@@ -224,6 +224,16 @@ class RefundComputation(BaseModel):
     is_final: bool = False
     tender_allocations: list[TenderAllocation] = []
     not_computable: list[NotComputableComponent] = []
+    # Supersession (R7): a computation re-run on the warehouse-graded
+    # condition is a NEW artefact whose `supersedes` names the one it
+    # replaces — the replaced artefact is never edited. Computations
+    # before R7 (and every declared-basis computation) carry None.
+    supersedes: str | None = None
+    # Which condition the money was computed over: "declared" (the
+    # customer's statement, R2) or "graded" (the warehouse's, R7 —
+    # with the graded condition itself recorded alongside).
+    condition_basis: str = "declared"
+    graded_condition: str | None = None
 
     @field_validator("total_deductions", "refund_total", mode="before")
     @classmethod
@@ -281,6 +291,12 @@ class DispositionDecision(BaseModel):
     channel: str | None = None
     category: str | None = None
     condition_declared: str
+    # The warehouse-graded condition (R7), recorded on graded-basis
+    # decisions alongside the customer's original declaration. The
+    # decision was evaluated over this condition; `condition_declared`
+    # still states what the customer claimed, so the disagreement —
+    # when there is one — is on the artefact, not lost.
+    graded_condition: str | None = None
     age_days: int | None = None
     age_band: str | None = None
     missing_dimension: str | None = None
@@ -443,6 +459,115 @@ class RefundReceipt(BaseModel):
     tender_allocations: list[TenderAllocation] = []
     status: str = "executed"
     executed_on: date
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _money(cls, v: object) -> Decimal:
+        return money(Decimal(str(v)))
+
+
+class WarehouseReceipt(BaseModel):
+    """The warehouse receipt act (R7): a named receiver takes the
+    returned parcel into the warehouse, on the record.
+
+    Recorded only once the carrier's own events say the parcel was
+    received — the warehouse does not receipt parcels the carrier
+    still shows in transit. The receiver is named because grading
+    (R7) enforces separation of duties against this name: whoever
+    received the parcel may not grade it.
+    """
+
+    warehouse_receipt_id: str
+    case_id: str
+    label_id: str
+    received_by: str
+    received_on: date
+
+
+class GradingReport(BaseModel):
+    """The warehouse grading act (R7) and its cascade, on one record.
+
+    A named grader states the item's GRADED condition — the fact the
+    rest of the case then re-derives from: the disposition is
+    superseded by a graded-basis decision, the refund computation is
+    re-run over the graded condition, and any money difference
+    against an already-executed refund becomes a stated adjustment.
+    Every link of that cascade is recorded here by artefact id; the
+    superseded artefacts themselves are never edited.
+
+    For a case held for inspection, `functional_test_result` and
+    `data_wipe_status` are what inspection had to establish — a
+    report on a held case without them does not finalise.
+    `received_weight_grams` is the warehouse weigh-in: once on
+    record it is the weight the fraud engine scores against (a
+    re-score supersedes the intake-scan score, by link).
+    """
+
+    report_id: str
+    case_id: str
+    label_id: str
+    warehouse_receipt_id: str
+    grader: str
+    graded_on: date
+    declared_condition: str
+    graded_condition: str
+    functional_test_result: str | None = None  # pass | fail
+    data_wipe_status: str | None = None  # verified | not_verified
+    damage_notes: str = ""
+    received_weight_grams: int | None = None
+    wear_evidence: bool = False
+    grading_pack_version: str
+    # The cascade, by artefact id (None where a step did not fire).
+    superseded_disposition_id: str | None = None
+    new_disposition_id: str | None = None
+    superseded_computation_id: str | None = None
+    new_computation_id: str | None = None
+    refund_delta: Decimal | None = None
+    adjustment_id: str | None = None
+    fraud_rescore_triggered: bool = False
+    new_fraud_score_id: str | None = None
+
+    @field_validator("refund_delta", mode="before")
+    @classmethod
+    def _money(cls, v: object) -> Decimal | None:
+        return None if v is None else money(Decimal(str(v)))
+
+
+class RefundAdjustment(BaseModel):
+    """A stated money position created by grading after execution (R7).
+
+    Grading re-prices a refund that has ALREADY been paid. The
+    difference is never silently absorbed:
+
+    - `recovery_due` (the customer was over-refunded): the position
+      stands as a recorded receivable, with the approval tier its
+      collection would require noted on the artefact. This round
+      builds NO clawback execution — collecting is a later, gated
+      act that does not exist yet, and the artefact says so.
+    - `top_up_due` (the customer was under-refunded): the position
+      is settled through the SAME gates as any refund — approvals
+      re-checked against the NEW computation, the fraud guard, and
+      an idempotency key in the top-up key domain — by
+      `execute_top_up`, which fills in the execution/receipt links
+      and flips `status` to "executed".
+    """
+
+    adjustment_id: str
+    case_id: str
+    kind: str  # recovery_due | top_up_due
+    amount: Decimal
+    reason: str
+    from_computation_id: str
+    to_computation_id: str
+    source_receipt_id: str | None = None
+    grading_report_id: str
+    approval_tier: str
+    approval_note: str
+    status: str = "open"  # open | executed (top_up_due only)
+    created_on: date
+    top_up_execution_id: str | None = None
+    top_up_receipt_id: str | None = None
+    idempotency_key: str | None = None
 
     @field_validator("amount", mode="before")
     @classmethod

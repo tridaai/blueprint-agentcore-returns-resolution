@@ -44,6 +44,7 @@ from pydantic import BaseModel
 MATRIX_VERSION = "2026.10.1"
 CHANNEL_TABLE_VERSION = "2026.10.1"
 BASIS_DECLARED = "declared"
+BASIS_GRADED = "graded"
 
 # Dispositions — the closed vocabulary a decision may name.
 RESTOCK = "RESTOCK"
@@ -329,6 +330,9 @@ def decide_disposition(
     category: str | None,
     condition_declared: str,
     age_days: int | None,
+    basis: str = BASIS_DECLARED,
+    graded_condition: str | None = None,
+    supersedes: str | None = None,
 ):
     """The pure evaluation. Same facts -> same artefact, byte for byte.
 
@@ -339,8 +343,20 @@ def decide_disposition(
     to the cell's stated next cell; the first cell whose channel is
     open decides. Any missing dimension ends the walk as
     `not_decidable` naming that dimension.
+
+    The condition the walk evaluates over is the DECLARED condition
+    by default (basis "declared", R3). Warehouse grading (R7) passes
+    `graded_condition` with basis "graded": the walk then evaluates
+    over the graded condition, the artefact records BOTH conditions
+    (what the customer declared, what the warehouse found), and
+    `supersedes` links it to the decision it replaces — which is
+    never edited. Declared-basis calls produce byte-identical
+    artefacts to R3: the graded facts enter the content address only
+    on the graded path.
     """
     from .models import DispositionDecision, RerouteStep
+
+    condition = graded_condition if graded_condition is not None else condition_declared
 
     base_facts: dict = {
         "case_id": case_id,
@@ -351,8 +367,11 @@ def decide_disposition(
         "category": category,
         "condition_declared": condition_declared,
         "age_days": age_days,
-        "basis": BASIS_DECLARED,
+        "basis": basis,
     }
+    if graded_condition is not None:
+        base_facts["graded_condition"] = graded_condition
+        base_facts["supersedes"] = supersedes
 
     def _not_decidable(missing_dimension: str, age_band: str | None, reroutes: list) -> DispositionDecision:
         facts = {**base_facts, "age_band": age_band}
@@ -364,22 +383,24 @@ def decide_disposition(
             channel_table_version=channels.version,
             status="not_decidable",
             disposition=None,
-            basis=BASIS_DECLARED,
+            basis=basis,
             cell_id=None,
             channel=None,
             category=category,
             condition_declared=condition_declared,
+            graded_condition=graded_condition,
             age_days=age_days,
             age_band=age_band,
             missing_dimension=missing_dimension,
             reroutes=reroutes,
+            supersedes=supersedes,
         )
 
     if category is None:
         return _not_decidable("category", None, [])
     if category not in matrix.categories():
         return _not_decidable("category", None, [])
-    if condition_declared not in matrix.conditions:
+    if condition not in matrix.conditions:
         return _not_decidable("condition_declared", None, [])
     if age_days is None:
         return _not_decidable("item_age_band", None, [])
@@ -387,10 +408,10 @@ def decide_disposition(
     if band is None:
         return _not_decidable("item_age_band", None, [])
 
-    cell = matrix.primary_cell(category, condition_declared, band.band_id)
+    cell = matrix.primary_cell(category, condition, band.band_id)
     if cell is None:
         return _not_decidable(
-            f"matrix_cell[{category}/{condition_declared}/{band.band_id}]", band.band_id, []
+            f"matrix_cell[{category}/{condition}/{band.band_id}]", band.band_id, []
         )
 
     reroutes: list[RerouteStep] = []
@@ -426,16 +447,18 @@ def decide_disposition(
         channel_table_version=channels.version,
         status="decided",
         disposition=cell.disposition,
-        basis=BASIS_DECLARED,
+        basis=basis,
         cell_id=cell.cell_id,
         channel=cell.channel,
         category=category,
         condition_declared=condition_declared,
+        graded_condition=graded_condition,
         age_days=age_days,
         age_band=band.band_id,
         missing_dimension=None,
         reroutes=reroutes,
         inspection_unknowns=list(cell.inspection_unknowns),
+        supersedes=supersedes,
     )
 
 
@@ -449,12 +472,17 @@ def verify_disposition(
     category: str | None,
     condition_declared: str,
     age_days: int | None,
+    basis: str = BASIS_DECLARED,
+    graded_condition: str | None = None,
+    supersedes: str | None = None,
 ) -> list[str]:
     """Re-perform the decision from the pinned facts and compare.
 
     Returns the list of problems; empty means the stored artefact is
     exactly what the matrix produces from these facts — a tampered
-    disposition, cell, channel or reroute path is named.
+    disposition, cell, channel or reroute path is named. Graded-basis
+    decisions (R7) are re-performed over the graded facts the
+    artefact itself records.
     """
     expected = decide_disposition(
         matrix,
@@ -464,6 +492,9 @@ def verify_disposition(
         category=category,
         condition_declared=condition_declared,
         age_days=age_days,
+        basis=basis,
+        graded_condition=graded_condition,
+        supersedes=supersedes,
     )
     problems: list[str] = []
     if decision.disposition_id != expected.disposition_id:

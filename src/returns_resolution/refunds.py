@@ -48,14 +48,24 @@ def _canonical(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def inputs_fingerprint(order: Order, decision: EligibilityDecision) -> str:
-    """Hash of the exact inputs a computation is pinned to."""
-    blob = _canonical(
-        {
-            "order": order.model_dump(mode="json"),
-            "decision": decision.model_dump(mode="json"),
-        }
-    )
+def inputs_fingerprint(
+    order: Order, decision: EligibilityDecision, condition_override: str | None = None
+) -> str:
+    """Hash of the exact inputs a computation is pinned to.
+
+    The declared-basis fingerprint is the R2 blob, unchanged. A
+    graded re-run (R7) extends the blob with the graded condition —
+    a different input set must content-address differently, or the
+    re-run would collide with the computation it supersedes.
+    """
+    payload: dict = {
+        "order": order.model_dump(mode="json"),
+        "decision": decision.model_dump(mode="json"),
+    }
+    if condition_override is not None:
+        payload["condition_override"] = condition_override
+        payload["condition_basis"] = "graded"
+    blob = _canonical(payload)
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
@@ -77,9 +87,23 @@ def compute_refund(
     product: Product | None,
     request: ReturnRequest,
     decision: EligibilityDecision,
+    *,
+    condition_override: str | None = None,
+    supersedes: str | None = None,
 ) -> RefundComputation:
-    fingerprint = inputs_fingerprint(order, decision)
+    """Compute the refund over the request's DECLARED condition.
+
+    Warehouse grading (R7) re-runs the same engine with
+    `condition_override` set to the graded condition: the restocking
+    rate is then read off the graded condition, the artefact records
+    basis "graded" with the graded condition alongside the declared
+    one it was computed from, and `supersedes` links it to the
+    computation it replaces. The declared-basis call is byte-identical
+    to R2 — the override enters the fingerprint only when present.
+    """
+    fingerprint = inputs_fingerprint(order, decision, condition_override)
     computation_id = _computation_id(decision.case_id, pack.version, fingerprint)
+    condition_basis = "graded" if condition_override is not None else "declared"
 
     if not decision.eligible:
         # A denied case has a computation of record too: no lines, a
@@ -96,6 +120,9 @@ def compute_refund(
             total_deductions=Decimal("0.00"),
             refund_total=Decimal("0.00"),
             is_final=True,
+            supersedes=supersedes,
+            condition_basis=condition_basis,
+            graded_condition=condition_override,
         )
 
     lines: list[ComputationLine] = []
@@ -118,10 +145,20 @@ def compute_refund(
         )
     )
 
-    # Restocking fee: rate by declared condition, from the pack.
-    rate_raw = pack.restocking_fee_rates.get(request.condition_declared)
+    # Restocking fee: rate by condition, from the pack — the declared
+    # condition, or (R7) the warehouse-graded condition when this run
+    # is a graded re-run. Both conditions are on the line's inputs
+    # whenever they differ, so the rate's basis is never ambiguous.
+    effective_condition = (
+        condition_override if condition_override is not None else request.condition_declared
+    )
+    condition_inputs = {"condition_declared": request.condition_declared}
+    if condition_override is not None:
+        condition_inputs["graded_condition"] = condition_override
+        condition_inputs["condition_basis"] = "graded"
+    rate_raw = pack.restocking_fee_rates.get(effective_condition)
     if rate_raw is None:
-        missing = f"restocking_fee_rate[condition={request.condition_declared}]"
+        missing = f"restocking_fee_rate[condition={effective_condition}]"
         lines.append(
             ComputationLine(
                 line_id="restocking_fee",
@@ -129,9 +166,9 @@ def compute_refund(
                 amount=None,
                 status="not_computable",
                 missing_input=missing,
-                inputs={"condition_declared": request.condition_declared},
-                rule="restocking_fee = item_amount * restocking_fee_rates[condition_declared]",
-                policy_ref=f"policy.restocking_fee_rates[{request.condition_declared}]",
+                inputs=condition_inputs,
+                rule="restocking_fee = item_amount * restocking_fee_rates[condition]",
+                policy_ref=f"policy.restocking_fee_rates[{effective_condition}]",
             )
         )
         not_computable.append(NotComputableComponent(component="restocking_fee", missing_input=missing))
@@ -146,10 +183,10 @@ def compute_refund(
                 inputs={
                     "item_amount": str(item_amount),
                     "rate": str(rate),
-                    "condition_declared": request.condition_declared,
+                    **condition_inputs,
                 },
                 rule="restocking_fee = item_amount * rate, quantised to cents HALF_UP",
-                policy_ref=f"policy.restocking_fee_rates[{request.condition_declared}]={rate_raw}",
+                policy_ref=f"policy.restocking_fee_rates[{effective_condition}]={rate_raw}",
             )
         )
 
@@ -251,6 +288,9 @@ def compute_refund(
         is_final=money_lines_final,
         tender_allocations=allocations,
         not_computable=not_computable,
+        supersedes=supersedes,
+        condition_basis=condition_basis,
+        graded_condition=condition_override,
     )
 
 
@@ -266,9 +306,15 @@ def verify_computation(
 
     Returns the list of problems; empty means the stored computation is
     exactly what the engine produces from these inputs — any tampered
-    line amount, total, allocation or fingerprint is named.
+    line amount, total, allocation or fingerprint is named. A
+    graded-basis computation (R7) is re-performed over the graded
+    condition the artefact itself records.
     """
-    expected = compute_refund(pack, order, product, request, decision)
+    override = computation.graded_condition if computation.condition_basis == "graded" else None
+    expected = compute_refund(
+        pack, order, product, request, decision,
+        condition_override=override, supersedes=computation.supersedes,
+    )
     problems: list[str] = []
     if computation.computation_id != expected.computation_id:
         problems.append(
