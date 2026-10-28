@@ -32,6 +32,7 @@ from .service import (
     FraudHoldError,
     FraudReviewError,
     GradingError,
+    MessagingError,
     PaymentsError,
 )
 from .store import SqlStore
@@ -91,7 +92,12 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     functional_test_result?, data_wipe_status?, damage_notes?,
     received_weight_grams?, wear_evidence?} |
     list_grading_reports {case_id} | list_adjustments {case_id} |
-    execute_top_up {case_id, idempotency_key, as_of}.
+    execute_top_up {case_id, idempotency_key, as_of} |
+    draft_message {case_id, message_type, as_of, model_note?} |
+    verify_message {message_id, as_of} | queue_message {message_id, as_of} |
+    send_message {message_id, as_of} | get_message {message_id} |
+    list_messages {case_id} | list_refused_messages {case_id} |
+    get_disclosure_pack.
     """
     action = payload.get("action", "intake_feed")
     if action == "seed":
@@ -364,6 +370,59 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
             return {"receipt": receipt.model_dump(mode="json")}
         except (LookupError, ApprovalError, FraudHoldError, PaymentsError) as exc:
             return {"error": str(exc)}
+    if action == "draft_message":
+        try:
+            message = service.draft_message(
+                payload["case_id"],
+                payload.get("message_type", ""),
+                as_of=date.fromisoformat(payload["as_of"]),
+                model_note=payload.get("model_note"),
+            )
+            return {"message": message.model_dump(mode="json")}
+        except (LookupError, MessagingError) as exc:
+            return {"error": str(exc)}
+    if action == "verify_message":
+        try:
+            message = service.verify_message(
+                payload["message_id"], as_of=date.fromisoformat(payload["as_of"])
+            )
+            return {"message": message.model_dump(mode="json")}
+        except (LookupError, MessagingError) as exc:
+            return {"error": str(exc)}
+    if action == "queue_message":
+        try:
+            message = service.queue_message(
+                payload["message_id"], as_of=date.fromisoformat(payload["as_of"])
+            )
+            return {"message": message.model_dump(mode="json")}
+        except (LookupError, MessagingError) as exc:
+            return {"error": str(exc)}
+    if action == "send_message":
+        try:
+            message = service.send_message(
+                payload["message_id"], as_of=date.fromisoformat(payload["as_of"])
+            )
+            return {"message": message.model_dump(mode="json")}
+        except (LookupError, MessagingError) as exc:
+            return {"error": str(exc)}
+    if action == "get_message":
+        message = service.get_message(payload["message_id"])
+        return {"message": message.model_dump(mode="json") if message else None}
+    if action == "list_messages":
+        return {
+            "messages": [
+                m.model_dump(mode="json") for m in service.list_messages(payload["case_id"])
+            ]
+        }
+    if action == "list_refused_messages":
+        return {
+            "messages": [
+                m.model_dump(mode="json")
+                for m in service.list_refused_messages(payload["case_id"])
+            ]
+        }
+    if action == "get_disclosure_pack":
+        return {"disclosure_pack": service.get_disclosure_pack().model_dump(mode="json")}
     if action == "list_cases":
         return {"cases": [c.model_dump(mode="json") for c in service.list_cases()]}
     if action == "list_orders":

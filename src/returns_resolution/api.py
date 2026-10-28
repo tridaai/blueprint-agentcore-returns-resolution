@@ -24,6 +24,7 @@ from .service import (
     FraudHoldError,
     FraudReviewError,
     GradingError,
+    MessagingError,
     PaymentsError,
 )
 
@@ -99,6 +100,16 @@ class WarehouseReceiptRequest(BaseModel):
         if not v or not v.strip():
             raise ValueError("a warehouse receipt requires a named receiver")
         return v.strip()
+
+
+class MessageDraftRequest(BaseModel):
+    message_type: str
+    as_of: date
+    model_note: str | None = None
+
+
+class MessageActRequest(BaseModel):
+    as_of: date
 
 
 class GradingRequest(BaseModel):
@@ -538,6 +549,79 @@ def create_app(service: CaseService) -> FastAPI:
         except PaymentsError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return receipt.model_dump(mode="json")
+
+    # -- customer messaging (R8): draft, verify, queue, send -------------
+    @app.get("/messaging/disclosure-pack")
+    def disclosure_pack() -> dict:
+        return service.get_disclosure_pack().model_dump(mode="json")
+
+    @app.get("/messages")
+    def all_messages() -> list[dict]:
+        return [m.model_dump(mode="json") for m in service.list_all_messages()]
+
+    @app.post("/cases/{case_id}/messages", status_code=201)
+    def draft_message(case_id: str, body: MessageDraftRequest) -> dict:
+        try:
+            message = service.draft_message(
+                case_id, body.message_type, as_of=body.as_of, model_note=body.model_note
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except MessagingError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return message.model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/messages")
+    def messages(case_id: str) -> list[dict]:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return [m.model_dump(mode="json") for m in service.list_messages(case_id)]
+
+    @app.get("/cases/{case_id}/messages/refused")
+    def refused_messages(case_id: str) -> list[dict]:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return [m.model_dump(mode="json") for m in service.list_refused_messages(case_id)]
+
+    @app.get("/cases/{case_id}/messages/{message_id}")
+    def message(case_id: str, message_id: str) -> dict:
+        found = service.get_message(message_id)
+        if found is None or found.case_id != case_id:
+            raise HTTPException(status_code=404, detail="message not found")
+        return found.model_dump(mode="json")
+
+    @app.post("/cases/{case_id}/messages/{message_id}/verify")
+    def verify_message(case_id: str, message_id: str, body: MessageActRequest) -> dict:
+        found = service.get_message(message_id)
+        if found is None or found.case_id != case_id:
+            raise HTTPException(status_code=404, detail="message not found")
+        try:
+            verified = service.verify_message(message_id, as_of=body.as_of)
+        except MessagingError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return verified.model_dump(mode="json")
+
+    @app.post("/cases/{case_id}/messages/{message_id}/queue")
+    def queue_message(case_id: str, message_id: str, body: MessageActRequest) -> dict:
+        found = service.get_message(message_id)
+        if found is None or found.case_id != case_id:
+            raise HTTPException(status_code=404, detail="message not found")
+        try:
+            queued = service.queue_message(message_id, as_of=body.as_of)
+        except MessagingError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return queued.model_dump(mode="json")
+
+    @app.post("/cases/{case_id}/messages/{message_id}/send")
+    def send_message(case_id: str, message_id: str, body: MessageActRequest) -> dict:
+        found = service.get_message(message_id)
+        if found is None or found.case_id != case_id:
+            raise HTTPException(status_code=404, detail="message not found")
+        try:
+            sent = service.send_message(message_id, as_of=body.as_of)
+        except MessagingError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return sent.model_dump(mode="json")
 
     @app.post("/cases/{case_id}/evidence")
     async def evidence(case_id: str, request: Request, kind: str = "photo", filename: str = "evidence.bin") -> dict:
