@@ -143,6 +143,7 @@ def main() -> int:
     print("\n--- carrier tools via the gateway (carrier: LOCAL DOUBLE — nothing really ships) ---")
     from returns_resolution.models import ReturnRequest as _ReturnRequest
     from returns_resolution.service import CarrierError as _CarrierError
+    from returns_resolution.service import GradingError as _GradingError
 
     carrier = service.carrier_port
 
@@ -218,6 +219,51 @@ def main() -> int:
         )
     except _CarrierError as exc:
         print(f"  CASE-2003 pickup refused — {exc}")
+
+    print("\n--- warehouse grading: the parcel comes back, the cascade runs (R7) ---")
+    returned_on = _date(2026, 10, 30)  # the carrier's received day for the label above
+    service.record_warehouse_receipt(
+        "CASE-2003", received_by="w.chen", received_on=returned_on
+    )
+    report = service.record_grading(
+        "CASE-2003", grader="p.novak", graded_condition="used",
+        graded_on=_date(2026, 10, 31), damage_notes="heel counter scuffed",
+    )
+    (recovery,) = service.list_adjustments("CASE-2003")
+    print(
+        "  CASE-2003 boots declared like_new ($130.50 already paid above) graded used: "
+        "disposition RESTOCK → OUTLET (basis: graded), refund re-priced to $116.00, "
+        f"delta {report.refund_delta}"
+    )
+    print(
+        f"  recovery position {recovery.adjustment_id}: {recovery.amount} "
+        f"({recovery.status}) — a recorded receivable; no clawback is executed"
+    )
+    print(f"  re-issued summary: {service.get_case('CASE-2003').summary}")
+
+    _issue("CASE-2006", today)  # the held lamp's label (idempotent if present)
+    service.record_warehouse_receipt(
+        "CASE-2006", received_by="w.chen", received_on=returned_on
+    )
+    try:
+        service.record_grading(
+            "CASE-2006", grader="p.novak", graded_condition="used",
+            graded_on=_date(2026, 10, 31),
+        )
+    except _GradingError as exc:
+        print(f"  CASE-2006 grading refused — {exc}")
+    lamp_report = service.record_grading(
+        "CASE-2006", grader="p.novak", graded_condition="used",
+        graded_on=_date(2026, 10, 31),
+        functional_test_result="pass", data_wipe_status="verified",
+    )
+    lamp_decision = service.get_disposition("CASE-2006")
+    print(
+        f"  CASE-2006 held electronics graded functional + wiped → "
+        f"{lamp_decision.disposition} via {lamp_decision.channel} "
+        f"(grading-pack rule {lamp_decision.cell_id}); "
+        f"the money does not move (delta {lamp_report.refund_delta})"
+    )
 
     print("\n--- case timeline (derived from the artefacts of record) ---")
     for case_id, as_of in (("CASE-2003", _date(2026, 10, 30)), ("CASE-3008", _date(2026, 11, 10))):

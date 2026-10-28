@@ -290,10 +290,83 @@ an undecided fraud block — each producing a named gap with the
 concrete fact (the ship-by date, the void) in its detail. It stores
 nothing; two reads of the same record produce the same view.
 
+## Warehouse grading and the supersession cascade (R7)
+
+Everything before R7 priced and routed a return on the customer's
+*declared* condition. R7 is where the parcel comes back and the
+declaration meets the item. Two recorded acts open it: the
+**warehouse receipt**, which exists only when the carrier port's
+event script shows the case's active label `received` as of the
+receipt date — the warehouse cannot conjure a parcel the carrier
+has not delivered, and replaying the same act returns the same
+receipt while a different act against a receipted label refuses —
+and the **grading report**, one per case, by a named grader who
+must not be the person who received the parcel (the approval
+ladder's separation of duties, applied to the warehouse floor).
+
+The report carries the graded condition from the declared
+vocabulary, damage notes, the parcel's received weight, and, for
+held electronics, the two facts R3's hold named as unknowns:
+functional test result and data-wipe status. A held case's grading
+that omits either refuses to finalise, naming what inspection had
+to establish; with both present, the hold resolves through the
+grading pack's inspection table (`grading.py`, versioned data):
+pass + verified wipe → REFURBISH via the store; a failed test →
+RECYCLE whatever the wipe; pass + unverified wipe → RECYCLE,
+because a device that cannot be proven wiped is never resold. The
+successor is a new disposition decision whose cell id is the
+grading rule and whose `supersedes` names the hold.
+
+The cascade then runs in code, in one order, each step a new
+linked artefact. (1) A graded condition different from the declared
+one supersedes the disposition: a fresh matrix walk with
+`basis: graded`, both conditions on the record, channel routability
+re-checked for the graded season. (2) The refund re-prices on the
+graded condition — `compute_refund` with a condition override and
+a `supersedes` link; the fee lines record declared and graded
+conditions, the fingerprint covers the override, and the grading
+report states the **delta** between the old and new totals as its
+own figure. (3) If the old computation already executed, the delta
+is never absorbed: a negative delta becomes a `recovery_due`
+**adjustment** — amount, reason, both computation ids, standing
+open as a recorded receivable with its approval requirement noted,
+and deliberately no execution path (no clawback is built); a
+positive delta becomes a `top_up_due` adjustment executed through
+the R5 machinery again — fraud guard, approval status re-derived
+against the NEW computation (approvals pinned to the superseded
+one are simply not counted), and keys namespaced `topup:` so the
+two domains can never collide. The top-up pays the per-tender
+difference between the computations, so its receipt can never
+exceed what the graded truth says was underpaid; and a plain
+`execute_refund` against the new computation refuses once the case
+settled elsewhere, which is what makes the adjustment path the
+only door. (4) The summary re-issues against the new computation
+through the same figure-verified compose, so the customer reads
+the graded figures and nothing else. Because a failed verification
+must leave no half-cascade, the whole cascade is computed in
+memory and verified before the first artefact is stored.
+
+Two supporting changes make the chains real. Migration 0007
+rebuilds `refund_computations` and `disposition_decisions` without
+their one-per-case uniqueness (artefact ids were always the keys)
+and adds `warehouse_receipts`, `grading_reports` and
+`refund_adjustments`; both stores resolve a case's current
+computation or disposition by following the chain — an artefact is
+the head when no other names it as `supersedes` — and list the
+whole chain for the timeline and the graders. And the fraud pack
+gains its second trigger: the report's received weight replaces
+the intake-scan weight as the scoring fact (the request artefact
+is never edited; the override lives in the service's fact
+assembly), and a grading at least two condition ranks worse than
+declared, with wear evidence on the report, re-scores the case
+through the unchanged R4 engine — a new score artefact, linked,
+never an edit. The timeline grows receipt, grading and adjustment
+stages and names the `warehouse_grading` gap for a parcel received
+but not yet graded.
+
 ## What is deliberately not here yet
 
-Warehouse grading (R7),
-messaging verifier depth (R8), Memory port (R9), injection quarantine
+Messaging verifier depth (R8), Memory port (R9), injection quarantine
 (R10), Gateway + Policy ports (R11), model cost ledger (R12), console
 (R13), Postgres parity + production smoke (R15), access control (R16),
 reporting (R17), carrier exceptions (R18), red team (R19), deploy
