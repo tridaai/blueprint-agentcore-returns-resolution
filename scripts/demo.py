@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from returns_resolution.intake import FRAUD_FEED_REQUESTS, ReferenceFeed
 from returns_resolution.modelport import OfflineComposer
-from returns_resolution.service import CaseService
+from returns_resolution.service import CaseService, PaymentsError
 from returns_resolution.store import SqlStore
 
 
@@ -714,6 +714,146 @@ def main() -> int:
     for report in reports:
         problems = service.verify_management_report(report)
         print(f"  re-performance of {report.kind} ({report.report_id}): problems {problems}")
+
+    print("\n== Round 18: when the return journey itself breaks ==")
+    # The exception journeys walk on their own service: the cases
+    # above have all completed their journeys, and a broken
+    # journey needs parcels whose stories are still open.
+    from datetime import date as _date
+
+    from returns_resolution.store import InMemoryStore as _InMemoryStore
+
+    broken = CaseService(_InMemoryStore(), OfflineComposer())
+    broken.seed_orders()
+    reqs = {r.request_id: r for r in ReferenceFeed().fetch_requests()}
+
+    def _issue_on(service, case_id):
+        return service.invoke_tool(
+            "create_return_label", {"case_id": case_id, "issued_on": today},
+            case_id=case_id, called_on=today,
+        )
+
+    # A parcel that vanishes mid-journey (CASE-2001): the carrier
+    # tenders it, one in-transit scan, then silence. Detection
+    # raises the exception in code at the pack's ten-day window —
+    # not from anything a person typed.
+    broken.ingest(reqs["REQ-2001"])
+    label_lost = _issue_on(broken, "CASE-2001")
+    broken._carrier.set_script(carrier_ref=label_lost.carrier_ref, script="stalled_in_transit")
+    exc_lost = broken.detect_carrier_exceptions("CASE-2001", as_of=_date(2026, 11, 6))[0]
+    print(
+        f"  lost in transit: {exc_lost.exception_id} raised from the carrier record "
+        f"({len(exc_lost.event_ids)} events bound, window {exc_lost.window_days} days) — "
+        f"verification problems: {broken.verify_exception(exc_lost.exception_id)}"
+    )
+    notice_lost = broken.draft_message(
+        "CASE-2001", "carrier_exception_notice", as_of=_date(2026, 11, 6)
+    )
+    checked = broken.verify_message(notice_lost.message_id, as_of=_date(2026, 11, 6))
+    print(f"  the customer is told, in the verified vocabulary: {checked.text}")
+    # The refund cannot execute into an unresolved disappearance.
+    broken.record_approval("CASE-2001", approver="d.okafor", role="returns_lead", as_of=today)
+    broken.record_approval("CASE-2001", approver="m.reyes", role="returns_lead", as_of=today)
+    try:
+        broken.execute_refund("CASE-2001", idempotency_key="demo-r18-2001", as_of=_date(2026, 11, 6))
+        print("  ERROR: the refund executed into an open exception")
+    except PaymentsError as exc:
+        print(f"  refund execution refused while the exception stands: {exc}")
+    # Escalate, claim against the carrier at the pack's formula;
+    # resolve as refund-as-received and pay the customer; then
+    # settle the claim — the settlement is the house's money, on
+    # its own line, and the customer's figures do not move.
+    broken.record_exception_act(
+        exc_lost.exception_id, action="escalate", actor="s.reyes", acted_on=_date(2026, 11, 6)
+    )
+    claim_lost = broken.file_carrier_claim(
+        exc_lost.exception_id, filed_by="s.reyes", filed_on=_date(2026, 11, 6)
+    )
+    broken.record_exception_act(
+        exc_lost.exception_id, action="refund_as_received", actor="s.reyes",
+        acted_on=_date(2026, 11, 7),
+    )
+    receipt_lost = broken.execute_refund(
+        "CASE-2001", idempotency_key="demo-r18-2001", as_of=_date(2026, 11, 7)
+    )
+    broken.record_claim_act(
+        claim_lost.claim_id, action="acknowledged", actor="s.reyes", acted_on=_date(2026, 11, 8)
+    )
+    broken.record_claim_act(
+        claim_lost.claim_id, action="settled", actor="s.okafor",
+        acted_on=_date(2026, 11, 12), settled_amount=claim_lost.claimed_amount,
+    )
+    print(
+        f"  refund-as-received paid the customer ${receipt_lost.amount}; the carrier "
+        f"claim {claim_lost.claim_id} (${claim_lost.claimed_amount} = item "
+        f"${claim_lost.item_amount} + label ${claim_lost.label_cost}) settled in full — "
+        f"claim verification problems: {broken.verify_carrier_claim(claim_lost.claim_id)}"
+    )
+    money_broken = broken.compute_report("money_summary", as_of=_date(2026, 11, 15))
+    print(
+        f"  money summary: executed refunds ${money_broken.figures['executed_refunds']}, "
+        f"carrier claims settled ${money_broken.figures['carrier_claims_settled']} on "
+        f"their own line — re-performance problems: "
+        f"{broken.verify_management_report(money_broken)}"
+    )
+
+    # A label the carrier never scans at all (CASE-2006): at the
+    # pack's five-day window the exception offers its paths, and
+    # the house chooses customer-kept — which bars the refund
+    # for good, in code.
+    broken.ingest(reqs["REQ-2006"])
+    label_never = _issue_on(broken, "CASE-2006")
+    broken._carrier.set_script(carrier_ref=label_never.carrier_ref, script="never_tendered")
+    exc_never = broken.detect_carrier_exceptions("CASE-2006", as_of=_date(2026, 11, 1))[0]
+    broken.record_exception_act(
+        exc_never.exception_id, action="customer_kept", actor="s.reyes",
+        acted_on=_date(2026, 11, 1),
+    )
+    broken.record_approval("CASE-2006", approver="d.okafor", role="returns_lead", as_of=today)
+    try:
+        broken.execute_refund("CASE-2006", idempotency_key="demo-r18-2006", as_of=_date(2026, 11, 2))
+        print("  ERROR: a customer-kept case was refunded")
+    except PaymentsError as exc:
+        print(f"  never tendered, resolved customer-kept: the refund is refused — {exc}")
+
+    # A parcel the carrier damages (CASE-2003): grading
+    # attributes the damage to transit — the refund stands on
+    # the declared condition, no fraud re-score fires, the item
+    # follows the pack's transit row, and the claim is the
+    # carrier's bill, not the customer's.
+    broken.ingest(reqs["REQ-2003"])
+    label_dmg = _issue_on(broken, "CASE-2003")
+    broken._carrier.set_script(carrier_ref=label_dmg.carrier_ref, script="damaged_in_transit")
+    broken.record_warehouse_receipt(
+        "CASE-2003", received_by="w.chen", received_on=_date(2026, 10, 30)
+    )
+    report_dmg = broken.record_grading(
+        "CASE-2003", grader="p.novak", graded_condition="damaged_by_customer",
+        graded_on=_date(2026, 10, 31), wear_evidence=True,
+        damage_notes="crushed in transit, seams torn",
+    )
+    decision_dmg = broken.get_disposition("CASE-2003")
+    print(
+        f"  damaged in transit: grading attributes the damage to "
+        f"{report_dmg.damage_attribution} (carrier event {report_dmg.damage_event_id}); "
+        f"fraud re-score fired: {report_dmg.fraud_rescore_triggered}; the refund was "
+        f"NOT re-priced (new computation: {report_dmg.new_computation_id}); disposition "
+        f"{decision_dmg.disposition} under {decision_dmg.cell_id}"
+    )
+    notice_dmg = broken.draft_message(
+        "CASE-2003", "grading_outcome_notice", as_of=_date(2026, 10, 31)
+    )
+    checked_dmg = broken.verify_message(notice_dmg.message_id, as_of=_date(2026, 10, 31))
+    print(f"  the customer hears: {checked_dmg.text}")
+    exc_dmg = broken.detect_carrier_exceptions("CASE-2003", as_of=_date(2026, 10, 31))[0]
+    claim_dmg = broken.file_carrier_claim(
+        exc_dmg.exception_id, filed_by="s.reyes", filed_on=_date(2026, 11, 1)
+    )
+    print(
+        f"  and the carrier claim for the damage: ${claim_dmg.claimed_amount} "
+        f"(label ${claim_dmg.label_cost} + half the item at the pack's rate) — "
+        f"verification problems: {broken.verify_carrier_claim(claim_dmg.claim_id)}"
+    )
 
     for case_id in ("CASE-2003", "CASE-2004"):
         case = service.get_case(case_id)

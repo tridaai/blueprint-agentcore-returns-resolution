@@ -212,6 +212,8 @@ class ExceptionDetectRequest(BaseModel):
 
 
 class ExceptionActRequest(BaseModel):
+    # The act's action IS the handling choice: one of the pack's
+    # paths for the exception's kind, or "escalate".
     action: str
     actor: str = ""
     acted_on: date
