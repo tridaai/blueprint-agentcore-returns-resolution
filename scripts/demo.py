@@ -326,6 +326,34 @@ def main() -> int:
         print("  nothing stale was sent; a fresh verified summary stands in its place")
     print(f"  deliveries on the messaging double: {messaging.delivery_count} (one per send, retries included)")
 
+    print("\n--- customer memory (AgentCore Memory port: LOCAL DOUBLE — no real memory service) ---")
+    service.sync_memory()
+    records = service.retrieve_memory("CUST-CID", as_of=_date(2026, 11, 2))
+    for record in records:
+        print(
+            f"  {record.occurred_on}  {record.event_type:<22} case {record.case_id}  "
+            f"source {record.source_ref}  total={record.refund_total}  "
+            f"amount={record.refund_amount}  disposition={record.disposition}  band={record.fraud_band}"
+        )
+    from_mem = service.score_case_from_memory("CASE-2003")
+    stored = service.get_fraud_score("CASE-2003")
+    print(
+        f"  CASE-2003 re-scored from memory alone: {from_mem.total_score} {from_mem.band} "
+        f"(source: {from_mem.history_source}) — the same artefact the store path produced: "
+        f"{from_mem.score_id == stored.score_id}"
+    )
+    retention = service.memory_retention_status("CUST-CID", as_of=_date(2026, 11, 2))
+    print(
+        f"  retention (pack {retention['memory_pack_version']}, window {retention['retention_days']} days): "
+        f"{retention['active_count']} active, {retention['expired_count']} expired — expired records are "
+        "counted here, never deleted"
+    )
+    print(
+        f"  every retrieval above is on the access log: "
+        f"{len(service.list_memory_access_log('CUST-CID'))} entries for CUST-CID, "
+        f"{len(service.list_memory_access_log())} in total"
+    )
+
     for case_id in ("CASE-2003", "CASE-2004"):
         case = service.get_case(case_id)
         print(f"\n--- {case_id} summary (figure-verified) ---")

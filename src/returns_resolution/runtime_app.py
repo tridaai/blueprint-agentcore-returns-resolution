@@ -97,7 +97,12 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     verify_message {message_id, as_of} | queue_message {message_id, as_of} |
     send_message {message_id, as_of} | get_message {message_id} |
     list_messages {case_id} | list_refused_messages {case_id} |
-    get_disclosure_pack.
+    get_disclosure_pack |
+    get_memory_config | sync_memory |
+    get_customer_memory {customer_id, as_of?} |
+    get_memory_retention {customer_id, as_of?} |
+    list_memory_access_log {customer_id?} |
+    score_case_from_memory {case_id}.
     """
     action = payload.get("action", "intake_feed")
     if action == "seed":
@@ -423,6 +428,34 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         }
     if action == "get_disclosure_pack":
         return {"disclosure_pack": service.get_disclosure_pack().model_dump(mode="json")}
+    if action == "get_memory_config":
+        return {"memory_pack": service.get_memory_pack().model_dump(mode="json")}
+    if action == "sync_memory":
+        return {"records_written": service.sync_memory()}
+    if action == "get_customer_memory":
+        as_of = payload.get("as_of")
+        records = service.retrieve_memory(
+            payload["customer_id"],
+            as_of=date.fromisoformat(as_of) if as_of else None,
+            purpose="runtime_read",
+            actor="runtime dispatch",
+        )
+        return {"records": [r.model_dump(mode="json") for r in records]}
+    if action == "get_memory_retention":
+        as_of = payload.get("as_of")
+        return {
+            "retention": service.memory_retention_status(
+                payload["customer_id"],
+                as_of=date.fromisoformat(as_of) if as_of else None,
+                actor="runtime dispatch",
+            )
+        }
+    if action == "list_memory_access_log":
+        entries = service.list_memory_access_log(payload.get("customer_id"))
+        return {"access_log": [e.model_dump(mode="json") for e in entries]}
+    if action == "score_case_from_memory":
+        score = service.score_case_from_memory(payload["case_id"])
+        return {"fraud_score": score.model_dump(mode="json") if score else None}
     if action == "list_cases":
         return {"cases": [c.model_dump(mode="json") for c in service.list_cases()]}
     if action == "list_orders":

@@ -623,6 +623,55 @@ def create_app(service: CaseService) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return sent.model_dump(mode="json")
 
+    # -- customer memory (R9): scoped reads, retention, access log --------
+    @app.get("/memory/config")
+    def memory_config() -> dict:
+        return service.get_memory_pack().model_dump(mode="json")
+
+    @app.post("/memory/sync")
+    def memory_sync() -> dict:
+        return {"records_written": service.sync_memory()}
+
+    @app.get("/memory/access-log")
+    def memory_access_log() -> list[dict]:
+        return [e.model_dump(mode="json") for e in service.list_memory_access_log()]
+
+    @app.get("/customers/{customer_id}/memory")
+    def customer_memory(customer_id: str, as_of: date | None = None) -> list[dict]:
+        if not service.has_customer(customer_id):
+            raise HTTPException(status_code=404, detail="customer not found")
+        records = service.retrieve_memory(
+            customer_id, as_of=as_of, purpose="api_read", actor="api"
+        )
+        return [r.model_dump(mode="json") for r in records]
+
+    @app.get("/customers/{customer_id}/memory/retention")
+    def customer_memory_retention(customer_id: str, as_of: date | None = None) -> dict:
+        if not service.has_customer(customer_id):
+            raise HTTPException(status_code=404, detail="customer not found")
+        return service.memory_retention_status(customer_id, as_of=as_of, actor="api")
+
+    @app.get("/customers/{customer_id}/memory/access-log")
+    def customer_memory_access_log(customer_id: str) -> list[dict]:
+        if not service.has_customer(customer_id):
+            raise HTTPException(status_code=404, detail="customer not found")
+        return [
+            e.model_dump(mode="json")
+            for e in service.list_memory_access_log(customer_id)
+        ]
+
+    @app.get("/cases/{case_id}/fraud-score/from-memory")
+    def fraud_score_from_memory(case_id: str) -> dict:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        score = service.score_case_from_memory(case_id)
+        if score is None:
+            raise HTTPException(
+                status_code=404,
+                detail="memory holds no decision record for this case (sync first)",
+            )
+        return score.model_dump(mode="json")
+
     @app.post("/cases/{case_id}/evidence")
     async def evidence(case_id: str, request: Request, kind: str = "photo", filename: str = "evidence.bin") -> dict:
         if service.get_case(case_id) is None:
