@@ -357,6 +357,99 @@ class FraudReviewDecision(BaseModel):
     pack_version: str
 
 
+class RefundApproval(BaseModel):
+    """A named approval act (R5) — Law 5's human gate, on the record.
+
+    The act approves ONE pinned computation: its id and its refund
+    total are recorded, so an approval taken against a computation
+    that has since been superseded can never be mistaken for an
+    approval of the current one — the gates only count approvals
+    pinned to the case's current computation. `tier` is the approval
+    requirement the computation's total fell under at act time,
+    under the pack version recorded here.
+    """
+
+    approval_id: str
+    case_id: str
+    computation_id: str
+    approver: str
+    role: str
+    as_of: date
+    amount: Decimal
+    tier: str  # auto | single | dual
+    policy_pack_version: str
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _money(cls, v: object) -> Decimal:
+        return money(Decimal(str(v)))
+
+
+class ExecutionTransition(BaseModel):
+    """One state change of a refund execution, on the record."""
+
+    state: str  # requested | executing | executed | failed
+    at: date
+    detail: str = ""
+
+
+class RefundExecution(BaseModel):
+    """One refund execution attempt (R5) — the retry-safe state machine.
+
+    Keyed by its mandatory idempotency key: a retry with the same key
+    continues THIS record (its transitions accumulate), a retry with
+    a different key after money moved is refused as a duplicate
+    refund before a record is even opened. `status` mirrors the last
+    transition. A failed execution holds no receipt — the failure is
+    recorded here, and the case stays executable.
+    """
+
+    execution_id: str
+    case_id: str
+    computation_id: str
+    idempotency_key: str
+    amount: Decimal
+    provider: str
+    status: str  # requested | executing | executed | failed
+    transitions: list[ExecutionTransition] = []
+    receipt_id: str | None = None
+    failure_reason: str | None = None
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _money(cls, v: object) -> Decimal:
+        return money(Decimal(str(v)))
+
+
+class RefundReceipt(BaseModel):
+    """The money artefact (R5): proof a refund executed exactly once.
+
+    Written only when the payments port confirms the movement. One
+    receipt exists per executed computation and per idempotency key
+    — both keys are unique in the store, which is what makes a
+    double refund structurally impossible rather than unlikely. The
+    tender allocation is the computation's own, carried through so
+    the receipt states where the money went, tender by tender.
+    """
+
+    receipt_id: str
+    case_id: str
+    computation_id: str
+    execution_id: str
+    idempotency_key: str
+    provider: str
+    provider_ref: str
+    amount: Decimal
+    tender_allocations: list[TenderAllocation] = []
+    status: str = "executed"
+    executed_on: date
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _money(cls, v: object) -> Decimal:
+        return money(Decimal(str(v)))
+
+
 class ReturnCase(BaseModel):
     case_id: str
     request: ReturnRequest

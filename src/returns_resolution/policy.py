@@ -41,8 +41,16 @@ class PolicyPack(BaseModel):
     # label, no deduction). Any other category is deducted the flat fee.
     free_return_categories: set[str] = set()
     return_shipping_fee: Decimal = Decimal("0.00")
+    # --- Approval thresholds (R5) ---------------------------------------
+    # Law 5 as data: a final refund total at or below the auto cap
+    # needs no named approval; above it, one named approver; above
+    # the dual cap, a second approver who must be a different person
+    # than the first. The gates evaluate these numbers, and every
+    # approval act records the pack version it was taken under.
+    auto_approve_cap: Decimal = Decimal("0.00")
+    dual_approve_cap: Decimal = Decimal("0.00")
 
-    @field_validator("return_shipping_fee", mode="before")
+    @field_validator("return_shipping_fee", "auto_approve_cap", "dual_approve_cap", mode="before")
     @classmethod
     def _money(cls, v: object) -> Decimal:
         return money(Decimal(str(v)))
@@ -66,6 +74,8 @@ POLICY_PACK_V1 = PolicyPack(
     },
     free_return_categories={"apparel", "footwear"},
     return_shipping_fee=Decimal("6.95"),
+    auto_approve_cap=Decimal("50.00"),
+    dual_approve_cap=Decimal("150.00"),
 )
 
 # Clause ids — stable names that decisions, evals and (later) customer
