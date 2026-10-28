@@ -25,6 +25,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+from .access import ROLE_CUSTOMER, SURFACE_CONSOLE, Principal
 from .fraud import STATE_FRAUD_CONFIRMED, STATE_FRAUD_REVIEW
 from .models import FraudScore, RefundAdjustment, RefundReceipt, ReturnCase
 from .service import CaseService
@@ -203,8 +204,69 @@ def _quarantine_row(service: CaseService, item) -> dict:
     }
 
 
-def build_console_data(service: CaseService) -> dict:
-    """The board, queues, money and gateway views in one read."""
+def _scope_to_customer(data: dict, customer_id: str) -> dict:
+    """The console payload as one customer may see it (R16):
+    only their own cases, and only the customer-safe shape of
+    each surface — their refund figures and messages, the STATE
+    of their quarantined texts (never findings, never content),
+    their own gateway invocations, and nothing of the staff
+    review machinery: no fraud assessment, no review outcomes,
+    no other customer's anything."""
+    own_ids = {c["case_id"] for c in data["cases"] if c["customer_id"] == customer_id}
+
+    def summary(row: dict) -> dict:
+        row = dict(row)
+        row.pop("assessment", None)
+        return row
+
+    data["cases"] = [summary(c) for c in data["cases"] if c["case_id"] in own_ids]
+    data["queues"] = {
+        "review": [summary(c) for c in data["queues"]["review"] if c["case_id"] in own_ids],
+        "approvals": [a for a in data["queues"]["approvals"] if a["case_id"] in own_ids],
+        "recovery": [a for a in data["queues"]["recovery"] if a["case_id"] in own_ids],
+    }
+    data["money"] = {
+        "receipts": [r for r in data["money"]["receipts"] if r["case_id"] in own_ids],
+        "adjustments": [
+            a for a in data["money"]["adjustments"] if a["case_id"] in own_ids
+        ],
+    }
+    data["gateway"] = {
+        # No policy pack: the gateway/policy artefacts are
+        # staff-side data, and the pack's own reason texts name
+        # the fraud machinery. The customer's own invocations
+        # ride in a narrowed shape — what ran, when, and its
+        # outcome; never the policy that judged it.
+        "policy_pack": None,
+        "invocations": [
+            {k: i[k] for k in ("tool", "actor", "status", "called_on", "case_id") if k in i}
+            for i in data["gateway"]["invocations"]
+            if i["case_id"] in own_ids
+        ],
+    }
+    data["quarantine"] = [
+        {
+            "quarantine_id": q["quarantine_id"],
+            "case_id": q["case_id"],
+            "source_surface": q["source_surface"],
+            "field_name": q["field_name"],
+            "received_on": q["received_on"],
+            "state": q["state"],
+        }
+        for q in data["quarantine"]
+        if q["case_id"] in own_ids
+    ]
+    data["review_outcomes"] = {}
+    return data
+
+
+def build_console_data(service: CaseService, principal: Principal | None = None) -> dict:
+    """The board, queues, money and gateway views in one read.
+    With a principal the payload is access-checked and scoped:
+    staff-side roles get the board; a customer principal gets
+    only their own cases in the customer-safe shape (R16)."""
+    if principal is not None:
+        service.require_surface(principal, SURFACE_CONSOLE, target="console_data")
     cases = service.list_cases()
     receipts = service.list_receipts()
     adjustments = service.list_all_adjustments()
@@ -249,7 +311,7 @@ def build_console_data(service: CaseService) -> dict:
             )
     approval_queue.sort(key=lambda r: (r["amount"] or "", r["case_id"]), reverse=True)
 
-    return {
+    data = {
         "stages": STAGES,
         "cases": summaries,
         "queues": {
@@ -273,6 +335,9 @@ def build_console_data(service: CaseService) -> dict:
         ],
         "review_outcomes": service.get_scoring_pack().review_outcomes,
     }
+    if principal is not None and principal.role == ROLE_CUSTOMER:
+        data = _scope_to_customer(data, principal.id)
+    return data
 
 
 def _max_timeline_date(service: CaseService, case: ReturnCase) -> date:
@@ -302,8 +367,18 @@ def _max_timeline_date(service: CaseService, case: ReturnCase) -> date:
     return max(dates)
 
 
-def build_case_detail(service: CaseService, case_id: str) -> dict | None:
-    """One case's artefact chain in workflow order, console-safe."""
+def build_case_detail(
+    service: CaseService, case_id: str, principal: Principal | None = None
+) -> dict | None:
+    """One case's artefact chain in workflow order, console-safe.
+    With a customer principal, another customer's case is hidden
+    (None, exactly like an unknown case) and their own case's
+    detail carries no fraud internals — the assessment entries
+    and review decisions are staff-side data (R16)."""
+    if principal is not None and principal.role == ROLE_CUSTOMER:
+        case = service.get_case(case_id)
+        if case is None or case.customer_id != principal.id:
+            return None
     case = service.get_case(case_id)
     if case is None:
         return None
@@ -330,7 +405,7 @@ def build_case_detail(service: CaseService, case_id: str) -> dict | None:
     ]
     timeline = service.get_timeline(case_id, _max_timeline_date(service, case))
 
-    return {
+    detail = {
         "case": {
             "case_id": case.case_id,
             "customer_id": case.customer_id,
@@ -384,3 +459,28 @@ def build_case_detail(service: CaseService, case_id: str) -> dict | None:
         },
         "timeline": _dump(timeline),
     }
+    if principal is not None and principal.role == ROLE_CUSTOMER:
+        # The customer-safe detail: no fraud internals (assessments,
+        # review decisions), no cost ledger, only the messages
+        # actually sent, and quarantine as states without findings
+        # or release actors.
+        detail["assessments"] = []
+        detail["review_decisions"] = []
+        detail["cost_entries"] = []
+        detail["messages"] = [m for m in detail["messages"] if m["status"] == "sent"]
+        detail["quarantine"] = {
+            "items": [
+                {
+                    "quarantine_id": q["quarantine_id"],
+                    "case_id": q["case_id"],
+                    "source_surface": q["source_surface"],
+                    "field_name": q["field_name"],
+                    "received_on": q["received_on"],
+                    "state": q["state"],
+                }
+                for q in detail["quarantine"]["items"]
+            ],
+            "views": [],
+            "acts": [],
+        }
+    return detail

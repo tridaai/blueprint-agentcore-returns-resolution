@@ -286,6 +286,50 @@ def main() -> int:
     assert probe_rows[0]["quarantine_id"] in rendered["quarantineHtml"]
     assert PROBE not in html, "probe text present in the static console file"
 
+    # -- R16: a customer-scoped console payload -------------------
+    # The board under a customer principal carries ONLY that
+    # customer's cases, in the customer-safe shape: no other case
+    # id anywhere in the payload, no fraud-internal vocabulary,
+    # quarantine as states without findings.
+    cust_2001 = service.get_case("CASE-2001").customer_id
+    scoped = client.get(
+        "/console/data",
+        headers={"X-Principal-Id": cust_2001, "X-Principal-Role": "customer"},
+    )
+    assert scoped.status_code == 200, scoped.status_code
+    scoped_data = scoped.json()
+    assert [c["case_id"] for c in scoped_data["cases"]] == ["CASE-2001"], scoped_data["cases"]
+    assert all(c["customer_id"] == cust_2001 for c in scoped_data["cases"])
+    scoped_text = json.dumps(scoped_data)
+    for other in service.list_cases():
+        if other.case_id != "CASE-2001":
+            assert other.case_id not in scoped_text, f"{other.case_id} leaked into a customer payload"
+            assert other.customer_id not in scoped_text, f"{other.customer_id} leaked into a customer payload"
+    assert all("assessment" not in c for c in scoped_data["cases"])
+    assert scoped_data["review_outcomes"] == {}
+    lowered_scoped = scoped_text.lower()
+    scoped_leaks = sorted(
+        term for term in forbidden if term and term in lowered_scoped
+    )
+    assert not scoped_leaks, f"customer payload leaks fraud-internal terms: {scoped_leaks}"
+    assert "fraud_score" not in lowered_scoped and "fraudscore" not in lowered_scoped
+    for row in scoped_data["quarantine"]:
+        assert "findings" not in row and "text" not in row, row
+    # A staff principal still receives the full board, and an
+    # unknown role is refused by name rather than served.
+    staff = client.get(
+        "/console/data",
+        headers={"X-Principal-Id": "ops.desk", "X-Principal-Role": "staff_agent"},
+    )
+    assert staff.status_code == 200
+    assert len(staff.json()["cases"]) == len(service.list_cases())
+    refused = client.get(
+        "/console/data",
+        headers={"X-Principal-Id": "mallory", "X-Principal-Role": "superuser"},
+    )
+    assert refused.status_code == 401, refused.status_code
+    assert "unknown role" in refused.json()["detail"]
+
     print("CONSOLE CHECK: PASS")
     print(
         "money totals (cents): "

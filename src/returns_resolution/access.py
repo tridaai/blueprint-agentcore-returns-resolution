@@ -142,6 +142,25 @@ REASON_ACT_NOT_PERMITTED = "act_not_permitted"
 REASON_READ_ONLY_ROLE = "read_only_role"
 REASON_CASE_NOT_VISIBLE = "case_not_visible"
 REASON_CUSTOMER_SCOPE = "customer_scope"
+REASON_ACTOR_MISMATCH = "actor_mismatch"
+
+# The gateway actor (R11's vocabulary) a principal of each role
+# speaks as: the access layer and the gateway pack meet here, so
+# a carried principal can never invoke a tool under an actor its
+# role does not map to.
+GATEWAY_ACTOR_FOR_ROLE = {
+    ROLE_CUSTOMER: "customer",
+    ROLE_STAFF_AGENT: "staff",
+    ROLE_STAFF_SUPERVISOR: "staff",
+    ROLE_FRAUD_REVIEWER: "staff",
+    ROLE_AUDITOR: "auditor",
+    ROLE_SYSTEM: "staff",
+}
+
+# The reasons the surfaces render as a not-found response rather
+# than a named refusal: the case (or customer) is hidden, and the
+# response must not distinguish hidden from absent.
+HIDING_REASONS = {REASON_CASE_NOT_VISIBLE, REASON_CUSTOMER_SCOPE}
 
 
 class AccessDeniedError(RuntimeError):
@@ -223,6 +242,12 @@ ACCESS_PACK_V1 = AccessPack(
                 SURFACE_MONEY,
                 SURFACE_QUARANTINE,
                 SURFACE_MEMORY,
+                # The console surface is readable by a customer
+                # principal ONLY in its scoped form: the payload
+                # builder filters it to the customer's own cases
+                # and strips every staff-side field before it is
+                # served (the console check probes exactly that).
+                SURFACE_CONSOLE,
                 SURFACE_PACKS,
             ],
             acts=[ACT_INTAKE_RETURN],

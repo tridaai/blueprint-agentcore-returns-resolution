@@ -21,6 +21,7 @@ from .access import (
     ACT_INTAKE_RETURN,
     ACT_MANAGE_CASE,
     ACT_RELEASE_QUARANTINE,
+    REASON_ACTOR_MISMATCH,
     REASON_CASE_NOT_VISIBLE,
     REASON_CUSTOMER_SCOPE,
     ROLE_CUSTOMER,
@@ -805,7 +806,8 @@ class CaseService:
         the customer's."""
         target = case_id or "cost_ledger"
         if case_id is not None:
-            self._visible_case(principal, case_id, surface=SURFACE_COST_LEDGER, on=on)
+            if self._visible_case(principal, case_id, surface=SURFACE_COST_LEDGER, on=on) is None:
+                return None
         self._access.require_read(principal, SURFACE_COST_LEDGER, target=target, on=on)
         if case_id is not None:
             return self.list_cost_entries(case_id)
@@ -994,6 +996,65 @@ class CaseService:
             principal, ACT_EXECUTE_REFUND, surface=SURFACE_MONEY, target=case_id, on=as_of
         )
         return self.execute_top_up(case_id, idempotency_key=idempotency_key, as_of=as_of)
+
+    def require_surface(
+        self, principal: Principal, surface: str, *, target: str = "", on: date | None = None
+    ) -> None:
+        """A single surface grant, for the surfaces whose reads
+        are not already wrapped by a guarded method."""
+        self._access.require_read(principal, surface, target=target, on=on)
+
+    def deny_principal_mismatch(
+        self,
+        principal: Principal,
+        *,
+        surface: str,
+        target: str,
+        field: str,
+        claimed: str,
+        on: date | None = None,
+    ) -> None:
+        """Refuse (and record) an act whose body names a different
+        actor than the calling principal: under access control the
+        act of record and the authenticated caller are the same
+        person, so a body claiming someone else's name is refused,
+        never silently rewritten."""
+        self._access.deny(
+            principal_id=principal.id,
+            role=principal.role,
+            surface=surface,
+            target=target,
+            reason=REASON_ACTOR_MISMATCH,
+            detail=(
+                f"the act's named {field} ({claimed}) is not the calling "
+                f"principal ({principal.id})"
+            ),
+            on=on,
+        )
+
+    def memory_retention_status_as(
+        self,
+        principal: Principal,
+        customer_id: str,
+        *,
+        as_of: date | None = None,
+        actor: str = "api",
+        on: date | None = None,
+    ) -> dict:
+        """The retention read under the same scope as the memory
+        reads: surface grant, then the customer scope."""
+        self._access.require_read(principal, SURFACE_MEMORY, target=customer_id, on=on)
+        if principal.role == ROLE_CUSTOMER and customer_id != principal.id:
+            self._access.deny(
+                principal_id=principal.id,
+                role=principal.role,
+                surface=SURFACE_MEMORY,
+                target=customer_id,
+                reason=REASON_CUSTOMER_SCOPE,
+                detail="a customer principal reads only its own memory",
+                on=on,
+            )
+        return self.memory_retention_status(customer_id, as_of=as_of, actor=actor)
 
     def require_manage_case(
         self, principal: Principal, case_id: str, *, on: date | None = None
