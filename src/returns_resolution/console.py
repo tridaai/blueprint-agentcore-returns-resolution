@@ -11,6 +11,13 @@ total, band and provenance — never the detailed assessment payload.
 The detailed payload remains available through the case APIs for
 the systems and auditors that already use them; the console does
 not need it to operate the queues.
+
+A second narrowing (R15): the console carries NO customer text at
+all — neither a quarantine item's raw text nor a released view's
+render text. The quarantine queue is metadata: case, source,
+findings, state. The text itself lives behind the staff API, where
+a release decision is made; an operator screen that renders the
+hostile text it exists to contain would defeat the quarantine.
 """
 
 from __future__ import annotations
@@ -179,6 +186,23 @@ def _sum_rows(rows: list[dict]) -> str:
     return format(total, ".2f")
 
 
+def _quarantine_row(service: CaseService, item) -> dict:
+    """One quarantine item as console metadata — never its text."""
+    view = service.quarantine_view_for(item.quarantine_id)
+    return {
+        "quarantine_id": item.quarantine_id,
+        "case_id": item.case_id,
+        "source_surface": item.source_surface,
+        "field_name": item.field_name,
+        "received_on": item.received_on.isoformat(),
+        "risk": item.risk,
+        "state": service.quarantine_state(item),
+        "findings": [f.finding_id for f in item.findings],
+        "view_form": view.form if view is not None else None,
+        "released_by": view.released_by if view is not None else None,
+    }
+
+
 def build_console_data(service: CaseService) -> dict:
     """The board, queues, money and gateway views in one read."""
     cases = service.list_cases()
@@ -243,6 +267,10 @@ def build_console_data(service: CaseService) -> dict:
             "invocations": [_dump(c) for c in service.list_all_tool_calls()],
             "policy_pack": _dump(service.get_gateway_policy_pack()),
         },
+        "quarantine": [
+            _quarantine_row(service, item)
+            for item in service.list_all_quarantine_items()
+        ],
         "review_outcomes": service.get_scoring_pack().review_outcomes,
     }
 
@@ -335,5 +363,24 @@ def build_case_detail(service: CaseService, case_id: str) -> dict | None:
         "messages": [_dump(m) for m in service.list_messages(case_id)],
         "memory_records": memory_records,
         "cost_entries": [_dump(e) for e in service.list_cost_entries(case_id)],
+        "quarantine": {
+            "items": [
+                _quarantine_row(service, item)
+                for item in service.list_quarantine_items(case_id)
+            ],
+            "views": [
+                {
+                    "view_id": v.view_id,
+                    "quarantine_id": v.quarantine_id,
+                    "form": v.form,
+                    "transformations": v.transformations,
+                    "released_by": v.released_by,
+                    "release_act_id": v.release_act_id,
+                    "created_on": v.created_on.isoformat(),
+                }
+                for v in service.list_quarantine_views(case_id)
+            ],
+            "acts": [_dump(a) for a in service.list_quarantine_acts(case_id)],
+        },
         "timeline": _dump(timeline),
     }

@@ -178,6 +178,9 @@
     <div id="approvalQueue"></div>
     <h3>Recovery due</h3>
     <div id="recoveryQueue"></div>
+    <h3>Quarantine queue</h3>
+    <p class="muted">Customer text held by the R15 injection quarantine. This queue is metadata only — case, source, findings, state. The text itself never renders here; it is read behind the staff API, where a named release act happens.</p>
+    <div id="quarantineQueue"></div>
   </section>
 
   <section id="view-money" class="view">
@@ -360,6 +363,19 @@ function renderRecoveryQueue(data) {
   return `<div class="table-wrap"><table><thead><tr><th>Case</th><th>Amount</th><th>Created</th><th>Reason</th><th>Status</th></tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
+function renderQuarantineQueue(data) {
+  const rows = data.quarantine || [];
+  if (!rows.length) return `<div class="empty">No customer text is in quarantine.</div>`;
+  const body = rows.map((item) => `<tr>
+    <td><strong>${escapeHtml(item.quarantine_id)}</strong><br><span class="muted">${escapeHtml(item.case_id)}</span></td>
+    <td>${escapeHtml(item.source_surface)}<br><span class="muted">${escapeHtml(item.field_name)}</span></td>
+    <td>${escapeHtml((item.findings || []).join(", ") || "—")}</td>
+    <td>${pill(item.state, item.state === "held" ? "warn" : "good")}<br><span class="muted">${escapeHtml(item.view_form || "no view")}</span></td>
+    <td>${escapeHtml(item.received_on)}</td>
+  </tr>`).join("");
+  return `<div class="table-wrap"><table><thead><tr><th>Item</th><th>Source</th><th>Findings</th><th>State</th><th>Received</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
 function renderMoney(data) {
   const model = buildMoneyModel(data);
   const receiptRows = model.receipts.map((r) => `<tr>
@@ -465,6 +481,10 @@ function renderCaseDetail(detail) {
   const costRows = (detail.cost_entries || []).map((e) => `<tr>
     <td>${escapeHtml(e.seq)}</td><td>${escapeHtml(e.purpose)}</td><td>${escapeHtml(e.profile)}</td><td>${escapeHtml(e.status)}</td><td>${money(e.cost)}</td>
   </tr>`);
+  const quarantineRows = (detail.quarantine?.items || []).map((q) => `<tr>
+    <td>${escapeHtml(q.quarantine_id)}</td><td>${escapeHtml(q.source_surface)} / ${escapeHtml(q.field_name)}</td>
+    <td>${escapeHtml((q.findings || []).join(", ") || "—")}</td><td>${escapeHtml(q.state)}</td><td>${escapeHtml(q.view_form || "—")}</td>
+  </tr>`);
   const timelineRows = (detail.timeline?.entries || []).map((e) => `<tr>
     <td>${escapeHtml(e.at)}</td><td>${escapeHtml(e.stage)}</td><td>${escapeHtml(e.artefact_id)}</td><td>${escapeHtml(e.detail)}</td>
   </tr>`);
@@ -514,6 +534,9 @@ function renderCaseDetail(detail) {
     <h3>Model cost ledger</h3>
     ${simpleTable(["Sequence", "Purpose", "Profile", "Status", "Cost"], costRows)}
 
+    <h3>Quarantine (customer text — metadata only)</h3>
+    ${simpleTable(["Item", "Source", "Findings", "State", "View"], quarantineRows)}
+
     <h3>Timeline</h3>
     ${simpleTable(["Date", "Stage", "Artefact", "Detail"], timelineRows)}
     ${gaps ? `<h4>Named gaps</h4><ul>${gaps}</ul>` : ""}
@@ -530,6 +553,7 @@ function renderAll() {
   document.getElementById("reviewQueue").innerHTML = renderReviewQueue(DATA);
   document.getElementById("approvalQueue").innerHTML = renderApprovalQueue(DATA);
   document.getElementById("recoveryQueue").innerHTML = renderRecoveryQueue(DATA);
+  document.getElementById("quarantineQueue").innerHTML = renderQuarantineQueue(DATA);
   document.getElementById("moneyView").innerHTML = renderMoney(DATA);
   document.getElementById("gatewayView").innerHTML = renderGateway(DATA);
   bindQueueForms();
@@ -664,6 +688,7 @@ globalThis.ReturnsConsole = {
   buildMoneyModel,
   renderStageGrid,
   renderCaseRows,
+  renderQuarantineQueue,
   renderReviewQueue,
   renderApprovalQueue,
   renderRecoveryQueue,
