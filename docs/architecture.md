@@ -699,8 +699,69 @@ drops both the raw text and the views' render text, and the
 console check plants an instruction probe and asserts it appears
 in no payload and no rendered HTML.
 
+## Access control (R16)
+
+The access layer (`access.py`) stands in front of every surface
+and answers two questions the engines never ask: who is calling,
+and what may they see.
+
+**The pack.** `ACCESS_PACK_V1` (version `2026.10.1`) states, per
+role, the readable surfaces and the permitted acts, plus the
+act-requirements table. It is data with a fail-closed loader,
+like the policy, screening and scoring packs before it; the
+refusal messages name their required roles from the pack, so the
+message and the rule can never drift apart. Six roles: customer,
+staff_agent, staff_supervisor, fraud_reviewer, auditor, system.
+
+**The guard.** `AccessControl` authenticates a carried principal
+(id + role) — there is no default: a missing, malformed or
+unknown-role principal is denied with its named reason before
+any surface logic runs. Reads check surface grants; acts check
+the act table (an auditor's act attempt is denied
+`read_only_role` before the role check — read-only is a property
+of the role, not of the act). Every denial is written to the
+insert-only denial log (migration 0012) *before* the
+`AccessDeniedError` propagates, so a refusal is an artefact even
+when the caller disconnects.
+
+**Scoping.** The guarded service face (`*_as` methods) applies
+the surface grant first, then customer scope: a customer
+principal's case, order and memory reads resolve only their own
+records. The two scope denials — `case_not_visible`,
+`customer_scope` — are *hiding* reasons: the surfaces translate
+them into the resource's ordinary not-found response (the API's
+404 body for that endpoint; the Runtime's empty result), so a
+hidden case is indistinguishable from an absent one. Lists are
+scoped by filtering (a customer simply does not see other cases;
+filtering is not a refusal and records nothing). The customer
+case view is a separate, narrowed shape — decision, own refund
+figures, sent messages, quarantine item states — built field by
+field, so a staff field added tomorrow does not leak by default.
+
+**Actor binding.** Where an act names its actor in the body
+(approver, reviewer, released_by, gateway actor), a carried
+principal must *be* that actor: a mismatch is denied
+`actor_mismatch` and recorded, never silently rewritten.
+Gateway invocations resolve their actor from the principal's
+role (`GATEWAY_ACTOR_FOR_ROLE`: staff-side roles speak as
+`staff`, a customer as `customer`, an auditor as `auditor`) and
+the R11 policy pack judges that actor unchanged — R16 governs
+who may invoke and see; R11 still governs what tools may do.
+
+**Surfaces.** The API reads principals from
+`X-Principal-Id`/`X-Principal-Role` headers (a partial pair is
+malformed, not anonymous); the Runtime reads a `principal`
+object on the payload; the console builders take a principal and
+scope their payloads (a customer's console payload is filtered
+to their cases and stripped of the assessment, the review
+outcomes, the policy pack and quarantine findings — the console
+check probes exactly this). Calls carrying no principal remain
+the trusted-local operations path of R1–R15; in production,
+AgentCore Identity terminates caller identity in front of the
+surfaces, so every call carries one.
+
 ## What is deliberately not here yet
 
-Access control, reporting, carrier exceptions, red team,
+Reporting, carrier exceptions, red team,
 deploy artefacts. The README's honest status is the
 authoritative per-round account.

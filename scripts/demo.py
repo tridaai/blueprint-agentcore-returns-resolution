@@ -597,6 +597,48 @@ def main() -> int:
     )
     print(f"  a benign note is quoted verbatim: {benign.summary}")
 
+    print("\n--- access control: principals, roles, existence hiding (R16) ---")
+    from returns_resolution.access import AccessDeniedError as _Denied
+    from returns_resolution.access import Principal as _Principal
+    from returns_resolution.runtime_app import handle_payload as _dispatch
+
+    pack = service.get_access_pack()
+    print(
+        f"  access pack {pack.version}: roles "
+        + ", ".join(g.role for g in pack.roles)
+        + " — who may read and who may act is pack data, not code"
+    )
+    owner_id = service.get_case("CASE-2001").customer_id
+    me = {"id": owner_id, "role": "customer"}
+    probed = _dispatch(
+        service, {"action": "get_case", "case_id": "CASE-2003", "principal": me}
+    )
+    missing = _dispatch(
+        service, {"action": "get_case", "case_id": "CASE-9999", "principal": me}
+    )
+    print(
+        f"  customer {owner_id} probes CASE-2003 (someone else's): {probed}"
+    )
+    print(
+        f"  the same customer probes CASE-9999 (does not exist): {missing}"
+        f" — identical: {probed == missing}; the case is hidden, not refused"
+    )
+    agent = _Principal(id="j.agent", role="staff_agent")
+    try:
+        service.record_approval_as(agent, "CASE-2003", as_of=_date(2026, 10, 27))
+    except _Denied as exc:
+        print(f"  staff agent j.agent attempts the dual approval -> refused: {exc}")
+    auditor = _Principal(id="a.auditor", role="auditor")
+    log = service.list_access_denials_as(auditor)
+    print(
+        f"  the auditor reads the denial log ({len(log)} recorded refusal(s)):"
+    )
+    for entry in log:
+        print(
+            f"    {entry.denial_id}  {entry.principal_id} ({entry.role}) on "
+            f"{entry.surface}/{entry.target}: {entry.reason} — {entry.detail}"
+        )
+
     for case_id in ("CASE-2003", "CASE-2004"):
         case = service.get_case(case_id)
         print(f"\n--- {case_id} summary (figure-verified) ---")

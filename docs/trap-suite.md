@@ -110,6 +110,17 @@ the pack prescribes. Regression: T-M5/T-P4.
 | T-Q4 | A grading act whose photo-metadata field carries the T-Q1 text | The field is **absent** from the report and named in its `gaps` with the quarantine item id; the clean fields read as their views | A held field is a named gap — never silently dropped, never silently used |
 | T-Q5 | The console, with the T-Q1 text planted against an open case | The quarantine queue lists the item (findings, state held); the probe string appears in **no** payload, case detail or rendered HTML | The console carries no customer text at all — neither raw nor released |
 
+## Access traps (R16)
+
+| Trap | The trap | Expected outcome (hand-derived) | The deciding law |
+|---|---|---|---|
+| T-A1 | A customer principal reads another customer's case id — and a case id that does not exist | The two responses are **identical** (API: same 404 status and body bytes; Runtime: the same `{"case": null}`) — existence is hidden, not refused; the denial log records the probe with the requested id string as its only target | A hidden case answers as an absent case; the log records what the requester supplied, never what exists |
+| T-A2 | A call carrying a partial principal (id, no role) and a call carrying an invented role ("superuser") | Both refused with named reasons (`malformed_principal`, `unknown_role`) — 401 on the API — and both recorded; neither is downgraded to the anonymous path | A carried principal is always authenticated; there is no default principal |
+| T-A3 | A staff_agent attempts a dual approval and a quarantine release | Both refused; each refusal **names the required role** (staff_supervisor) from the pack's act table, and both stand in the denial log | Supervisor acts belong to the supervisor tier; the refusal message and the rule are the same data |
+| T-A4 | An auditor reads the cost ledger and the denial log, then attempts a refund execution | The reads succeed — the auditor sees everything; the act is refused `read_only_role` and the attempt itself joins the denial log the auditor can read | The auditor is read-only across everything; an auditor's act attempt is itself an auditable event |
+| T-A5 | A customer principal invokes a gateway tool claiming actor "staff"; then, honestly, as "customer" | The claim is refused `actor_mismatch` (recorded); the honest invocation reaches the gateway and is judged by the R11 pack — a policy denial envelope, not a label | A principal invokes only as the actor its role maps to; the access layer decides who, the policy pack decides what |
+| T-A6 | An approval whose body names a different approver than the calling supervisor principal | Refused `actor_mismatch` and recorded — the act of record and the authenticated caller must be the same person; the approval does not land under either name | Acts bind their named actor to the principal; a borrowed name is a refusal, never a rewrite |
+
 ## What the suite deliberately does not trap
 
 - **A 94.99 fraud score** — unreachable by construction (T-F2);
