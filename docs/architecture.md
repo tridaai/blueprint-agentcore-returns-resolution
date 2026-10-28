@@ -40,7 +40,8 @@ planted feed / POST /returns / Runtime invocation
   dispatch (`handle_payload`) is shared, so behaviour cannot drift
   between the two shapes.
 - **Memory, Gateway, Policy, Payments, Identity** are ports in the
-  design, wired in later rounds (R5/R9/R11/R16). In R1 the only
+  design, wired in across rounds (Payments R5, the Gateway-shaped
+  tool port R6; Memory R9, Policy R11, Identity R16). In R1 the only
   AgentCore-adjacent port with an implementation is the model port,
   whose `hosted-bedrock` profile is deliberately fail-closed: selected
   without a configured inference-profile ARN it raises, because a
@@ -223,9 +224,75 @@ with the reason recorded and **no receipt** — the case stays
 executable, and the retry continues the same execution record when
 it reuses the key.
 
+## Carrier tools behind the gateway, and the timeline (R6)
+
+Tool-shaped work leaves the service through one choke point. The
+`ToolGateway` holds MCP-style definitions for the round's four tools
+and is the only path that can invoke them: it canonicalises the
+inputs to JSON, hashes them, mints a call id from (tool, case,
+inputs hash, call date, per-case sequence), and records EVERY call —
+success or refusal — through the store before returning. Artefacts
+produced by a call are stamped with its id (`via_call_id`), so any
+label, void or booking can be traced to the exact recorded act and
+its exact inputs. Unknown tools refuse at the gateway; handler
+refusals are recorded with status `error` and re-raised in their
+original type, so surfaces map them precisely (409, not a generic
+500). Tool arguments cross the gateway as JSON; date fields arrive
+as ISO strings and parse strictly in the handlers.
+
+Behind the gateway sits the carrier port. Its only implementation
+is the local double — labelled in code and on every artefact —
+which is deterministic by construction: a label reference hashes
+the exact issue inputs including a per-act request reference, so
+replaying one issuance act returns its original reference while a
+fresh act after a void (new reference, recorded `supersedes`) gets
+a new one; `label_count` counts distinct references and is how the
+tests grade "the port issued exactly once". Its event script is a
+pure function of (label, as_of): tendered on the issue date,
+in transit the next day, received three days out — with void state
+passed in from the void artefact of record rather than the double's
+own memory, because a voided parcel must never read as received
+even across a port restart.
+
+The service handler for issuance is a chain of named refusals:
+case exists → fraud path open (the R4 guard, called, not
+reimplemented) → decision eligible (denial clauses named) → product
+of record → shipped weight of record → pack schedule entry. Only
+then does idempotency apply: an active label for the case is
+returned as-is, before any carrier call. The label artefact pins
+its schedule inputs (category, parcel weight, service level, cost)
+and its reconciliation against the computation's return-shipping
+line. The reconciliation is deliberately a field, computed at
+issuance: matched / retailer_absorbed (only when the deduction is
+zero AND the category is in the pack's free-return set — the pack's
+stated intent, cited in the detail) / variance (exact figure
+standing) / not_reconcilable (no computation, or the shipping line
+itself not computed — the missing input named). Nothing downstream
+ever has to guess whether a cost difference was seen.
+
+When a case already carries a customer summary, issuance extends it
+through the model port's label sentence and re-verifies the whole
+text BEFORE the label is stored — the verifier's universe gains
+exactly one figure (the label cost, as the artefact states it), so
+a summary quoting a label cost the artefact doesn't carry fails and
+no label lands. Voiding mirrors issuance's discipline: named actor,
+stated reason, carrier void first, then the void artefact and the
+label's status flip; a second void refuses because a void is a
+single act, not a state to re-enter.
+
+The timeline is the read model over all of it: a pure function
+assembling the case's stored artefacts into (recorded date, stage
+rank, insertion) order, one entry per artefact id. Its gap rules
+are expectations derived from state, checked in order — missing
+computation, missing disposition, then the label expectation (voided
+without replacement / executed without one / ship-by passed), then
+an undecided fraud block — each producing a named gap with the
+concrete fact (the ship-by date, the void) in its detail. It stores
+nothing; two reads of the same record produce the same view.
+
 ## What is deliberately not here yet
 
-Carrier tools (R6), warehouse grading (R7),
+Warehouse grading (R7),
 messaging verifier depth (R8), Memory port (R9), injection quarantine
 (R10), Gateway + Policy ports (R11), model cost ledger (R12), console
 (R13), Postgres parity + production smoke (R15), access control (R16),
