@@ -12,7 +12,9 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date
+from decimal import Decimal
 
+from .carrier import CarrierPort, CarrierProviderError, LocalCarrierDouble
 from .disposition import (
     ChannelTable,
     MatrixPack,
@@ -32,19 +34,27 @@ from .fraud import (
     score_case,
     verify_fraud_score,
 )
+from .gateway import ToolCallRecord, ToolDefinition, ToolError, ToolGateway
 from .modelport import ModelPort
 from .models import (
+    CarrierEvent,
+    CaseTimeline,
     DispositionDecision,
     ExecutionTransition,
     FraudReviewDecision,
     FraudScore,
+    LabelCostReconciliation,
+    LabelVoid,
     Order,
+    PickupBooking,
     RefundApproval,
     RefundComputation,
     RefundExecution,
     RefundReceipt,
     ReturnCase,
+    ReturnLabel,
     ReturnRequest,
+    money,
 )
 from .payments import (
     APPROVERS_REQUIRED,
@@ -57,6 +67,7 @@ from .policy import PolicyPack, load_policy_pack
 from .refunds import compute_refund, verify_computation
 from .seed import CATALOGUE, HISTORY_CASES, HISTORY_ORDERS, ORDERS, PRODUCT_WEIGHTS_GRAMS
 from .store import Store
+from .timeline import build_timeline
 from .verifier import verify_summary
 
 
@@ -90,6 +101,12 @@ class DuplicateRefundError(PaymentsError):
     under a different idempotency key. Refused, always."""
 
 
+class CarrierError(RuntimeError):
+    """A carrier/label tool act was refused — the message names the
+    unmet precondition (ineligible case, missing schedule entry,
+    non-bulky pickup, already-voided label, …)."""
+
+
 class CaseService:
     def __init__(
         self,
@@ -101,6 +118,7 @@ class CaseService:
         channels: ChannelTable | None = None,
         scoring_pack: ScoringPack | None = None,
         payments_port: PaymentsPort | None = None,
+        carrier_port: CarrierPort | None = None,
     ):
         self._store = store
         self._model = model_port
@@ -114,10 +132,31 @@ class CaseService:
         # until a deployment binds the configured AgentCore Payments
         # provider to this port.
         self._payments = payments_port or LocalPaymentsDouble()
+        # The carrier port likewise defaults to the LOCAL DOUBLE
+        # (labelled on every artefact): no real label prints until a
+        # deployment binds the retailer's carrier integration.
+        self._carrier = carrier_port or LocalCarrierDouble()
+        # The tool gateway (R6): the ONLY path carrier/label actions
+        # take. Handlers are the _tool_* methods below; every call —
+        # success or refusal — is recorded into the store.
+        self._gateway = ToolGateway(
+            handlers={
+                "create_return_label": self._tool_create_label,
+                "void_return_label": self._tool_void_label,
+                "get_carrier_events": self._tool_get_carrier_events,
+                "book_pickup": self._tool_book_pickup,
+            },
+            record=self._store.put_tool_call,
+            count_calls=self._store.count_tool_calls,
+        )
 
     @property
     def payments_port(self) -> PaymentsPort:
         return self._payments
+
+    @property
+    def carrier_port(self) -> CarrierPort:
+        return self._carrier
 
     # -- seeding ---------------------------------------------------------
     def seed_orders(self) -> int:
@@ -865,6 +904,418 @@ class CaseService:
     def get_execution_by_key(self, idempotency_key: str) -> RefundExecution | None:
         payload = self._store.get_execution_by_key(idempotency_key)
         return RefundExecution.model_validate(payload) if payload else None
+
+    # -- carrier tools + timeline (R6) ---------------------------------------
+    def tool_definitions(self) -> list[ToolDefinition]:
+        """The gateway's tool list, as the gateway itself states it."""
+        return self._gateway.definitions()
+
+    def invoke_tool(
+        self, tool_name: str, arguments: dict, *, case_id: str, called_on: date
+    ):
+        """The one tool-invocation path every surface shares. The
+        gateway records the call (success or refusal) and returns
+        the tool's result; refusals raise with their named reason."""
+        _record, result = self._gateway.invoke(
+            tool_name, arguments, case_id=case_id, called_on=called_on
+        )
+        return result
+
+    def list_tool_calls(self, case_id: str) -> list[ToolCallRecord]:
+        calls = [ToolCallRecord.model_validate(p) for p in self._store.list_tool_calls(case_id)]
+        return sorted(calls, key=lambda c: (c.called_on, c.call_id))
+
+    # -- label reads ---------------------------------------------------------
+    def list_labels(self, case_id: str) -> list[ReturnLabel]:
+        labels = [ReturnLabel.model_validate(p) for p in self._store.list_labels(case_id)]
+        return sorted(labels, key=lambda label: (label.issued_on, label.label_id))
+
+    def list_all_labels(self) -> list[ReturnLabel]:
+        return [ReturnLabel.model_validate(p) for p in self._store.list_all_labels()]
+
+    def get_label(self, label_id: str) -> ReturnLabel | None:
+        payload = self._store.get_label(label_id)
+        return ReturnLabel.model_validate(payload) if payload else None
+
+    def get_label_for_case(self, case_id: str) -> ReturnLabel | None:
+        """The case's most recent label artefact, whatever its status."""
+        labels = self.list_labels(case_id)
+        return labels[-1] if labels else None
+
+    def get_active_label(self, case_id: str) -> ReturnLabel | None:
+        """The case's active (issued, not voided) label, if any."""
+        for label in reversed(self.list_labels(case_id)):
+            if label.status == "issued":
+                return label
+        return None
+
+    def list_voids(self, case_id: str) -> list[LabelVoid]:
+        return [LabelVoid.model_validate(p) for p in self._store.list_voids(case_id)]
+
+    def list_pickups(self, case_id: str) -> list[PickupBooking]:
+        pickups = [PickupBooking.model_validate(p) for p in self._store.list_pickups(case_id)]
+        return sorted(pickups, key=lambda p: (p.scheduled_on, p.pickup_id))
+
+    def get_carrier_events(self, label_id: str, as_of: date) -> list[CarrierEvent]:
+        """A label's tracking events as of a date, read directly from
+        the carrier port (the recorded tool path is
+        `get_carrier_events` via invoke_tool; the timeline reads
+        through this same helper without minting tool calls)."""
+        label = self.get_label(label_id)
+        if label is None:
+            raise LookupError(f"unknown label: {label_id}")
+        return self._carrier_events_for(label, as_of)
+
+    def _carrier_events_for(self, label: ReturnLabel, as_of: date) -> list[CarrierEvent]:
+        voided = self._store.get_void_by_label(label.label_id) is not None
+        return self._carrier.fetch_events(
+            carrier_ref=label.carrier_ref,
+            label_id=label.label_id,
+            issued_on=label.issued_on,
+            as_of=as_of,
+            voided=voided,
+        )
+
+    # -- the carrier schedule + cost reconciliation --------------------------
+    def _label_schedule(self, category: str, weight_grams: int) -> tuple[str, Decimal]:
+        """Service level + cost for a parcel, from the pack's carrier
+        schedule: freight at or above the pack's weight threshold,
+        otherwise the category's stated level. A category or level
+        the schedule does not cover is named, never defaulted."""
+        pack = self._pack
+        if pack.label_freight_weight_grams and weight_grams >= pack.label_freight_weight_grams:
+            level = "freight"
+        else:
+            level = pack.label_service_by_category.get(category)
+            if level is None:
+                raise CarrierError(
+                    f"the policy pack's carrier schedule has no service level for category "
+                    f"{category!r} (missing input: label_service_by_category[{category}]); "
+                    "no label can be scheduled"
+                )
+        raw_cost = pack.label_costs.get(level)
+        if raw_cost is None:
+            raise CarrierError(
+                f"the policy pack's carrier schedule has no cost for service level "
+                f"{level!r} (missing input: label_costs[{level}]); no label can be priced"
+            )
+        return level, money(Decimal(raw_cost))
+
+    def _reconcile_label_cost(
+        self, case: ReturnCase, computation: RefundComputation | None, label_cost: Decimal
+    ) -> LabelCostReconciliation:
+        """The label's cost against the computation's return-shipping
+        deduction. A difference is classified and stated on the
+        artefact — matched, the pack's stated free-return intent
+        (retailer_absorbed), an open variance, or honestly
+        not_reconcilable when the computation's shipping line names
+        a missing input instead of an amount."""
+        if computation is None:
+            return LabelCostReconciliation(
+                label_cost=label_cost,
+                status="not_reconcilable",
+                detail="no refund computation of record to reconcile the label cost against",
+            )
+        line = next((ln for ln in computation.lines if ln.line_id == "return_shipping"), None)
+        if line is None or line.status != "computed" or line.amount is None:
+            missing = line.missing_input if line is not None and line.missing_input else "return_shipping"
+            return LabelCostReconciliation(
+                label_cost=label_cost,
+                status="not_reconcilable",
+                detail=(
+                    "the computation's return-shipping line is not computable "
+                    f"(missing input: {missing}); there is no deduction to reconcile against"
+                ),
+            )
+        deducted = line.amount
+        variance = money(label_cost - deducted)
+        product = CATALOGUE.get(case.request.sku)
+        category = product.category if product is not None else None
+        if variance == 0:
+            return LabelCostReconciliation(
+                deducted_amount=deducted,
+                label_cost=label_cost,
+                variance=variance,
+                status="matched",
+                detail="the label cost equals the computation's return-shipping deduction",
+            )
+        if deducted == 0 and category in self._pack.free_return_categories:
+            return LabelCostReconciliation(
+                deducted_amount=deducted,
+                label_cost=label_cost,
+                variance=variance,
+                status="retailer_absorbed",
+                detail=(
+                    f"{category} is a free-return category in the pack: the customer was "
+                    f"deducted $0.00 and the retailer carries the ${label_cost} label cost. "
+                    "The variance is the pack's stated intent — stated here, not absorbed silently"
+                ),
+            )
+        return LabelCostReconciliation(
+            deducted_amount=deducted,
+            label_cost=label_cost,
+            variance=variance,
+            status="variance",
+            detail=(
+                f"the carrier charges ${label_cost} for this label but the computation "
+                f"deducted ${deducted}; the ${variance} variance stands on the record"
+            ),
+        )
+
+    # -- tool handlers (invoked ONLY through the gateway) ---------------------
+    def _tool_create_label(self, *, call_id: str, case_id: str, issued_on: date) -> ReturnLabel:
+        """create_return_label: issue the case's return label.
+
+        Preconditions, each refusal naming the gap: the case exists;
+        its fraud path is open (the R4 guard — a label moves the
+        case forward, so a blocked case refuses here); the decision
+        is eligible; the product's shipped weight is of record (the
+        schedule prices by category and weight). Idempotent per
+        case: a case with an active label gets that label back —
+        no second artefact, no second carrier issue. The extended
+        customer summary (label reference + cost) is verified
+        against the artefacts BEFORE anything is stored, so an
+        unverified summary can never ride along with a label.
+        """
+        case = self.get_case(case_id)
+        if case is None:
+            raise LookupError(f"unknown case: {case_id}")
+        self.assert_refund_path_open(case_id)
+        decision = case.decision
+        if decision is None or not decision.eligible:
+            denied = (
+                ", ".join(c.clause_id for c in decision.clauses if c.effect == "deny")
+                if decision is not None
+                else "no decision of record"
+            )
+            raise CarrierError(
+                f"case {case_id} is not eligible for a return label (denied: {denied})"
+            )
+        active = self.get_active_label(case_id)
+        if active is not None:
+            return active
+        product = CATALOGUE.get(case.request.sku)
+        if product is None:
+            raise CarrierError(
+                f"case {case_id}'s sku {case.request.sku} is not in the catalogue; "
+                "the carrier schedule cannot be applied"
+            )
+        unit_weight = PRODUCT_WEIGHTS_GRAMS.get(case.request.sku)
+        if unit_weight is None:
+            raise CarrierError(
+                f"no shipped weight of record for sku {case.request.sku} "
+                "(missing input: product_ship_weight_grams); a label cannot be scheduled"
+            )
+        weight_grams = unit_weight * case.request.qty
+        service_level, cost = self._label_schedule(product.category, weight_grams)
+        prior = self.list_labels(case_id)
+        request_ref = f"{case_id}:label:{len(prior) + 1}"
+        result = self._carrier.create_label(
+            case_id=case_id,
+            request_ref=request_ref,
+            service_level=service_level,
+            category=product.category,
+            weight_grams=weight_grams,
+            cost=cost,
+            issued_on=issued_on,
+        )
+        computation = self.get_computation(case_id)
+        blob = json.dumps(
+            {
+                "case_id": case_id,
+                "carrier_ref": result.carrier_ref,
+                "request_ref": request_ref,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        label = ReturnLabel(
+            label_id="RL-" + hashlib.sha256(blob.encode()).hexdigest()[:16],
+            case_id=case_id,
+            provider=result.provider,
+            carrier_ref=result.carrier_ref,
+            service_level=service_level,
+            category=product.category,
+            weight_grams=weight_grams,
+            cost=cost,
+            reconciliation=self._reconcile_label_cost(case, computation, cost),
+            status="issued",
+            issued_on=issued_on,
+            policy_pack_version=self._pack.version,
+            via_call_id=call_id,
+            supersedes=prior[-1].label_id if prior else None,
+        )
+        # The summary gains the label reference once issued — and is
+        # re-verified against the artefacts (the label's cost is
+        # sayable only as the label states it) before it is stored.
+        label_composer = getattr(self._model, "compose_label_summary", None)
+        if case.summary is not None and computation is not None and label_composer is not None:
+            text = label_composer(decision, product.name, computation, label)
+            violations = verify_summary(text, decision, computation, label)
+            if violations:
+                raise FigureVerificationError(violations)
+            case.summary = text
+            self._store.put_case(case.model_dump(mode="json"))
+            self._store.put_summary(
+                case.case_id,
+                verified=True,
+                payload={
+                    "case_id": case.case_id,
+                    "text": text,
+                    "violations": [],
+                    "profile": self._model.profile_name,
+                },
+            )
+        self._store.put_label(label.model_dump(mode="json"))
+        return label
+
+    def _tool_void_label(
+        self, *, call_id: str, case_id: str, label_id: str, voided_by: str, reason: str, voided_on: date
+    ) -> LabelVoid:
+        """void_return_label: the void act. A named actor, a stated
+        reason, an active label of this case — each refusal names
+        its gap. The act is its own artefact; the label's status
+        flips and the void stands as the reason."""
+        voided_by = (voided_by or "").strip()
+        if not voided_by:
+            raise CarrierError("voiding a label requires a named actor")
+        reason = (reason or "").strip()
+        if not reason:
+            raise CarrierError("voiding a label requires a stated reason")
+        label = self.get_label(label_id)
+        if label is None or label.case_id != case_id:
+            raise LookupError(f"unknown label {label_id} for case {case_id}")
+        if label.status == "voided":
+            raise CarrierError(f"label {label_id} is already voided; a void is a single act")
+        try:
+            self._carrier.void_label(carrier_ref=label.carrier_ref)
+        except CarrierProviderError as exc:
+            raise CarrierError(str(exc)) from exc
+        blob = json.dumps(
+            {
+                "label_id": label_id,
+                "voided_by": voided_by,
+                "reason": reason,
+                "voided_on": voided_on.isoformat(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        void = LabelVoid(
+            void_id="LV-" + hashlib.sha256(blob.encode()).hexdigest()[:16],
+            label_id=label_id,
+            case_id=case_id,
+            voided_by=voided_by,
+            reason=reason,
+            voided_on=voided_on,
+        )
+        self._store.put_void(void.model_dump(mode="json"))
+        label.status = "voided"
+        self._store.put_label(label.model_dump(mode="json"))
+        return void
+
+    def _tool_get_carrier_events(
+        self, *, call_id: str, case_id: str, label_id: str, as_of: date
+    ) -> list[CarrierEvent]:
+        """get_carrier_events: the label's tracking events as of a
+        date, from the carrier port. Read-only."""
+        label = self.get_label(label_id)
+        if label is None or label.case_id != case_id:
+            raise LookupError(f"unknown label {label_id} for case {case_id}")
+        return self._carrier_events_for(label, as_of)
+
+    def _tool_book_pickup(
+        self, *, call_id: str, case_id: str, scheduled_on: date, label_id: str | None = None
+    ) -> PickupBooking:
+        """book_pickup: a carrier pickup for the case's active label.
+
+        Bulky categories only — the pack flags them, and the refusal
+        for any other category names that rule. The pickup collects
+        the labelled parcel, so an active label must exist first.
+        """
+        case = self.get_case(case_id)
+        if case is None:
+            raise LookupError(f"unknown case: {case_id}")
+        product = CATALOGUE.get(case.request.sku)
+        category = product.category if product is not None else None
+        if category not in self._pack.bulky_categories:
+            raise CarrierError(
+                f"category {category!r} is not a pack-flagged bulky category "
+                f"(bulky_categories: {', '.join(sorted(self._pack.bulky_categories))}); "
+                "carrier pickup is refused — the customer ships with the label"
+            )
+        if label_id is not None:
+            label = self.get_label(label_id)
+            if label is None or label.case_id != case_id:
+                raise LookupError(f"unknown label {label_id} for case {case_id}")
+            if label.status != "issued":
+                raise CarrierError(f"label {label_id} is {label.status}; a pickup needs an active label")
+        else:
+            label = self.get_active_label(case_id)
+            if label is None:
+                raise CarrierError(
+                    f"case {case_id} has no active label; a pickup collects the labelled "
+                    "parcel, so a label must be issued first"
+                )
+        result = self._carrier.book_pickup(
+            case_id=case_id,
+            carrier_ref=label.carrier_ref,
+            scheduled_on=scheduled_on,
+            window=self._pack.pickup_window,
+        )
+        blob = json.dumps(
+            {
+                "case_id": case_id,
+                "label_id": label.label_id,
+                "carrier_ref": result.carrier_ref,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        booking = PickupBooking(
+            pickup_id="PK-" + hashlib.sha256(blob.encode()).hexdigest()[:16],
+            case_id=case_id,
+            label_id=label.label_id,
+            provider=result.provider,
+            carrier_ref=result.carrier_ref,
+            scheduled_on=scheduled_on,
+            window=self._pack.pickup_window,
+            status="booked",
+            via_call_id=call_id,
+        )
+        self._store.put_pickup(booking.model_dump(mode="json"))
+        return booking
+
+    # -- the timeline ---------------------------------------------------------
+    def get_timeline(self, case_id: str, as_of: date) -> CaseTimeline:
+        """The case's derived timeline at `as_of`: every artefact of
+        record in recorded-date order, expected-but-absent artefacts
+        named as gaps. Carrier events are read through the port as
+        of the same date, so the view is a pure function of the
+        record and the date — never stored, never prose."""
+        case = self.get_case(case_id)
+        if case is None:
+            raise LookupError(f"unknown case: {case_id}")
+        labels = self.list_labels(case_id)
+        return build_timeline(
+            case=case,
+            computation=self.get_computation(case_id),
+            disposition=self.get_disposition(case_id),
+            fraud_scores=[
+                FraudScore.model_validate(p) for p in self._store.list_fraud_scores(case_id)
+            ],
+            fraud_reviews=self._reviews_for(case_id),
+            approvals=self.list_approvals(case_id),
+            executions=self.list_executions(case_id),
+            receipt=self.get_receipt(case_id),
+            labels=labels,
+            voids=self.list_voids(case_id),
+            pickups=self.list_pickups(case_id),
+            events_by_label={
+                label.label_id: self._carrier_events_for(label, as_of) for label in labels
+            },
+            as_of=as_of,
+        )
 
     # -- reads ---------------------------------------------------------------
     def get_case(self, case_id: str) -> ReturnCase | None:

@@ -15,7 +15,7 @@ import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
-from .models import EligibilityDecision, RefundComputation, money
+from .models import EligibilityDecision, RefundComputation, ReturnLabel, money
 
 _AMOUNT_RE = re.compile(r"\$(\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d+\.\d{2})")
 _DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
@@ -45,6 +45,7 @@ def verify_summary(
     text: str,
     decision: EligibilityDecision,
     computation: RefundComputation | None = None,
+    label: ReturnLabel | None = None,
 ) -> list[str]:
     """Return the list of violations; an empty list means verified.
 
@@ -54,11 +55,19 @@ def verify_summary(
     the computation produced (a restocking fee, the final refund after
     deductions) verifies against the computation, and nothing else
     new becomes sayable: the universe is still a closed computed set.
+
+    From R6, when a return label is supplied, the label's cost joins
+    the universe — a summary may quote the label cost only as the
+    label artefact states it. The label's variance and deducted
+    amount are already sayable when they equal computation figures;
+    the label adds its cost and nothing else.
     """
     violations: list[str] = []
     allowed_amounts = set(decision.allowed_amounts)
     if computation is not None:
         allowed_amounts |= computation.allowed_amounts
+    if label is not None:
+        allowed_amounts.add(label.cost)
     for amount in extract_amounts(text):
         if amount not in allowed_amounts:
             violations.append(f"amount ${amount} does not equal any computed decision value")

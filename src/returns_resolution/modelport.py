@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from .models import EligibilityDecision, RefundComputation
+from .models import EligibilityDecision, RefundComputation, ReturnLabel
 
 
 class ModelPort(Protocol):
@@ -83,6 +83,29 @@ class OfflineComposer:
             f"version {decision.policy_pack_version}."
         )
         return base
+
+    def compose_label_summary(
+        self,
+        decision: EligibilityDecision,
+        product_name: str,
+        computation: RefundComputation,
+        label: ReturnLabel,
+    ) -> str:
+        """R6 summary: the refund summary plus the issued label.
+
+        Built only from artefacts: the base text is the R2 refund
+        summary over the same decision + computation, and the label
+        sentence quotes the label artefact's own reference and cost
+        — figures the verifier admits only via the label. No date is
+        stated for the label (the decision's dates are the summary's
+        only dates), so the extended text stays inside the verified
+        universe by construction.
+        """
+        base = self.compose_refund_summary(decision, product_name, computation)
+        return base + (
+            f" Your return label {label.carrier_ref} is ready "
+            f"(service level {label.service_level}; label cost ${label.cost})."
+        )
 
     def compose_summary(self, decision: EligibilityDecision, product_name: str) -> str:
         if decision.eligible:

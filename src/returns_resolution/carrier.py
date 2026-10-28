@@ -11,8 +11,11 @@ an AgentCore Gateway target), and that integration — never this
 double — is what prints labels and moves parcels.
 
 Determinism is the double's contract, so behaviour is gradable:
-- A label reference is a hash of the exact issue inputs; issuing the
-  same parcel twice at the port returns the same reference.
+- A label reference is a hash of the exact issue inputs, including
+  the caller's per-act `request_ref`: replaying one issuance act
+  returns its original reference, while a fresh act (a re-issue
+  after a void, under a new request_ref) gets a fresh reference —
+  the way a real carrier issues a new tracking number per label.
 - Tracking events are a fixed script per label — tendered on the
   issue date, in transit the next day, received three days after
   issue — and a read at `as_of` sees only the events whose day has
@@ -72,6 +75,7 @@ class CarrierPort(Protocol):
         self,
         *,
         case_id: str,
+        request_ref: str,
         service_level: str,
         category: str,
         weight_grams: int,
@@ -105,8 +109,9 @@ class LocalCarrierDouble:
 
     Behaviour contract:
     - Label references are content-derived and stable: the same
-      issue inputs produce the same reference, and `label_count`
-      counts distinct references actually issued.
+      issue inputs (including the caller's per-act request_ref)
+      produce the same reference, and `label_count` counts distinct
+      references actually issued.
     - Voiding is by reference; voiding an unknown or already-voided
       reference raises, and a voided label's event script stops —
       a voided parcel is never reported received.
@@ -126,6 +131,7 @@ class LocalCarrierDouble:
         self,
         *,
         case_id: str,
+        request_ref: str,
         service_level: str,
         category: str,
         weight_grams: int,
@@ -136,6 +142,7 @@ class LocalCarrierDouble:
             "double-label",
             {
                 "case_id": case_id,
+                "request_ref": request_ref,
                 "service_level": service_level,
                 "category": category,
                 "weight_grams": weight_grams,
