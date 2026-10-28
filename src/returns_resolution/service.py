@@ -48,7 +48,24 @@ from .fraud import (
     score_from_history,
     verify_fraud_score,
 )
-from .gateway import ToolCallRecord, ToolDefinition, ToolError, ToolGateway
+from .gateway import (
+    GatewayRequest,
+    GatewayResponse,
+    PolicyDeniedError,
+    ToolCallRecord,
+    ToolDefinition,
+    ToolError,
+    ToolGateway,
+)
+from .gateway_policy import (
+    ACTOR_STAFF,
+    ACTOR_WAREHOUSE,
+    GatewayPolicyPack,
+    PolicyDenial,
+    ToolFacts,
+    evaluate_gateway_policy,
+    load_gateway_policy_pack,
+)
 from .memory import (
     EVENT_CASE_DECIDED,
     EVENT_CASE_GRADED,
@@ -110,6 +127,7 @@ from .payments import (
     LocalPaymentsDouble,
     PaymentsPort,
     PaymentsProviderError,
+    ProviderReceipt,
     approval_tier,
 )
 from .policy import PolicyPack, load_policy_pack
@@ -202,6 +220,7 @@ class CaseService:
         channels: ChannelTable | None = None,
         scoring_pack: ScoringPack | None = None,
         payments_port: PaymentsPort | None = None,
+        gateway_policy_pack: GatewayPolicyPack | None = None,
         carrier_port: CarrierPort | None = None,
         messaging_port: MessagingPort | None = None,
         disclosure_pack: DisclosurePack | None = None,
@@ -247,18 +266,29 @@ class CaseService:
             put_access=store.put_memory_access,
             count_access=store.count_memory_access,
         )
-        # The tool gateway (R6): the ONLY path carrier/label actions
-        # take. Handlers are the _tool_* methods below; every call —
-        # success or refusal — is recorded into the store.
+        # The gateway policy pack (R11): versioned data, evaluated
+        # by the gateway BEFORE any handler runs — actors on every
+        # tool, and the money tool's state and amount constraints.
+        # A denial is recorded with the policy's id and the handler
+        # is never reached.
+        self._gateway_policy = gateway_policy_pack or load_gateway_policy_pack()
+        # The tool gateway (R6, generalized R11): the ONLY path
+        # tool-shaped actions take — carrier tools, refund execution
+        # and the grading callback alike. Handlers are the _tool_*
+        # methods below; every call — success, refusal or denial —
+        # is recorded into the store.
         self._gateway = ToolGateway(
             handlers={
                 "create_return_label": self._tool_create_label,
                 "void_return_label": self._tool_void_label,
                 "get_carrier_events": self._tool_get_carrier_events,
                 "book_pickup": self._tool_book_pickup,
+                "execute_refund": self._tool_execute_refund,
+                "submit_grading_report": self._tool_submit_grading_report,
             },
             record=self._store.put_tool_call,
             count_calls=self._store.count_tool_calls,
+            policy_evaluator=self._evaluate_gateway_policy,
         )
 
     @property
@@ -1251,7 +1281,43 @@ class CaseService:
         self._store.put_approval(approval.model_dump(mode="json"))
         return approval
 
-    # -- refund execution (R5) ------------------------------------------------
+    # -- refund execution (R5; the port call rides the gateway since R11) -----
+    def _execute_via_gateway(
+        self,
+        *,
+        case_id: str,
+        computation_id: str,
+        amount: Decimal,
+        tender_allocations: list[TenderAllocation],
+        idempotency_key: str,
+        as_of: date,
+    ) -> ProviderReceipt:
+        """The payments port call, through the gateway as the
+        execute_refund tool (R11). The execution record already
+        stands in 'executing' (prepared by the caller, after its
+        own gates passed); the gateway evaluates the policy pack,
+        records the invocation, and the handler verifies the
+        prepared record before the port is called. A policy denial
+        propagates as PolicyDeniedError — the callers record the
+        execution as failed on it, exactly as on a provider
+        failure: no receipt, no money moved.
+        """
+        arguments = {
+            "case_id": case_id,
+            "computation_id": computation_id,
+            "amount": str(money(amount)),
+            "tender_allocations": [a.model_dump(mode="json") for a in tender_allocations],
+            "idempotency_key": idempotency_key,
+        }
+        _record, receipt = self._gateway.invoke(
+            "execute_refund",
+            arguments,
+            case_id=case_id,
+            called_on=as_of,
+            actor=ACTOR_STAFF,
+        )
+        return receipt
+
     def execute_refund(
         self, case_id: str, *, idempotency_key: str, as_of: date
     ) -> RefundReceipt:
@@ -1375,13 +1441,25 @@ class CaseService:
         self._store.put_execution(execution.model_dump(mode="json"))
 
         try:
-            provider_receipt = self._payments.execute_refund(
+            provider_receipt = self._execute_via_gateway(
                 case_id=case_id,
                 computation_id=computation.computation_id,
                 amount=computation.refund_total,
                 tender_allocations=computation.tender_allocations,
                 idempotency_key=key,
+                as_of=as_of,
             )
+        except PolicyDeniedError as exc:
+            execution.status = "failed"
+            execution.failure_reason = str(exc)
+            execution.transitions.append(
+                ExecutionTransition(state="failed", at=as_of, detail=str(exc))
+            )
+            self._store.put_execution(execution.model_dump(mode="json"))
+            raise PaymentsError(
+                f"gateway policy denied the refund execution for case {case_id}: {exc} "
+                "No receipt was written; the case stays executable."
+            ) from exc
         except PaymentsProviderError as exc:
             execution.status = "failed"
             execution.failure_reason = str(exc)
@@ -1446,21 +1524,105 @@ class CaseService:
         payload = self._store.get_execution_by_key(idempotency_key)
         return RefundExecution.model_validate(payload) if payload else None
 
-    # -- carrier tools + timeline (R6) ---------------------------------------
+    # -- the gateway: tools, policy, invocation log (R6 + R11) ----------------
     def tool_definitions(self) -> list[ToolDefinition]:
         """The gateway's tool list, as the gateway itself states it."""
         return self._gateway.definitions()
 
+    def get_gateway_policy_pack(self) -> GatewayPolicyPack:
+        """The gateway policy pack of record — the data the gateway
+        evaluates in front of every tool invocation."""
+        return self._gateway_policy
+
+    def _gateway_facts(self, tool: str, case_id: str, arguments: dict) -> ToolFacts:
+        """The facts a policy evaluation reads, built from the
+        artefacts of record for the case and the invocation's own
+        arguments. A fact that cannot be established stays None —
+        and a required fact that is None denies (fail-closed)."""
+        case = self.get_case(case_id)
+        facts = ToolFacts(case_exists=case is not None)
+        if case is not None:
+            facts.eligible = case.decision.eligible if case.decision is not None else None
+            facts.fraud_blocked = self.refund_path_blocked(case_id)
+            disposition = self.get_disposition(case_id)
+            facts.disposition_decided = (
+                disposition.status == "decided" if disposition is not None else None
+            )
+        if tool == "execute_refund":
+            computation_id = arguments.get("computation_id")
+            payload = next(
+                (
+                    p
+                    for p in self._store.list_computations()
+                    if p["computation_id"] == computation_id
+                ),
+                None,
+            )
+            if payload is not None:
+                computation = RefundComputation.model_validate(payload)
+                facts.computed_amount = computation.refund_total
+                if computation.refund_total is not None:
+                    tier = approval_tier(self._pack, computation.refund_total)
+                    approvers = {
+                        a.approver
+                        for a in self._approvals_for(case_id, computation.computation_id)
+                    }
+                    facts.approval_satisfied = len(approvers) >= APPROVERS_REQUIRED[tier]
+                existing = self._store.get_receipt_by_computation(computation.computation_id)
+                facts.computation_executed = (
+                    existing is not None
+                    and existing["idempotency_key"] != arguments.get("idempotency_key")
+                )
+            raw_amount = arguments.get("amount")
+            if raw_amount is not None:
+                try:
+                    facts.amount = money(Decimal(str(raw_amount)))
+                except Exception:
+                    facts.amount = None
+        return facts
+
+    def _evaluate_gateway_policy(
+        self, tool: str, actor: str, case_id: str, arguments: dict
+    ) -> PolicyDenial | None:
+        """The gateway's policy hook: the pack's denial of record
+        for this invocation, or None when it is permitted."""
+        return evaluate_gateway_policy(
+            self._gateway_policy,
+            tool=tool,
+            actor=actor,
+            facts=self._gateway_facts(tool, case_id, arguments),
+        )
+
     def invoke_tool(
-        self, tool_name: str, arguments: dict, *, case_id: str, called_on: date
+        self, tool_name: str, arguments: dict, *, case_id: str, called_on: date,
+        actor: str = ACTOR_STAFF,
     ):
         """The one tool-invocation path every surface shares. The
-        gateway records the call (success or refusal) and returns
-        the tool's result; refusals raise with their named reason."""
+        gateway evaluates the policy pack first (a denial raises
+        PolicyDeniedError and nothing executes), records the call —
+        success, refusal or denial — and returns the tool's result;
+        refusals raise with their named reason."""
         _record, result = self._gateway.invoke(
-            tool_name, arguments, case_id=case_id, called_on=called_on
+            tool_name, arguments, case_id=case_id, called_on=called_on, actor=actor
         )
         return result
+
+    def invoke_tool_envelope(
+        self, tool_name: str, arguments: dict, *, case_id: str, called_on: date,
+        actor: str = ACTOR_STAFF,
+    ) -> GatewayResponse:
+        """The same invocation through the port's envelope: the
+        outcome — result, denial or refusal — arrives in the
+        response, AgentCore-shaped, instead of raising."""
+        return self._gateway.invoke_envelope(
+            GatewayRequest(
+                tool=tool_name,
+                arguments=arguments,
+                case_id=case_id,
+                actor=actor,
+                called_on=called_on,
+            )
+        )
 
     def list_tool_calls(self, case_id: str) -> list[ToolCallRecord]:
         calls = [ToolCallRecord.model_validate(p) for p in self._store.list_tool_calls(case_id)]
@@ -1604,6 +1766,91 @@ class CaseService:
         )
 
     # -- tool handlers (invoked ONLY through the gateway) ---------------------
+    def _tool_execute_refund(
+        self,
+        *,
+        call_id: str,
+        case_id: str,
+        computation_id: str,
+        amount: str,
+        tender_allocations: list,
+        idempotency_key: str,
+    ) -> ProviderReceipt:
+        """execute_refund: the payments port call, and nothing else.
+
+        The gateway policy pack has already evaluated the call.
+        What remains is the prepared-execution contract: this tool
+        moves money ONLY against an execution record the service's
+        execution flow prepared — its gates passed, the record
+        stands in 'executing', and its amount is the amount this
+        call names. An invocation without a prepared record, or
+        naming a different case, computation or amount, is refused
+        here: there is no path from a bare tool call to the
+        payments port that skips the governed flow.
+        """
+        stored = self._store.get_execution_by_key(idempotency_key)
+        if stored is None:
+            raise PaymentsError(
+                "execute_refund names no prepared execution: refund money moves only "
+                "through the service's execution flow, which prepares an execution "
+                "record after its gates pass"
+            )
+        execution = RefundExecution.model_validate(stored)
+        if execution.case_id != case_id or execution.computation_id != computation_id:
+            raise PaymentsError(
+                f"the prepared execution for key {idempotency_key!r} names case "
+                f"{execution.case_id} / computation {execution.computation_id}, not "
+                f"case {case_id} / computation {computation_id}"
+            )
+        if execution.status != "executing":
+            raise PaymentsError(
+                f"the prepared execution {execution.execution_id} stands at "
+                f"{execution.status!r}, not 'executing'; the port is not called"
+            )
+        if money(execution.amount) != money(Decimal(str(amount))):
+            raise PaymentsError(
+                f"the amount argument {amount} does not equal the prepared "
+                f"execution's amount {execution.amount}; the port is not called"
+            )
+        return self._payments.execute_refund(
+            case_id=case_id,
+            computation_id=computation_id,
+            amount=money(Decimal(str(amount))),
+            tender_allocations=[
+                TenderAllocation.model_validate(a) for a in tender_allocations
+            ],
+            idempotency_key=idempotency_key,
+        )
+
+    def _tool_submit_grading_report(
+        self,
+        *,
+        call_id: str,
+        case_id: str,
+        grader: str,
+        graded_condition: str,
+        graded_on: date,
+        functional_test_result: str | None = None,
+        data_wipe_status: str | None = None,
+        damage_notes: str = "",
+        received_weight_grams: int | None = None,
+        wear_evidence: bool = False,
+    ) -> GradingReport:
+        """submit_grading_report: the warehouse's grading callback.
+        The grading act itself — gates and cascade — is
+        _record_grading_impl; this handler is its gateway face."""
+        return self._record_grading_impl(
+            case_id,
+            grader=grader,
+            graded_condition=graded_condition,
+            graded_on=graded_on,
+            functional_test_result=functional_test_result,
+            data_wipe_status=data_wipe_status,
+            damage_notes=damage_notes,
+            received_weight_grams=received_weight_grams,
+            wear_evidence=wear_evidence,
+        )
+
     def _tool_create_label(self, *, call_id: str, case_id: str, issued_on: date) -> ReturnLabel:
         """create_return_label: issue the case's return label.
 
@@ -1971,6 +2218,46 @@ class CaseService:
         return RefundAdjustment.model_validate(payload) if payload else None
 
     def record_grading(
+        self,
+        case_id: str,
+        *,
+        grader: str,
+        graded_condition: str,
+        graded_on: date,
+        functional_test_result: str | None = None,
+        data_wipe_status: str | None = None,
+        damage_notes: str = "",
+        received_weight_grams: int | None = None,
+        wear_evidence: bool = False,
+    ) -> GradingReport:
+        """Record the warehouse's grading report for a case.
+
+        Since R11 the grading act is the warehouse's callback
+        through the gateway (the submit_grading_report tool, actor
+        "warehouse"): the invocation is policy-evaluated and
+        recorded like every tool call, and the act itself — gates
+        and supersession cascade — runs as the tool's handler in
+        _record_grading_impl.
+        """
+        return self.invoke_tool(
+            "submit_grading_report",
+            {
+                "case_id": case_id,
+                "grader": grader,
+                "graded_condition": graded_condition,
+                "graded_on": graded_on,
+                "functional_test_result": functional_test_result,
+                "data_wipe_status": data_wipe_status,
+                "damage_notes": damage_notes,
+                "received_weight_grams": received_weight_grams,
+                "wear_evidence": wear_evidence,
+            },
+            case_id=case_id,
+            called_on=graded_on,
+            actor=ACTOR_WAREHOUSE,
+        )
+
+    def _record_grading_impl(
         self,
         case_id: str,
         *,
@@ -2488,13 +2775,25 @@ class CaseService:
                     )
 
         try:
-            provider_receipt = self._payments.execute_refund(
+            provider_receipt = self._execute_via_gateway(
                 case_id=case_id,
                 computation_id=computation.computation_id,
                 amount=adjustment.amount,
                 tender_allocations=allocations,
                 idempotency_key=namespaced,
+                as_of=as_of,
             )
+        except PolicyDeniedError as exc:
+            execution.status = "failed"
+            execution.failure_reason = str(exc)
+            execution.transitions.append(
+                ExecutionTransition(state="failed", at=as_of, detail=str(exc))
+            )
+            self._store.put_execution(execution.model_dump(mode="json"))
+            raise PaymentsError(
+                f"gateway policy denied the top-up execution for case {case_id}: {exc} "
+                "No receipt was written; the top-up adjustment stays open."
+            ) from exc
         except PaymentsProviderError as exc:
             execution.status = "failed"
             execution.failure_reason = str(exc)

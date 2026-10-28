@@ -74,6 +74,9 @@ def test_tool_definitions_are_listed_with_schemas():
     definitions = {d.name: d for d in service.tool_definitions()}
     assert set(definitions) == {
         "create_return_label", "void_return_label", "get_carrier_events", "book_pickup",
+        # R11: the gateway generalized — refund execution and the
+        # grading callback are gateway tools now too.
+        "execute_refund", "submit_grading_report",
     }
     for definition in definitions.values():
         assert definition.input_schema["type"] == "object"
