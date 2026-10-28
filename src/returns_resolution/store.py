@@ -61,8 +61,21 @@ _MIGRATION_0001_PG = _MIGRATION_0001_SQLITE.replace(
     "applied_at TEXT NOT NULL DEFAULT ''",
 )
 
+# Migration 0002 — refund computations (R2): one artefact per case,
+# keyed by its content-addressed computation id.
+_MIGRATION_0002_SQLITE = """
+CREATE TABLE IF NOT EXISTS computations (
+    computation_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL UNIQUE,
+    policy_pack_version TEXT NOT NULL,
+    is_final INTEGER NOT NULL,
+    payload TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("0001", _MIGRATION_0001_SQLITE, _MIGRATION_0001_PG),
+    ("0002", _MIGRATION_0002_SQLITE, _MIGRATION_0002_SQLITE),
 ]
 
 
@@ -81,6 +94,9 @@ class Store(Protocol):
     def get_summary(self, case_id: str) -> dict[str, Any] | None: ...
     def put_evidence(self, payload: dict[str, Any]) -> None: ...
     def list_evidence(self, case_id: str) -> list[dict[str, Any]]: ...
+    def put_computation(self, payload: dict[str, Any]) -> None: ...
+    def get_computation(self, case_id: str) -> dict[str, Any] | None: ...
+    def list_computations(self) -> list[dict[str, Any]]: ...
 
 
 class SqlStore:
@@ -261,6 +277,33 @@ class SqlStore:
         rows = self._query("SELECT payload FROM evidence WHERE case_id = ? ORDER BY evidence_id", (case_id,))
         return [json.loads(r["payload"]) for r in rows]
 
+    # -- computations (R2) -----------------------------------------------------
+    def put_computation(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO computations (computation_id, case_id, policy_pack_version, is_final, payload) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (computation_id) DO UPDATE SET payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO computations (computation_id, case_id, policy_pack_version, is_final, payload) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (computation_id) DO UPDATE SET payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["computation_id"],
+                payload["case_id"],
+                payload["policy_pack_version"],
+                1 if payload["is_final"] else 0,
+                json.dumps(payload),
+            ),
+        )
+
+    def get_computation(self, case_id: str) -> dict[str, Any] | None:
+        row = self._query_one("SELECT payload FROM computations WHERE case_id = ?", (case_id,))
+        return json.loads(row["payload"]) if row else None
+
+    def list_computations(self) -> list[dict[str, Any]]:
+        return [json.loads(r["payload"]) for r in self._query("SELECT payload FROM computations ORDER BY case_id")]
+
 
 class InMemoryStore:
     """Test double implementing the same port with dicts."""
@@ -271,9 +314,10 @@ class InMemoryStore:
         self._decisions: dict[str, dict] = {}
         self._summaries: dict[str, dict] = {}
         self._evidence: dict[str, dict] = {}
+        self._computations: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
-        return ["0001"]
+        return ["0001", "0002"]
 
     def put_order(self, payload: dict[str, Any]) -> None:
         self._orders[payload["order_id"]] = payload
@@ -316,3 +360,12 @@ class InMemoryStore:
 
     def list_evidence(self, case_id: str) -> list[dict[str, Any]]:
         return [e for e in self._evidence.values() if e["case_id"] == case_id]
+
+    def put_computation(self, payload: dict[str, Any]) -> None:
+        self._computations[payload["case_id"]] = payload
+
+    def get_computation(self, case_id: str) -> dict[str, Any] | None:
+        return self._computations.get(case_id)
+
+    def list_computations(self) -> list[dict[str, Any]]:
+        return [self._computations[k] for k in sorted(self._computations)]

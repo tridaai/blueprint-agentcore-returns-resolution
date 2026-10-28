@@ -11,7 +11,11 @@ decision record.
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from decimal import Decimal
+
+from pydantic import BaseModel, field_validator
+
+from .models import money
 
 
 class PolicyPack(BaseModel):
@@ -27,6 +31,21 @@ class PolicyPack(BaseModel):
     barred_conditions: set[str]
     # Days after an approved request by which the customer must ship.
     ship_within_days: int = 14
+    # --- Refund schedule (R2) -------------------------------------------
+    # Restocking fee rate by customer-declared condition, as a fraction
+    # of the item amount. A declared condition with no rate here makes
+    # the fee NOT COMPUTABLE (the engine names the missing rate) — it
+    # is never treated as a zero fee.
+    restocking_fee_rates: dict[str, str] = {}
+    # Categories whose return shipping is on the retailer (prepaid
+    # label, no deduction). Any other category is deducted the flat fee.
+    free_return_categories: set[str] = set()
+    return_shipping_fee: Decimal = Decimal("0.00")
+
+    @field_validator("return_shipping_fee", mode="before")
+    @classmethod
+    def _money(cls, v: object) -> Decimal:
+        return money(Decimal(str(v)))
 
 
 POLICY_PACK_V1 = PolicyPack(
@@ -40,6 +59,13 @@ POLICY_PACK_V1 = PolicyPack(
     excluded_categories={"gift_card", "consumable"},
     barred_conditions={"damaged_by_customer"},
     ship_within_days=14,
+    restocking_fee_rates={
+        "new_with_tags": "0.00",
+        "like_new": "0.10",
+        "used": "0.20",
+    },
+    free_return_categories={"apparel", "footwear"},
+    return_shipping_fee=Decimal("6.95"),
 )
 
 # Clause ids — stable names that decisions, evals and (later) customer

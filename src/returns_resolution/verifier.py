@@ -15,7 +15,7 @@ import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
-from .models import EligibilityDecision, money
+from .models import EligibilityDecision, RefundComputation, money
 
 _AMOUNT_RE = re.compile(r"\$(\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d+\.\d{2})")
 _DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
@@ -41,10 +41,24 @@ def extract_dates(text: str) -> list[date]:
     return dates
 
 
-def verify_summary(text: str, decision: EligibilityDecision) -> list[str]:
-    """Return the list of violations; an empty list means verified."""
+def verify_summary(
+    text: str,
+    decision: EligibilityDecision,
+    computation: RefundComputation | None = None,
+) -> list[str]:
+    """Return the list of violations; an empty list means verified.
+
+    The allowed amount universe is the decision's values plus — from
+    R2, when a refund computation is supplied — every computed line,
+    total and tender allocation of the computation. A figure that only
+    the computation produced (a restocking fee, the final refund after
+    deductions) verifies against the computation, and nothing else
+    new becomes sayable: the universe is still a closed computed set.
+    """
     violations: list[str] = []
-    allowed_amounts = decision.allowed_amounts
+    allowed_amounts = set(decision.allowed_amounts)
+    if computation is not None:
+        allowed_amounts |= computation.allowed_amounts
     for amount in extract_amounts(text):
         if amount not in allowed_amounts:
             violations.append(f"amount ${amount} does not equal any computed decision value")

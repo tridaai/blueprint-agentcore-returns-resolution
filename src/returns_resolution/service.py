@@ -12,8 +12,9 @@ from __future__ import annotations
 from .eligibility import case_id_for, evaluate
 from .evidence import EvidenceStore
 from .modelport import ModelPort
-from .models import Order, ReturnCase, ReturnRequest
+from .models import Order, RefundComputation, ReturnCase, ReturnRequest
 from .policy import PolicyPack, load_policy_pack
+from .refunds import compute_refund, verify_computation
 from .seed import CATALOGUE, ORDERS
 from .store import Store
 from .verifier import verify_summary
@@ -59,9 +60,16 @@ class CaseService:
         decision = evaluate(self._pack, order, product, request)
         self._store.put_decision(decision.model_dump(mode="json"))
 
+        computation = compute_refund(self._pack, order, product, request, decision)
+        self._store.put_computation(computation.model_dump(mode="json"))
+
         product_name = product.name if product else request.sku
-        summary_text = self._model.compose_summary(decision, product_name)
-        violations = verify_summary(summary_text, decision)
+        refund_composer = getattr(self._model, "compose_refund_summary", None)
+        if refund_composer is not None and decision.eligible:
+            summary_text = refund_composer(decision, product_name, computation)
+        else:
+            summary_text = self._model.compose_summary(decision, product_name)
+        violations = verify_summary(summary_text, decision, computation)
         case = ReturnCase(
             case_id=case_id_for(request.request_id),
             request=request,
@@ -69,6 +77,7 @@ class CaseService:
             customer_id=order.customer_id,
             status="summary_ready" if not violations else "summary_failed",
             decision=decision,
+            computation=computation,
             summary=summary_text if not violations else None,
         )
         self._store.put_case(case.model_dump(mode="json"))
@@ -92,6 +101,41 @@ class CaseService:
         record = self._evidence.put(case_id, kind, filename, content)
         self._store.put_evidence(record)
         return record
+
+    # -- computations (R2) ---------------------------------------------------
+    def get_computation(self, case_id: str) -> RefundComputation | None:
+        """The stored computation; computed+stored on demand for a case
+        decided before R2 (its decision and order are still pinned)."""
+        stored = self._store.get_computation(case_id)
+        if stored is not None:
+            return RefundComputation.model_validate(stored)
+        case = self.get_case(case_id)
+        if case is None or case.decision is None:
+            return None
+        order = self.get_order(case.order_id)
+        if order is None:
+            return None
+        computation = compute_refund(
+            self._pack, order, CATALOGUE.get(case.request.sku), case.request, case.decision
+        )
+        self._store.put_computation(computation.model_dump(mode="json"))
+        return computation
+
+    def verify_stored_computation(self, case_id: str) -> list[str]:
+        """Re-perform the stored computation's arithmetic; [] = intact."""
+        computation = self.get_computation(case_id)
+        case = self.get_case(case_id)
+        if computation is None or case is None or case.decision is None:
+            return ["no computation or decision for this case"]
+        order = self.get_order(case.order_id)
+        if order is None:
+            return ["order missing for this case"]
+        return verify_computation(
+            computation, self._pack, order, CATALOGUE.get(case.request.sku), case.request, case.decision
+        )
+
+    def list_computations(self) -> list[RefundComputation]:
+        return [RefundComputation.model_validate(p) for p in self._store.list_computations()]
 
     # -- reads ---------------------------------------------------------------
     def get_case(self, case_id: str) -> ReturnCase | None:

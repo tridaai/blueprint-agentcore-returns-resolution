@@ -54,6 +54,7 @@ def build_service(config: Config | None = None) -> CaseService:
 def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, Any]:
     """The one dispatch every surface shares. Actions:
     seed | intake_feed | intake {request} | get_case {case_id} |
+    get_computation {case_id} | verify_computation {case_id} |
     list_cases | list_orders.
     """
     action = payload.get("action", "intake_feed")
@@ -78,6 +79,12 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     if action == "get_case":
         case = service.get_case(payload["case_id"])
         return {"case": case.model_dump(mode="json") if case else None}
+    if action == "get_computation":
+        computation = service.get_computation(payload["case_id"])
+        return {"computation": computation.model_dump(mode="json") if computation else None}
+    if action == "verify_computation":
+        problems = service.verify_stored_computation(payload["case_id"])
+        return {"case_id": payload["case_id"], "ok": not problems, "problems": problems}
     if action == "list_cases":
         return {"cases": [c.model_dump(mode="json") for c in service.list_cases()]}
     if action == "list_orders":

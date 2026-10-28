@@ -84,6 +84,24 @@ def create_app(service: CaseService) -> FastAPI:
             raise HTTPException(status_code=404, detail="decision not found")
         return found.decision.model_dump(mode="json")
 
+    @app.get("/cases/{case_id}/computation")
+    def computation(case_id: str) -> dict:
+        found = service.get_computation(case_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="computation not found")
+        return found.model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/computation/verify")
+    def computation_verify(case_id: str) -> dict:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        problems = service.verify_stored_computation(case_id)
+        return {"case_id": case_id, "ok": not problems, "problems": problems}
+
+    @app.get("/computations")
+    def computations() -> list[dict]:
+        return [c.model_dump(mode="json") for c in service.list_computations()]
+
     @app.post("/cases/{case_id}/evidence")
     async def evidence(case_id: str, request: Request, kind: str = "photo", filename: str = "evidence.bin") -> dict:
         if service.get_case(case_id) is None:

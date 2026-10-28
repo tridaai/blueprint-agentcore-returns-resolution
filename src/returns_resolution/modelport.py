@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from .models import EligibilityDecision
+from .models import EligibilityDecision, RefundComputation
 
 
 class ModelPort(Protocol):
@@ -45,6 +45,44 @@ class OfflineComposer:
     """Deterministic summary built only from computed decision facts."""
 
     profile_name = "offline"
+
+    def compose_refund_summary(
+        self, decision: EligibilityDecision, product_name: str, computation: RefundComputation
+    ) -> str:
+        """R2 summary: quotes the refund computation, the money of record.
+
+        Only figures the computation computed are stated (fee/shipping
+        lines appear only when they are non-zero); while the
+        computation is not final the summary says exactly which input
+        is missing and states no refund total at all.
+        """
+        base = (
+            f"Your return of the {product_name} is approved. "
+            f"The item amount is ${decision.item_amount}. "
+        )
+        line_by_id = {line.line_id: line for line in computation.lines}
+        fee = line_by_id.get("restocking_fee")
+        if fee is not None and fee.amount:
+            base += f"A restocking fee of ${fee.amount} applies. "
+        shipping = line_by_id.get("return_shipping")
+        if shipping is not None and shipping.amount:
+            base += f"Return shipping of ${shipping.amount} is deducted. "
+        if computation.is_final and computation.refund_total is not None:
+            base += f"Your refund due is ${computation.refund_total}. "
+        else:
+            missing = ", ".join(c.missing_input for c in computation.not_computable)
+            base += (
+                "Your final refund is not yet computed — it is waiting on: "
+                f"{missing}. No refund figure is final until that input arrives. "
+            )
+        base += (
+            f"Your order was delivered on {decision.delivered_on} and you requested "
+            f"the return on {decision.requested_on}, within the return window that "
+            f"ends {decision.window_end}. Please ship the item back by "
+            f"{decision.ship_by}. This decision was taken under return policy "
+            f"version {decision.policy_pack_version}."
+        )
+        return base
 
     def compose_summary(self, decision: EligibilityDecision, product_name: str) -> str:
         if decision.eligible:

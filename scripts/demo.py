@@ -37,6 +37,15 @@ def main() -> int:
             f"pack={d.policy_pack_version}  clauses=[{clauses}]"
         )
 
+    for case_id in ("CASE-2003", "CASE-2006"):
+        computation = service.get_computation(case_id)
+        print(f"\n--- {case_id} refund computation ({computation.computation_id}, final={computation.is_final}) ---")
+        for line in computation.lines:
+            print(f"  {line.line_id:<16} {line.kind:<9} ${line.amount}  [{line.policy_ref}]")
+        print(f"  refund_total     ${computation.refund_total}")
+        for component in computation.not_computable:
+            print(f"  not computable: {component.component} — missing {component.missing_input}")
+
     for case_id in ("CASE-2003", "CASE-2004"):
         case = cases[case_id]
         print(f"\n--- {case_id} summary (figure-verified) ---")
