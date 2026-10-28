@@ -166,7 +166,7 @@ def test_feed_ingests_all_planted_requests():
 def test_sqlite_store_migrates_once_and_persists(tmp_path):
     path = tmp_path / "returns.db"
     store = SqlStore(sqlite_path=path)
-    assert store.migrate() == ["0001", "0002", "0003", "0004"]  # 0002 by R2 (computations), 0003 by R3 (dispositions), 0004 by R4 (fraud)
+    assert store.migrate() == ["0001", "0002", "0003", "0004", "0005"]  # 0002 by R2 (computations), 0003 by R3 (dispositions), 0004 by R4 (fraud), 0005 by R5 (approvals/executions/receipts)
     assert store.migrate() == [], "re-running migrations applies nothing"
     service = CaseService(store, OfflineComposer())
     service.seed_orders()

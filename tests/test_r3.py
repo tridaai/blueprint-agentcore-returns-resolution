@@ -302,7 +302,7 @@ def test_ingest_stays_idempotent_with_dispositions():
 def test_disposition_persists_through_the_sql_store(tmp_path):
     path = tmp_path / "returns.db"
     store = SqlStore(sqlite_path=path)
-    assert store.migrate() == ["0001", "0002", "0003", "0004"]
+    assert store.migrate() == ["0001", "0002", "0003", "0004", "0005"]
     assert store.migrate() == []
     service = CaseService(store, OfflineComposer())
     service.seed_orders()
