@@ -1,4 +1,4 @@
-"""Eval gate for Blueprint #18 (R1–R18).
+"""Eval gate for Blueprint #18 (R1–R19).
 
 Profiles (R10): the full scenario body runs once per store profile
 — in-memory and SQLite always, PostgreSQL when DATABASE_URL (or
@@ -272,6 +272,32 @@ Zero-tolerance counters against planted truth:
 - exception_status_leaks (R18): a customer principal served
   another customer's exception status, an un-narrowed status
   shape, or a claim read.
+- redteam_claim_double_settlements (R19): a claim settlement
+  counted that its state fold could not honour (same-day acts
+  folding by hash instead of lifecycle), a back-dated claim
+  act accepted, or a second settlement standing.
+- redteam_settlement_after_denial (R19): a settlement recorded
+  over a standing denial, or money counted for one.
+- redteam_top_up_into_open_exception (R19): a top-up executed
+  while a carrier exception stood open on the case — the
+  refund guard's seam.
+- redteam_damaged_limbo_cases (R19): a damaged exception whose
+  grading matched the declaration left unresolved, its refund
+  barred forever.
+- redteam_blame_terms_verified (R19): a customer payload
+  carrying an exception-pack blame term passing verification.
+- redteam_claim_filing_existence_distinguishable (R19): the
+  claim-filing endpoint answering a non-filer differently for
+  a real exception id than for an invented one.
+- redteam_runtime_actor_mismatch_accepted (R19): a Runtime
+  R18 action recorded under a payload actor that is not the
+  calling principal.
+- redteam_padded_principals_accepted (R19): a principal pair
+  with surrounding whitespace authenticating as the role it
+  merely resembles.
+- redteam_claim_superseded_computation_accepted (R19): a
+  carrier claim passing verification while bound to a
+  computation the record has superseded.
 
 Prints the counters and GATE: PASS/FAIL; exit code follows.
 """
@@ -436,6 +462,15 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
         "claim_settlement_moved_customer_figures": 0,
         "blame_language_in_customer_payloads": 0,
         "exception_status_leaks": 0,
+        "redteam_claim_double_settlements": 0,
+        "redteam_settlement_after_denial": 0,
+        "redteam_top_up_into_open_exception": 0,
+        "redteam_damaged_limbo_cases": 0,
+        "redteam_blame_terms_verified": 0,
+        "redteam_claim_filing_existence_distinguishable": 0,
+        "redteam_runtime_actor_mismatch_accepted": 0,
+        "redteam_padded_principals_accepted": 0,
+        "redteam_claim_superseded_computation_accepted": 0,
     }
 
     service = CaseService(make_store(), OfflineComposer())
@@ -3243,6 +3278,283 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
     except _AccessDenied as exc:
         if exc.reason != "read_only_role":
             counters["access_auditor_acts_accepted"] += 1
+
+    # -- R19: the red-team traps -------------------------------------------
+    # The rounds since R14 attacked as one system (docs/
+    # red-team.md): the claim fold, the top-up's missing guard,
+    # the damaged limbo, the verifier's blame vocabulary,
+    # existence on the filing endpoint, the Runtime's actor
+    # discipline, principals judged as carried, and claims
+    # bound to superseded computations. Every trap runs on a
+    # fresh service, so the fingerprint below is untouched.
+    from returns_resolution.access import (
+        AccessDeniedError as _AccessDenied19,
+    )
+    from returns_resolution.api import create_app as _create_app19
+    from returns_resolution.carrier_exceptions import (
+        CarrierExceptionError as _CarrierError19,
+    )
+    from returns_resolution.carrier_exceptions import (
+        load_exception_pack as _load_exception_pack19,
+    )
+    from returns_resolution.reporting import money_totals as _money_totals19
+    from returns_resolution.runtime_app import handle_payload as _handle19
+
+    _D19 = date(2026, 10, 27)
+    _LOST19 = date(2026, 11, 6)
+
+    def _rt_service():
+        carrier = LocalCarrierDouble()
+        svc = CaseService(make_store(), OfflineComposer(), carrier_port=carrier)
+        svc.seed_orders()
+        for _request in PLANTED_REQUESTS:
+            svc.ingest(_request)
+        return svc, carrier
+
+    def _rt_issue(svc, case_id):
+        svc.invoke_tool(
+            "create_return_label", {"case_id": case_id, "issued_on": _D19},
+            case_id=case_id, called_on=_D19,
+        )
+        return svc.get_label_for_case(case_id)
+
+    def _rt_lost(svc, carrier, case_id):
+        label = _rt_issue(svc, case_id)
+        carrier.set_script(carrier_ref=label.carrier_ref, script="stalled_in_transit")
+        return svc.detect_carrier_exceptions(case_id, as_of=_LOST19)[0]
+
+    # The claim fold: a same-day acknowledgement + settlement
+    # stands settled exactly once in the money, however the act
+    # ids hash; a back-dated act is refused at the door.
+    rt, rt_carrier = _rt_service()
+    _exc = _rt_lost(rt, rt_carrier, "CASE-2003")
+    rt.record_exception_act(
+        _exc.exception_id, action="refund_as_received", actor="s.reyes",
+        acted_on=_LOST19,
+    )
+    _claim = rt.file_carrier_claim(
+        _exc.exception_id, filed_by="s.reyes", filed_on=_LOST19
+    )
+    rt.record_claim_act(
+        _claim.claim_id, action="acknowledged", actor="s.reyes",
+        acted_on=date(2026, 11, 10),
+    )
+    rt.record_claim_act(
+        _claim.claim_id, action="settled", actor="s.reyes",
+        acted_on=date(2026, 11, 10), settled_amount=Decimal("151.95"),
+    )
+    _view = rt.claim_view(rt.get_claim(_claim.claim_id))
+    if (
+        _view["state"] != "settled"
+        or _view["settled_amount"] != "151.95"
+        or _money_totals19(rt)["carrier_claims_settled"] != Decimal("151.95")
+    ):
+        counters["redteam_claim_double_settlements"] += 1
+    try:
+        rt.record_claim_act(
+            _claim.claim_id, action="settled", actor="s.reyes",
+            acted_on=date(2026, 11, 12), settled_amount=Decimal("100.00"),
+        )
+        counters["redteam_claim_double_settlements"] += 1  # a second settlement
+    except _CarrierError19:
+        pass
+    if _money_totals19(rt)["carrier_claims_settled"] != Decimal("151.95"):
+        counters["redteam_claim_double_settlements"] += 1
+
+    # No settlement stands over a denial, and none is back-dated
+    # past the acknowledgement that must precede it.
+    _exc = _rt_lost(rt, rt_carrier, "CASE-2001")
+    rt.record_exception_act(
+        _exc.exception_id, action="refund_as_received", actor="s.reyes",
+        acted_on=_LOST19,
+    )
+    _claim = rt.file_carrier_claim(
+        _exc.exception_id, filed_by="s.reyes", filed_on=_LOST19
+    )
+    rt.record_claim_act(
+        _claim.claim_id, action="acknowledged", actor="s.reyes",
+        acted_on=date(2026, 11, 10),
+    )
+    try:
+        rt.record_claim_act(
+            _claim.claim_id, action="settled", actor="s.reyes",
+            acted_on=date(2026, 11, 9), settled_amount=Decimal("10.00"),
+        )
+        counters["redteam_claim_double_settlements"] += 1  # back-dated act
+    except _CarrierError19:
+        pass
+    rt.record_claim_act(
+        _claim.claim_id, action="denied", actor="s.reyes",
+        acted_on=date(2026, 11, 11), reason_code="carrier_liability_refused",
+    )
+    try:
+        rt.record_claim_act(
+            _claim.claim_id, action="settled", actor="s.reyes",
+            acted_on=date(2026, 11, 12), settled_amount=Decimal("10.00"),
+        )
+        counters["redteam_settlement_after_denial"] += 1
+    except _CarrierError19:
+        pass
+    if rt.claim_view(rt.get_claim(_claim.claim_id))["state"] != "denied":
+        counters["redteam_settlement_after_denial"] += 1
+
+    # The pack's blame terms refuse verification on the notice.
+    for _term in _load_exception_pack19().blame_terms:
+        _msg = rt.draft_message(
+            "CASE-2003", "carrier_exception_notice", as_of=_LOST19,
+            model_note=f"Update on your return: {_term}.",
+        )
+        if rt.verify_message(_msg.message_id, as_of=_LOST19).status != "refused":
+            counters["redteam_blame_terms_verified"] += 1
+
+    # The top-up carries the carrier guard: a payable top-up on
+    # a case whose replacement label was never tendered does
+    # not execute.
+    rt2, rt2_carrier = _rt_service()
+    _label = _rt_issue(rt2, "CASE-2003")
+    rt2.record_warehouse_receipt(
+        "CASE-2003", received_by="w.chen", received_on=date(2026, 10, 30)
+    )
+    rt2.record_approval("CASE-2003", approver="d.okafor", role="returns_lead", as_of=_D19)
+    rt2.execute_refund("CASE-2003", idempotency_key="eval-r19-rt2", as_of=_D19)
+    rt2.record_grading(
+        "CASE-2003", grader="p.novak", graded_condition="new_with_tags",
+        graded_on=date(2026, 10, 31), wear_evidence=False,
+    )
+    rt2.record_approval("CASE-2003", approver="d.okafor", role="returns_lead", as_of=_D19)
+    rt2.invoke_tool(
+        "void_return_label",
+        {
+            "case_id": "CASE-2003", "label_id": _label.label_id,
+            "voided_by": "s.reyes", "reason": "customer asked for a fresh label",
+            "voided_on": date(2026, 11, 1),
+        },
+        case_id="CASE-2003", called_on=date(2026, 11, 1),
+    )
+    _rt_issue(rt2, "CASE-2003")
+    _label2 = rt2.get_active_label("CASE-2003")
+    rt2_carrier.set_script(carrier_ref=_label2.carrier_ref, script="never_tendered")
+    rt2.detect_carrier_exceptions("CASE-2003", as_of=_LOST19)
+    try:
+        rt2.execute_top_up(
+            "CASE-2003", idempotency_key="eval-r19-rt2-top", as_of=date(2026, 11, 7)
+        )
+        counters["redteam_top_up_into_open_exception"] += 1
+    except PaymentsError:
+        pass
+
+    # Grading that matches the declaration clears the damaged
+    # exception — no limbo, and the held refund executes.
+    rt3, rt3_carrier = _rt_service()
+    _label = _rt_issue(rt3, "CASE-2003")
+    rt3_carrier.set_script(carrier_ref=_label.carrier_ref, script="damaged_in_transit")
+    _exc = rt3.detect_carrier_exceptions("CASE-2003", as_of=date(2026, 10, 31))[0]
+    rt3.record_warehouse_receipt(
+        "CASE-2003", received_by="w.chen", received_on=date(2026, 10, 30)
+    )
+    rt3.record_grading(
+        "CASE-2003", grader="p.novak", graded_condition="like_new",
+        graded_on=date(2026, 10, 31), wear_evidence=False,
+    )
+    if (
+        rt3.exception_view(rt3.get_exception(_exc.exception_id))["state"] != "resolved"
+        or rt3.carrier_block("CASE-2003") is not None
+    ):
+        counters["redteam_damaged_limbo_cases"] += 1
+    else:
+        rt3.record_approval(
+            "CASE-2003", approver="d.okafor", role="returns_lead", as_of=_D19
+        )
+        try:
+            rt3.execute_refund(
+                "CASE-2003", idempotency_key="eval-r19-rt3", as_of=date(2026, 10, 31)
+            )
+        except Exception:
+            counters["redteam_damaged_limbo_cases"] += 1
+
+    # Claim filing never confirms an exception to a non-filer.
+    from fastapi.testclient import TestClient as _TestClient19
+
+    rt4, rt4_carrier = _rt_service()
+    _exc = _rt_lost(rt4, rt4_carrier, "CASE-2003")
+    _client = _TestClient19(_create_app19(rt4))
+    _cust = rt4.get_case("CASE-2003").customer_id
+    _headers = {"X-Principal-Id": _cust, "X-Principal-Role": "customer"}
+    _body = {"filed_by": _cust, "filed_on": "2026-11-06"}
+    _real = _client.post(
+        "/cases/CASE-2003/claims", headers=_headers,
+        json={**_body, "exception_id": _exc.exception_id},
+    )
+    _fake = _client.post(
+        "/cases/CASE-2003/claims", headers=_headers,
+        json={**_body, "exception_id": "CEX-0000000000000000"},
+    )
+    if _real.status_code != _fake.status_code or _real.content != _fake.content:
+        counters["redteam_claim_filing_existence_distinguishable"] += 1
+
+    # The Runtime judges a payload actor against the principal.
+    _principal19 = {"id": "s.super", "role": "staff_supervisor"}
+    _resp = _handle19(
+        rt4,
+        {
+            "action": "record_exception_act", "exception_id": _exc.exception_id,
+            "exception_action": "escalate", "actor": "mallory",
+            "acted_on": "2026-11-06", "principal": _principal19,
+        },
+    )
+    if (
+        _resp.get("access_reason") != "actor_mismatch"
+        or rt4.list_exception_acts(_exc.exception_id)
+    ):
+        counters["redteam_runtime_actor_mismatch_accepted"] += 1
+
+    # A principal pair is judged as carried — padding is not a
+    # principal.
+    try:
+        rt4.authenticate_principal(
+            {"id": "s.super", "role": " staff_supervisor "},
+            surface="case", target="CASE-2003",
+        )
+        counters["redteam_padded_principals_accepted"] += 1
+    except _AccessDenied19 as exc:
+        if exc.reason != "malformed_principal":
+            counters["redteam_padded_principals_accepted"] += 1
+
+    # A claim verifies against the CURRENT computation: grading
+    # that supersedes the bound computation is named.
+    rt5, rt5_carrier = _rt_service()
+    _label = _rt_issue(rt5, "CASE-2003")
+    rt5.record_warehouse_receipt(
+        "CASE-2003", received_by="w.chen", received_on=date(2026, 10, 30)
+    )
+    rt5.invoke_tool(
+        "void_return_label",
+        {
+            "case_id": "CASE-2003", "label_id": _label.label_id,
+            "voided_by": "s.reyes", "reason": "customer asked for a fresh label",
+            "voided_on": date(2026, 11, 1),
+        },
+        case_id="CASE-2003", called_on=date(2026, 11, 1),
+    )
+    _rt_issue(rt5, "CASE-2003")
+    _label2 = rt5.get_active_label("CASE-2003")
+    rt5_carrier.set_script(carrier_ref=_label2.carrier_ref, script="stalled_in_transit")
+    _exc = rt5.detect_carrier_exceptions("CASE-2003", as_of=date(2026, 11, 11))[0]
+    rt5.record_exception_act(
+        _exc.exception_id, action="escalate", actor="s.reyes",
+        acted_on=date(2026, 11, 11),
+    )
+    _claim = rt5.file_carrier_claim(
+        _exc.exception_id, filed_by="s.reyes", filed_on=date(2026, 11, 11)
+    )
+    if rt5.verify_carrier_claim(_claim.claim_id) != []:
+        counters["redteam_claim_superseded_computation_accepted"] += 1
+    rt5.record_grading(
+        "CASE-2003", grader="p.novak", graded_condition="new_with_tags",
+        graded_on=date(2026, 10, 31), wear_evidence=False,
+    )
+    if rt5.verify_carrier_claim(_claim.claim_id) == []:
+        counters["redteam_claim_superseded_computation_accepted"] += 1
 
     # The cross-profile fingerprint (R10): the content-addressed
     # artefact ids the planted work minted on this profile's store.
