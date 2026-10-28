@@ -1,4 +1,13 @@
-"""Eval gate for Blueprint #18 (R1–R9).
+"""Eval gate for Blueprint #18 (R1–R10).
+
+Profiles (R10): the full scenario body runs once per store profile
+— in-memory and SQLite always, PostgreSQL when DATABASE_URL (or
+RETURNS_DATABASE_URL) is set. Every profile must produce the same
+zero counters, and the parity counters at the end compare the
+content-addressed artefact ids (receipts, fraud scores,
+computations, dispositions, labels, messages, memory records)
+across profiles: identical planted work must mint identical
+artefact ids on every store, or the gate fails.
 
 Zero-tolerance counters against planted truth:
 - eligibility_outcome_mismatches: decisions that differ from the
@@ -136,6 +145,7 @@ Prints the counters and GATE: PASS/FAIL; exit code follows.
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import date
 from decimal import Decimal
@@ -163,7 +173,7 @@ from returns_resolution.service import (
     MessagingError,
     PaymentsError,
 )
-from returns_resolution.store import InMemoryStore
+from returns_resolution.store import InMemoryStore, SqlStore
 from returns_resolution.verifier import verify_summary
 
 REFUND_FIXTURES = {
@@ -192,7 +202,7 @@ class _TamperedComposer:
         return "Your refund due is $999.99. Please ship by 2027-01-01."
 
 
-def main() -> int:
+def run_scenarios(make_store) -> tuple[dict, dict]:
     counters = {
         "eligibility_outcome_mismatches": 0,
         "clause_mismatches": 0,
@@ -238,7 +248,7 @@ def main() -> int:
         "unlogged_memory_retrievals": 0,
     }
 
-    service = CaseService(InMemoryStore(), OfflineComposer())
+    service = CaseService(make_store(), OfflineComposer())
     service.seed_orders()
     decisions = {}
     for request in PLANTED_REQUESTS:
@@ -329,7 +339,7 @@ def main() -> int:
         named = {c.component for c in computation.not_computable}
         if computation.eligible and "tender_allocation" not in named and not computation.tender_allocations:
             counters["partial_state_mislabeled"] += 1
-    tampered_service = CaseService(InMemoryStore(), _TamperedComposer())
+    tampered_service = CaseService(make_store(), _TamperedComposer())
     tampered_service.seed_orders()
     try:
         tampered_service.ingest(PLANTED_REQUESTS[0])
@@ -483,7 +493,7 @@ def main() -> int:
     # cards -> 20 = 95.00 FRAUD_REVIEW; CUST-WARD wardrobing 3x12=36
     # at cap, everything else named-insufficient or zero = 36.00
     # MONITOR; every R1 feed customer scores 0.00 CLEAR.
-    fraud = CaseService(InMemoryStore(), OfflineComposer())
+    fraud = CaseService(make_store(), OfflineComposer())
     fraud.seed_orders()
     fraud.seed_history()
     for request in PLANTED_REQUESTS:
@@ -540,7 +550,7 @@ def main() -> int:
             counters["fraud_score_irreproducibility"] += 1
     if fraud.rescore_case("CASE-3008").score_id != ser.fraud_score.score_id:
         counters["fraud_score_irreproducibility"] += 1
-    twin = CaseService(InMemoryStore(), OfflineComposer())
+    twin = CaseService(make_store(), OfflineComposer())
     twin.seed_orders()
     twin.seed_history()
     twin_ser = twin.ingest(FRAUD_FEED_REQUESTS[0])
@@ -607,7 +617,7 @@ def main() -> int:
     # double refund is a count, not an opinion.
     DAY5 = date(2026, 10, 27)
     double = LocalPaymentsDouble()
-    money = CaseService(InMemoryStore(), OfflineComposer(), payments_port=double)
+    money = CaseService(make_store(), OfflineComposer(), payments_port=double)
     money.seed_orders()
     for request in PLANTED_REQUESTS:
         money.ingest(request)
@@ -685,7 +695,7 @@ def main() -> int:
     # through the R4 guard; after the named clearance it executes
     # through the ordinary gates.
     blocked_double = LocalPaymentsDouble()
-    blocked = CaseService(InMemoryStore(), OfflineComposer(), payments_port=blocked_double)
+    blocked = CaseService(make_store(), OfflineComposer(), payments_port=blocked_double)
     blocked.seed_orders()
     blocked.seed_history()
     blocked.ingest(FRAUD_FEED_REQUESTS[0])
@@ -714,7 +724,7 @@ def main() -> int:
     # receipt and no movement; the retry lands exactly one of each,
     # and the execution record carries the whole trail.
     flaky_double = LocalPaymentsDouble(fail_times={"eval-flaky": 1})
-    flaky = CaseService(InMemoryStore(), OfflineComposer(), payments_port=flaky_double)
+    flaky = CaseService(make_store(), OfflineComposer(), payments_port=flaky_double)
     flaky.seed_orders()
     for request in PLANTED_REQUESTS:
         flaky.ingest(request)
@@ -744,7 +754,7 @@ def main() -> int:
     # a fully walked case must claim none.
     DAY6 = date(2026, 10, 27)
     carrier = LocalCarrierDouble()
-    ship = CaseService(InMemoryStore(), OfflineComposer(), carrier_port=carrier)
+    ship = CaseService(make_store(), OfflineComposer(), carrier_port=carrier)
     ship.seed_orders()
     for request in PLANTED_REQUESTS:
         ship.ingest(request)
@@ -777,7 +787,7 @@ def main() -> int:
 
     # The fraud-blocked case refuses through the R4 guard — and its
     # timeline names the pending review decision as the gap.
-    blocked_ship = CaseService(InMemoryStore(), OfflineComposer())
+    blocked_ship = CaseService(make_store(), OfflineComposer())
     blocked_ship.seed_orders()
     blocked_ship.seed_history()
     blocked_ship.ingest(FRAUD_FEED_REQUESTS[0])
@@ -888,7 +898,7 @@ def main() -> int:
     GRADED7 = date(2026, 10, 31)
 
     def _grade_service():
-        svc = CaseService(InMemoryStore(), OfflineComposer())
+        svc = CaseService(make_store(), OfflineComposer())
         svc.seed_orders()
         return svc
 
@@ -1043,7 +1053,7 @@ def main() -> int:
     # Executed, then graded BETTER: the top-up, gated on the NEW
     # computation's approvals, in the topup: key domain, exactly once.
     topup_double = LocalPaymentsDouble()
-    owing = CaseService(InMemoryStore(), OfflineComposer(), payments_port=topup_double)
+    owing = CaseService(make_store(), OfflineComposer(), payments_port=topup_double)
     owing.seed_orders()
     owing.ingest(
         ReturnRequest(
@@ -1129,7 +1139,7 @@ def main() -> int:
     RECEIVED8 = date(2026, 10, 30)
     GRADED8 = date(2026, 10, 31)
     msg_double = LocalMessagingDouble()
-    msg = CaseService(InMemoryStore(), OfflineComposer(), messaging_port=msg_double)
+    msg = CaseService(make_store(), OfflineComposer(), messaging_port=msg_double)
     msg.seed_orders()
     msg.seed_history()
     for request in PLANTED_REQUESTS:
@@ -1252,7 +1262,7 @@ def main() -> int:
     # Milestone derivation, customer-scoped logged retrieval,
     # retention tombstones, store/memory score parity, and the
     # messaging universe extended to the case's OWN customer only.
-    mem = CaseService(InMemoryStore(), OfflineComposer())
+    mem = CaseService(make_store(), OfflineComposer())
     mem.seed_orders()
     mem.seed_history()
     if mem.sync_memory() != 9:
@@ -1354,7 +1364,7 @@ def main() -> int:
     # nothing, the tombstone counts the expired records, and the
     # expired figure is refused in a message.
     short = CaseService(
-        InMemoryStore(), OfflineComposer(),
+        make_store(), OfflineComposer(),
         memory_pack=MemoryPack(version="2026.10.1", retention_days=20),
     )
     short.seed_orders()
@@ -1394,9 +1404,113 @@ def main() -> int:
         ):
             counters["unlogged_memory_retrievals"] += 1
 
-    for name, value in counters.items():
+    # The cross-profile fingerprint (R10): the content-addressed
+    # artefact ids the planted work minted on this profile's store.
+    # Identical planted work must mint identical ids on every store.
+    fingerprint = {
+        "computations": sorted(
+            c["computation_id"] for c in service._store.list_computations()
+        ),
+        "dispositions": sorted(
+            d["disposition_id"] for d in service._store.list_dispositions()
+        ),
+        "fraud_scores": sorted(
+            sc["score_id"] for sc in fraud._store.list_all_fraud_scores()
+        ),
+        "receipts": sorted(
+            r["receipt_id"]
+            for svc in (money, flaky, owing)
+            for r in svc._store.list_receipts()
+        ),
+        "labels": sorted(
+            lbl["label_id"] for lbl in ship._store.list_all_labels()
+        ),
+        "messages": sorted(
+            m["message_id"] for m in msg._store.list_all_messages()
+        ),
+        "memory_records": sorted(
+            row["record_id"] for row in mem._store.list_memory_record_index()
+        ),
+    }
+    return counters, fingerprint
+
+
+def _sqlite_factory(tmp_root: Path):
+    import itertools
+
+    counter = itertools.count()
+
+    def make():
+        store = SqlStore(sqlite_path=tmp_root / f"eval-{next(counter)}.db")
+        store.migrate()
+        return store
+
+    return make
+
+
+def _postgres_factory(base_url: str):
+    import itertools
+
+    import psycopg
+
+    counter = itertools.count()
+
+    def make():
+        schema = f"eval_{next(counter)}"
+        with psycopg.connect(base_url, autocommit=True) as conn:
+            conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+        sep = "&" if "?" in base_url else "?"
+        store = SqlStore(database_url=f"{base_url}{sep}options=-csearch_path%3D{schema}")
+        store.migrate()
+        return store
+
+    return make
+
+
+def main() -> int:
+    import tempfile
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="returns-evals-"))
+    profiles: list[tuple[str, object]] = [
+        ("in-memory", lambda: InMemoryStore()),
+        ("sqlite", _sqlite_factory(tmp_root)),
+    ]
+    pg_url = os.environ.get("DATABASE_URL") or os.environ.get("RETURNS_DATABASE_URL")
+    if pg_url:
+        profiles.append(("postgres", _postgres_factory(pg_url)))
+
+    results: dict[str, tuple[dict, dict]] = {}
+    for label, factory in profiles:
+        counters, fingerprint = run_scenarios(factory)
+        results[label] = (counters, fingerprint)
+        print(f"--- profile: {label} ---")
+        for name, value in counters.items():
+            print(f"{name}: {value} (required 0)")
+
+    # Parity (R10): every profile's counters equal the first
+    # profile's, and the artefact-id fingerprints are identical.
+    labels = [label for label, _ in profiles]
+    base_counters, base_fingerprint = results[labels[0]]
+    parity = {"profile_counter_differences": 0, "cross_profile_artefact_id_mismatches": 0}
+    for label in labels[1:]:
+        counters, fingerprint = results[label]
+        for name, value in base_counters.items():
+            if counters.get(name) != value:
+                parity["profile_counter_differences"] += 1
+        for kind, ids in base_fingerprint.items():
+            if fingerprint.get(kind) != ids:
+                parity["cross_profile_artefact_id_mismatches"] += 1
+    print("--- parity across profiles ---")
+    for name, value in parity.items():
         print(f"{name}: {value} (required 0)")
-    failed = [k for k, v in counters.items() if v != 0]
+
+    failed = [
+        f"{label}:{name}"
+        for label, (counters, _) in results.items()
+        for name, value in counters.items()
+        if value != 0
+    ]
+    failed += [name for name, value in parity.items() if value != 0]
     print("GATE: PASS" if not failed else f"GATE: FAIL ({', '.join(failed)})")
     return 0 if not failed else 1
 
