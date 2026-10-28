@@ -446,8 +446,10 @@ class ToolGateway:
 
 
 def _result_ref(result: Any) -> str | None:
-    """The artefact id a call produced, where the result carries one."""
-    for attr in ("label_id", "void_id", "pickup_id", "provider_ref", "report_id"):
+    """The artefact id a call produced, where the result carries one.
+    report_id stands first: a grading report also carries the label
+    it grades, and the artefact the call PRODUCED is the report."""
+    for attr in ("report_id", "label_id", "void_id", "pickup_id", "provider_ref"):
         value = getattr(result, attr, None)
         if value:
             return str(value)

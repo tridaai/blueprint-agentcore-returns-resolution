@@ -354,6 +354,26 @@ def main() -> int:
         f"{len(service.list_memory_access_log())} in total"
     )
 
+    print("\n--- the gateway policy pack (AgentCore Policy: LOCAL DOUBLE — pack 2026.10.1) ---")
+    pack = service.get_gateway_policy_pack()
+    print(f"  {len(pack.policies)} policies, evaluated first-match in pack order, in front of every tool")
+    denial = service.invoke_tool_envelope(
+        "create_return_label", {"case_id": "CASE-2006", "issued_on": _date(2026, 10, 27)},
+        case_id="CASE-2006", called_on=_date(2026, 10, 27), actor="customer",
+    )
+    print(
+        f"  a customer invoking create_return_label: outcome={denial.outcome} — the transport "
+        f"succeeded; the denial rides back as JSON-RPC code {denial.error['code']} "
+        f"[{denial.error['data']['policy_id']}]: {denial.error['message']}"
+    )
+    print("  CASE-2003's invocation log (every tool-shaped act of the walk above):")
+    for call in service.list_tool_calls("CASE-2003"):
+        extra = f" policy {call.policy_id}" if call.policy_id else ""
+        print(
+            f"    {call.called_on}  {call.tool:<22} actor={call.actor:<10} "
+            f"status={call.status}{extra}  result={call.result_ref}"
+        )
+
     for case_id in ("CASE-2003", "CASE-2004"):
         case = service.get_case(case_id)
         print(f"\n--- {case_id} summary (figure-verified) ---")

@@ -1,4 +1,4 @@
-"""Eval gate for Blueprint #18 (R1–R10).
+"""Eval gate for Blueprint #18 (R1–R11).
 
 Profiles (R10): the full scenario body runs once per store profile
 — in-memory and SQLite always, PostgreSQL when DATABASE_URL (or
@@ -139,6 +139,20 @@ Zero-tolerance counters against planted truth:
 - unlogged_memory_retrievals: memory port reads that never
   reached the access log, or log entries missing their purpose,
   actor or customer scope.
+- gateway_policy_bypasses: forbidden gateway invocations that
+  landed, were denied by a different policy than the pack's
+  first-match order prescribes, executed anything on a denial
+  (a label, a money movement), or a denial envelope that is not
+  the AgentCore shape (outcome "denied", JSON-RPC code -32002).
+- gateway_denials_unrecorded: policy denials raised without a
+  matching denied record (policy id + actor) standing in the
+  invocation log, or denied records naming a policy id the pack
+  does not contain.
+- gateway_artefacts_without_invocation: receipts or grading
+  reports of record with no corresponding ok gateway invocation
+  (execute_refund carrying the receipt's provider reference,
+  submit_grading_report carrying the report's id) — money and
+  grading must exist only as recorded gateway calls.
 
 Prints the counters and GATE: PASS/FAIL; exit code follows.
 """
@@ -154,6 +168,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from returns_resolution.carrier import LocalCarrierDouble
+from returns_resolution.gateway import PolicyDeniedError
 from returns_resolution.intake import FRAUD_FEED_REQUESTS, PLANTED_REQUESTS
 from returns_resolution.memory import MemoryPack
 from returns_resolution.messaging import LocalMessagingDouble
@@ -242,6 +257,9 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
         "stale_message_sends": 0,
         "forbidden_content_sent": 0,
         "figure_fact_violations_sent": 0,
+        "gateway_policy_bypasses": 0,
+        "gateway_denials_unrecorded": 0,
+        "gateway_artefacts_without_invocation": 0,
         "cross_customer_leaks": 0,
         "memory_store_score_divergences": 0,
         "expired_memory_surfaces": 0,
@@ -1403,6 +1421,175 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
             or entry.customer_id not in ("CUST-CID", "CUST-SER", "CUST-WARD")
         ):
             counters["unlogged_memory_retrievals"] += 1
+
+    # ---- R11: the gateway + the policy pack ---------------------------
+    # Forbidden invocations, attempted: each must be denied by the
+    # named policy (first-match, in pack order), recorded as a denied
+    # invocation carrying that policy's id and the actor, and execute
+    # nothing. The permitted flows must stand in the invocation log:
+    # no receipt and no grading report without its gateway call.
+    gw_double = LocalPaymentsDouble()
+    gw = CaseService(make_store(), OfflineComposer(), payments_port=gw_double)
+    gw.seed_orders()
+    gw.seed_history()
+    for request in PLANTED_REQUESTS:
+        gw.ingest(request)
+    for request in FRAUD_FEED_REQUESTS:
+        gw.ingest(request)
+    pack_ids = {p.policy_id for p in gw.get_gateway_policy_pack().policies}
+
+    def _expect_denial(svc, tool, arguments, *, case_id, actor, policy_id):
+        known_ids = {c.call_id for c in svc.list_tool_calls(case_id)}
+        try:
+            svc.invoke_tool(tool, arguments, case_id=case_id, called_on=DAY7, actor=actor)
+            counters["gateway_policy_bypasses"] += 1  # the forbidden call landed
+            return
+        except PolicyDeniedError as exc:
+            if exc.denial.policy_id != policy_id:
+                counters["gateway_policy_bypasses"] += 1  # denied, by the wrong policy
+                return
+        recorded = [
+            c
+            for c in svc.list_tool_calls(case_id)
+            if c.call_id not in known_ids
+            and c.status == "denied"
+            and c.policy_id == policy_id
+            and c.actor == actor
+        ]
+        if len(recorded) != 1:
+            counters["gateway_denials_unrecorded"] += 1
+
+    comp_2003 = gw.get_computation("CASE-2003")
+    comp_2006 = gw.get_computation("CASE-2006")
+    comp_3008 = gw.get_computation("CASE-3008")
+
+    # A customer invokes nothing at the gateway — and no label lands.
+    _expect_denial(
+        gw, "create_return_label", {"case_id": "CASE-2003", "issued_on": DAY7},
+        case_id="CASE-2003", actor="customer", policy_id="GP-CUSTOMER-NO-TOOLS",
+    )
+    if gw.list_labels("CASE-2003"):
+        counters["gateway_policy_bypasses"] += 1
+    # Carrier writes are staff work; an auditor may read, never book.
+    _expect_denial(
+        gw, "book_pickup",
+        {"case_id": "CASE-2003", "scheduled_on": DAY7, "label_id": None},
+        case_id="CASE-2003", actor="auditor", policy_id="GP-CARRIER-WRITE-ACTORS",
+    )
+    # Money moves only for staff actors.
+    _expect_denial(
+        gw, "execute_refund",
+        {
+            "case_id": "CASE-2006", "computation_id": comp_2006.computation_id,
+            "amount": str(comp_2006.refund_total), "tender_allocations": [],
+            "idempotency_key": "eval-r11-warehouse",
+        },
+        case_id="CASE-2006", actor="warehouse", policy_id="GP-PAYMENT-ACTORS",
+    )
+    # The fraud hold denies at the gateway, before any approval talk.
+    _expect_denial(
+        gw, "execute_refund",
+        {
+            "case_id": "CASE-3008", "computation_id": comp_3008.computation_id,
+            "amount": str(comp_3008.refund_total), "tender_allocations": [],
+            "idempotency_key": "eval-r11-fraud",
+        },
+        case_id="CASE-3008", actor="staff", policy_id="GP-PAYMENT-FRAUD-HOLD",
+    )
+    # An unapproved computation does not execute at the gateway.
+    _expect_denial(
+        gw, "execute_refund",
+        {
+            "case_id": "CASE-2003", "computation_id": comp_2003.computation_id,
+            "amount": str(comp_2003.refund_total), "tender_allocations": [],
+            "idempotency_key": "eval-r11-unapproved",
+        },
+        case_id="CASE-2003", actor="staff", policy_id="GP-PAYMENT-APPROVAL",
+    )
+    # Approved now — but an amount above the computed figure is denied.
+    gw.record_approval("CASE-2003", approver="d.okafor", role="returns_lead", as_of=DAY7)
+    _expect_denial(
+        gw, "execute_refund",
+        {
+            "case_id": "CASE-2003", "computation_id": comp_2003.computation_id,
+            "amount": "999.99", "tender_allocations": [],
+            "idempotency_key": "eval-r11-inflated",
+        },
+        case_id="CASE-2003", actor="staff", policy_id="GP-PAYMENT-AMOUNT",
+    )
+    if gw_double.movement_count != 0:
+        counters["gateway_policy_bypasses"] += 1  # a denial moved money
+    # The governed execution lands — through the gateway, on the log.
+    receipt11 = gw.execute_refund("CASE-2003", idempotency_key="eval-r11-exec", as_of=DAY7)
+    if gw_double.movement_count != 1:
+        counters["gateway_policy_bypasses"] += 1
+    exec_calls = [
+        c for c in gw.list_tool_calls("CASE-2003")
+        if c.tool == "execute_refund" and c.status == "ok"
+    ]
+    if (
+        len(exec_calls) != 1
+        or exec_calls[0].result_ref != receipt11.provider_ref
+        or not exec_calls[0].result_hash
+    ):
+        counters["gateway_artefacts_without_invocation"] += 1
+    # A second execution under a fresh key is denied as already executed.
+    _expect_denial(
+        gw, "execute_refund",
+        {
+            "case_id": "CASE-2003", "computation_id": comp_2003.computation_id,
+            "amount": str(comp_2003.refund_total), "tender_allocations": [],
+            "idempotency_key": "eval-r11-again",
+        },
+        case_id="CASE-2003", actor="staff", policy_id="GP-PAYMENT-UNEXECUTED",
+    )
+    if gw_double.movement_count != 1:
+        counters["gateway_policy_bypasses"] += 1
+    # The grading callback belongs to the warehouse — not an auditor.
+    _expect_denial(
+        gw, "submit_grading_report",
+        {
+            "case_id": "CASE-2003", "grader": "p.novak", "graded_condition": "used",
+            "graded_on": GRADED7, "functional_test_result": None,
+            "data_wipe_status": None, "damage_notes": "",
+            "received_weight_grams": None, "wear_evidence": False,
+        },
+        case_id="CASE-2003", actor="auditor", policy_id="GP-GRADING-ACTORS",
+    )
+    if gw.list_grading_reports("CASE-2003"):
+        counters["gateway_policy_bypasses"] += 1
+    # The governed grading walk: label, receipt, grade — the report
+    # stands with its submit_grading_report invocation beside it.
+    _label7(gw, "CASE-2003")
+    gw.record_warehouse_receipt("CASE-2003", received_by="w.chen", received_on=RECEIVED7)
+    gw.record_grading(
+        "CASE-2003", grader="p.novak", graded_condition="used", graded_on=GRADED7
+    )
+    grading_calls = [
+        c for c in gw.list_tool_calls("CASE-2003")
+        if c.tool == "submit_grading_report" and c.status == "ok"
+    ]
+    reports11 = gw.list_grading_reports("CASE-2003")
+    if (
+        len(reports11) != 1
+        or len(grading_calls) != 1
+        or grading_calls[0].result_ref != reports11[0].report_id
+        or grading_calls[0].actor != "warehouse"
+    ):
+        counters["gateway_artefacts_without_invocation"] += 1
+    # The denial envelope: outcome "denied", JSON-RPC code -32002 —
+    # a successful transport carrying the denial, not an error.
+    envelope11 = gw.invoke_tool_envelope(
+        "create_return_label", {"case_id": "CASE-2006", "issued_on": DAY7},
+        case_id="CASE-2006", called_on=DAY7, actor="customer",
+    )
+    if envelope11.outcome != "denied" or (envelope11.error or {}).get("code") != -32002:
+        counters["gateway_policy_bypasses"] += 1
+    # Every denied record on this service names a policy in the pack.
+    for case in gw.list_cases():
+        for call in gw.list_tool_calls(case.case_id):
+            if call.status == "denied" and call.policy_id not in pack_ids:
+                counters["gateway_denials_unrecorded"] += 1
 
     # The cross-profile fingerprint (R10): the content-addressed
     # artefact ids the planted work minted on this profile's store.
