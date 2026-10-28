@@ -168,6 +168,59 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 );
 """
 
+# Migration 0007 — warehouse grading (R7). Computations and
+# dispositions become CHAINS per case: grading supersedes the
+# declared-basis computation and disposition with new artefacts, and
+# the superseded ones must stay stored, byte-identical — so the
+# case_id UNIQUE constraints from 0002/0003 are rebuilt away (the
+# artefact ids stay primary keys). Plus the round's own tables:
+# warehouse receipts (one per label), grading reports (one finalised
+# report per case — structural, like the service's refusal), and
+# refund adjustments. The rebuild SQL is dialect-neutral, as with
+# 0002-0006.
+_MIGRATION_0007_SQLITE = """
+CREATE TABLE IF NOT EXISTS computations_chain (
+    computation_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    policy_pack_version TEXT NOT NULL,
+    is_final INTEGER NOT NULL,
+    payload TEXT NOT NULL
+);
+INSERT INTO computations_chain (computation_id, case_id, policy_pack_version, is_final, payload)
+    SELECT computation_id, case_id, policy_pack_version, is_final, payload FROM computations;
+DROP TABLE computations;
+ALTER TABLE computations_chain RENAME TO computations;
+CREATE TABLE IF NOT EXISTS dispositions_chain (
+    disposition_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    matrix_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+INSERT INTO dispositions_chain (disposition_id, case_id, matrix_version, status, payload)
+    SELECT disposition_id, case_id, matrix_version, status, payload FROM dispositions;
+DROP TABLE dispositions;
+ALTER TABLE dispositions_chain RENAME TO dispositions;
+CREATE TABLE IF NOT EXISTS warehouse_receipts (
+    warehouse_receipt_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    label_id TEXT NOT NULL UNIQUE,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS grading_reports (
+    report_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL UNIQUE,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS refund_adjustments (
+    adjustment_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("0001", _MIGRATION_0001_SQLITE, _MIGRATION_0001_PG),
     ("0002", _MIGRATION_0002_SQLITE, _MIGRATION_0002_SQLITE),
@@ -175,7 +228,21 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("0004", _MIGRATION_0004_SQLITE, _MIGRATION_0004_SQLITE),
     ("0005", _MIGRATION_0005_SQLITE, _MIGRATION_0005_SQLITE),
     ("0006", _MIGRATION_0006_SQLITE, _MIGRATION_0006_SQLITE),
+    ("0007", _MIGRATION_0007_SQLITE, _MIGRATION_0007_SQLITE),
 ]
+
+
+def _chain_head(payloads: list[dict[str, Any]], id_key: str) -> dict[str, Any] | None:
+    """The current artefact of a supersession chain: the one no
+    other artefact in the chain names as its `supersedes`. A broken
+    chain (every artefact superseded) falls back to the last by id —
+    stated here rather than hidden, and unreachable through the
+    service, which only ever appends heads."""
+    if not payloads:
+        return None
+    superseded = {p.get("supersedes") for p in payloads} - {None}
+    heads = [p for p in payloads if p[id_key] not in superseded]
+    return heads[-1] if heads else payloads[-1]
 
 
 class Store(Protocol):
@@ -196,9 +263,11 @@ class Store(Protocol):
     def put_computation(self, payload: dict[str, Any]) -> None: ...
     def get_computation(self, case_id: str) -> dict[str, Any] | None: ...
     def list_computations(self) -> list[dict[str, Any]]: ...
+    def list_computations_for_case(self, case_id: str) -> list[dict[str, Any]]: ...
     def put_disposition(self, payload: dict[str, Any]) -> None: ...
     def get_disposition(self, case_id: str) -> dict[str, Any] | None: ...
     def list_dispositions(self) -> list[dict[str, Any]]: ...
+    def list_dispositions_for_case(self, case_id: str) -> list[dict[str, Any]]: ...
     def put_fraud_score(self, payload: dict[str, Any]) -> None: ...
     def get_fraud_score(self, score_id: str) -> dict[str, Any] | None: ...
     def list_fraud_scores(self, case_id: str) -> list[dict[str, Any]]: ...
@@ -230,6 +299,15 @@ class Store(Protocol):
     def put_tool_call(self, payload: dict[str, Any]) -> None: ...
     def list_tool_calls(self, case_id: str) -> list[dict[str, Any]]: ...
     def count_tool_calls(self, case_id: str) -> int: ...
+    def put_warehouse_receipt(self, payload: dict[str, Any]) -> None: ...
+    def get_warehouse_receipt_for_label(self, label_id: str) -> dict[str, Any] | None: ...
+    def list_warehouse_receipts(self, case_id: str) -> list[dict[str, Any]]: ...
+    def put_grading_report(self, payload: dict[str, Any]) -> None: ...
+    def get_grading_report(self, report_id: str) -> dict[str, Any] | None: ...
+    def list_grading_reports(self, case_id: str) -> list[dict[str, Any]]: ...
+    def put_adjustment(self, payload: dict[str, Any]) -> None: ...
+    def get_adjustment(self, adjustment_id: str) -> dict[str, Any] | None: ...
+    def list_adjustments(self, case_id: str) -> list[dict[str, Any]]: ...
 
 
 class SqlStore:
@@ -431,11 +509,19 @@ class SqlStore:
         )
 
     def get_computation(self, case_id: str) -> dict[str, Any] | None:
-        row = self._query_one("SELECT payload FROM computations WHERE case_id = ?", (case_id,))
-        return json.loads(row["payload"]) if row else None
+        # The CURRENT computation: the head of the case's supersession
+        # chain (R7). Before R7 every chain has exactly one member.
+        return _chain_head(self.list_computations_for_case(case_id), "computation_id")
 
     def list_computations(self) -> list[dict[str, Any]]:
         return [json.loads(r["payload"]) for r in self._query("SELECT payload FROM computations ORDER BY case_id")]
+
+    def list_computations_for_case(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM computations WHERE case_id = ? ORDER BY computation_id",
+            (case_id,),
+        )
+        return [json.loads(r["payload"]) for r in rows]
 
     # -- dispositions (R3) ---------------------------------------------------
     def put_disposition(self, payload: dict[str, Any]) -> None:
@@ -458,11 +544,19 @@ class SqlStore:
         )
 
     def get_disposition(self, case_id: str) -> dict[str, Any] | None:
-        row = self._query_one("SELECT payload FROM dispositions WHERE case_id = ?", (case_id,))
-        return json.loads(row["payload"]) if row else None
+        # The CURRENT disposition: the head of the case's supersession
+        # chain (R7). Before R7 every chain has exactly one member.
+        return _chain_head(self.list_dispositions_for_case(case_id), "disposition_id")
 
     def list_dispositions(self) -> list[dict[str, Any]]:
         return [json.loads(r["payload"]) for r in self._query("SELECT payload FROM dispositions ORDER BY case_id")]
+
+    def list_dispositions_for_case(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM dispositions WHERE case_id = ? ORDER BY disposition_id",
+            (case_id,),
+        )
+        return [json.loads(r["payload"]) for r in rows]
 
     # -- fraud scores + reviews (R4) --------------------------------------
     def put_fraud_score(self, payload: dict[str, Any]) -> None:
@@ -759,6 +853,98 @@ class SqlStore:
         rows = self._query("SELECT COUNT(*) AS n FROM tool_calls WHERE case_id = ?", (case_id,))
         return int(rows[0]["n"]) if rows else 0
 
+    # -- warehouse receipts, grading reports, adjustments (R7) -----------
+    def put_warehouse_receipt(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO warehouse_receipts (warehouse_receipt_id, case_id, label_id, payload) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (warehouse_receipt_id) DO UPDATE SET payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO warehouse_receipts (warehouse_receipt_id, case_id, label_id, payload) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (warehouse_receipt_id) DO UPDATE SET payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["warehouse_receipt_id"],
+                payload["case_id"],
+                payload["label_id"],
+                json.dumps(payload),
+            ),
+        )
+
+    def get_warehouse_receipt_for_label(self, label_id: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT payload FROM warehouse_receipts WHERE label_id = ?", (label_id,)
+        )
+        return json.loads(row["payload"]) if row else None
+
+    def list_warehouse_receipts(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM warehouse_receipts WHERE case_id = ? ORDER BY warehouse_receipt_id",
+            (case_id,),
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
+    def put_grading_report(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO grading_reports (report_id, case_id, payload) "
+            "VALUES (?, ?, ?) ON CONFLICT (report_id) DO UPDATE SET payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO grading_reports (report_id, case_id, payload) "
+            "VALUES (%s, %s, %s) ON CONFLICT (report_id) DO UPDATE SET payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (payload["report_id"], payload["case_id"], json.dumps(payload)),
+        )
+
+    def get_grading_report(self, report_id: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT payload FROM grading_reports WHERE report_id = ?", (report_id,)
+        )
+        return json.loads(row["payload"]) if row else None
+
+    def list_grading_reports(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM grading_reports WHERE case_id = ? ORDER BY report_id",
+            (case_id,),
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
+    def put_adjustment(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO refund_adjustments (adjustment_id, case_id, kind, status, payload) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (adjustment_id) DO UPDATE SET "
+            "status = excluded.status, payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO refund_adjustments (adjustment_id, case_id, kind, status, payload) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (adjustment_id) DO UPDATE SET "
+            "status = EXCLUDED.status, payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["adjustment_id"],
+                payload["case_id"],
+                payload["kind"],
+                payload["status"],
+                json.dumps(payload),
+            ),
+        )
+
+    def get_adjustment(self, adjustment_id: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT payload FROM refund_adjustments WHERE adjustment_id = ?", (adjustment_id,)
+        )
+        return json.loads(row["payload"]) if row else None
+
+    def list_adjustments(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM refund_adjustments WHERE case_id = ? ORDER BY adjustment_id",
+            (case_id,),
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
 
 class InMemoryStore:
     """Test double implementing the same port with dicts."""
@@ -780,9 +966,12 @@ class InMemoryStore:
         self._voids: dict[str, dict] = {}
         self._pickups: dict[str, dict] = {}
         self._tool_calls: dict[str, dict] = {}
+        self._warehouse_receipts: dict[str, dict] = {}
+        self._grading_reports: dict[str, dict] = {}
+        self._adjustments: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
-        return ["0001", "0002", "0003", "0004", "0005", "0006"]
+        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007"]
 
     def put_order(self, payload: dict[str, Any]) -> None:
         self._orders[payload["order_id"]] = payload
@@ -827,22 +1016,42 @@ class InMemoryStore:
         return [e for e in self._evidence.values() if e["case_id"] == case_id]
 
     def put_computation(self, payload: dict[str, Any]) -> None:
-        self._computations[payload["case_id"]] = payload
+        self._computations[payload["computation_id"]] = payload
 
     def get_computation(self, case_id: str) -> dict[str, Any] | None:
-        return self._computations.get(case_id)
+        return _chain_head(self.list_computations_for_case(case_id), "computation_id")
 
     def list_computations(self) -> list[dict[str, Any]]:
-        return [self._computations[k] for k in sorted(self._computations)]
+        return sorted(
+            self._computations.values(),
+            key=lambda p: (p["case_id"], p["computation_id"]),
+        )
+
+    def list_computations_for_case(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._computations[k]
+            for k in sorted(self._computations)
+            if self._computations[k]["case_id"] == case_id
+        ]
 
     def put_disposition(self, payload: dict[str, Any]) -> None:
-        self._dispositions[payload["case_id"]] = payload
+        self._dispositions[payload["disposition_id"]] = payload
 
     def get_disposition(self, case_id: str) -> dict[str, Any] | None:
-        return self._dispositions.get(case_id)
+        return _chain_head(self.list_dispositions_for_case(case_id), "disposition_id")
 
     def list_dispositions(self) -> list[dict[str, Any]]:
-        return [self._dispositions[k] for k in sorted(self._dispositions)]
+        return sorted(
+            self._dispositions.values(),
+            key=lambda p: (p["case_id"], p["disposition_id"]),
+        )
+
+    def list_dispositions_for_case(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._dispositions[k]
+            for k in sorted(self._dispositions)
+            if self._dispositions[k]["case_id"] == case_id
+        ]
 
     def put_fraud_score(self, payload: dict[str, Any]) -> None:
         self._fraud_scores[payload["score_id"]] = payload
@@ -986,3 +1195,45 @@ class InMemoryStore:
 
     def count_tool_calls(self, case_id: str) -> int:
         return sum(1 for c in self._tool_calls.values() if c["case_id"] == case_id)
+
+    def put_warehouse_receipt(self, payload: dict[str, Any]) -> None:
+        self._warehouse_receipts[payload["warehouse_receipt_id"]] = payload
+
+    def get_warehouse_receipt_for_label(self, label_id: str) -> dict[str, Any] | None:
+        for receipt in self._warehouse_receipts.values():
+            if receipt["label_id"] == label_id:
+                return receipt
+        return None
+
+    def list_warehouse_receipts(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._warehouse_receipts[k]
+            for k in sorted(self._warehouse_receipts)
+            if self._warehouse_receipts[k]["case_id"] == case_id
+        ]
+
+    def put_grading_report(self, payload: dict[str, Any]) -> None:
+        self._grading_reports[payload["report_id"]] = payload
+
+    def get_grading_report(self, report_id: str) -> dict[str, Any] | None:
+        return self._grading_reports.get(report_id)
+
+    def list_grading_reports(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._grading_reports[k]
+            for k in sorted(self._grading_reports)
+            if self._grading_reports[k]["case_id"] == case_id
+        ]
+
+    def put_adjustment(self, payload: dict[str, Any]) -> None:
+        self._adjustments[payload["adjustment_id"]] = payload
+
+    def get_adjustment(self, adjustment_id: str) -> dict[str, Any] | None:
+        return self._adjustments.get(adjustment_id)
+
+    def list_adjustments(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._adjustments[k]
+            for k in sorted(self._adjustments)
+            if self._adjustments[k]["case_id"] == case_id
+        ]
