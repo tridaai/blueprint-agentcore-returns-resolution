@@ -82,6 +82,28 @@ A case whose draft fails verification is stored as `summary_failed`
 with the violations recorded and **no summary** — the failure is a
 state an operator can see, not a message a customer receives.
 
+## The refund computation (R2)
+
+`refunds.py` is the money of record. From the decision, the order as
+stored and the pack's refund schedule (restocking rates by declared
+condition; free-return categories; the flat return-shipping fee) it
+produces a `RefundComputation`: named lines (item credit, restocking
+fee, return-shipping deduction), each carrying its derivation —
+pinned inputs, the rule, the policy reference — plus totals and a
+tender allocation. The artefact is content-addressed: its id hashes
+the decision + order fingerprints, the pack version and the engine
+version, and `verify_computation` re-performs the whole computation
+and compares every field, so a tampered figure is detected rather
+than believed. A component whose input is missing (a condition with
+no rate in the pack; an order with no tender breakdown) is recorded
+`not_computable` *naming the input* — never a silent zero; while a
+money line is not computable the total is `None` and `is_final` is
+False. The decision's R1 `refund_due` remains the pre-fee eligibility
+figure; from R2 the computation's `refund_total` is the refund. The
+figure verifier's amount universe extends to the computation's
+lines, totals and allocations when a computation is supplied, so the
+summary quotes the computed refund — and still nothing else.
+
 ## What is deliberately not here yet
 
 Disposition matrix (R3), fraud scoring (R4), approval gates and the
