@@ -748,6 +748,55 @@ class CaseTimeline(BaseModel):
     gaps: list[TimelineGap] = []
 
 
+class MessageTransition(BaseModel):
+    """One state change of a customer message, on the record (R8).
+
+    The lifecycle is draft → verified → queued → sent, with refused
+    (verification failed) and withdrawn (superseded or stale) as
+    terminal side states. Every transition — including a refusal,
+    whose detail names the violations' count, and a withdrawal,
+    whose detail names the replacement — is recorded here, so the
+    message's whole road is auditable from the artefact itself.
+    """
+
+    state: str  # draft | verified | refused | queued | sent | withdrawn
+    at: date
+    actor: str = ""
+    detail: str = ""
+
+
+class CustomerMessage(BaseModel):
+    """One customer-facing message (R8) — a stored artefact.
+
+    Rendered from a typed template over the case's artefacts of
+    record, verified by the messaging verifier before it may be
+    queued, and sent only through the messaging port. The artefact
+    pins what it was rendered against: `artefact_refs` names the
+    artefacts (by role and id) and `artefact_fingerprint` hashes
+    their payloads — at send time the fingerprint is recomputed,
+    and a mismatch means the case moved under the message: it is
+    withdrawn and re-drafted, never sent stale. A message that
+    failed verification is stored as `refused` with its violations
+    listed — never sent, never silently fixed.
+    """
+
+    message_id: str
+    case_id: str
+    message_type: str  # one of messaging.MESSAGE_TYPES
+    status: str  # draft | verified | refused | queued | sent | withdrawn
+    text: str
+    violations: list[str] = []
+    template_version: str
+    disclosure_pack_version: str
+    artefact_refs: dict[str, str] = {}
+    artefact_fingerprint: str
+    provider: str | None = None
+    provider_ref: str | None = None
+    supersedes: str | None = None
+    created_on: date
+    transitions: list[MessageTransition] = []
+
+
 class ReturnCase(BaseModel):
     case_id: str
     request: ReturnRequest

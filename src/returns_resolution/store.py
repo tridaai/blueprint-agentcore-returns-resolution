@@ -221,6 +221,21 @@ CREATE TABLE IF NOT EXISTS refund_adjustments (
 );
 """
 
+# Migration 0008 — customer messages (R8). One row per message
+# artefact: the lifecycle mutates a message's status in place (its
+# transitions accumulate on the payload), so the case key is not
+# unique — a case holds its whole message history, refused and
+# withdrawn messages included.
+_MIGRATION_0008_SQLITE = """
+CREATE TABLE IF NOT EXISTS customer_messages (
+    message_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    message_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("0001", _MIGRATION_0001_SQLITE, _MIGRATION_0001_PG),
     ("0002", _MIGRATION_0002_SQLITE, _MIGRATION_0002_SQLITE),
@@ -229,6 +244,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("0005", _MIGRATION_0005_SQLITE, _MIGRATION_0005_SQLITE),
     ("0006", _MIGRATION_0006_SQLITE, _MIGRATION_0006_SQLITE),
     ("0007", _MIGRATION_0007_SQLITE, _MIGRATION_0007_SQLITE),
+    ("0008", _MIGRATION_0008_SQLITE, _MIGRATION_0008_SQLITE),
 ]
 
 
@@ -308,6 +324,11 @@ class Store(Protocol):
     def put_adjustment(self, payload: dict[str, Any]) -> None: ...
     def get_adjustment(self, adjustment_id: str) -> dict[str, Any] | None: ...
     def list_adjustments(self, case_id: str) -> list[dict[str, Any]]: ...
+    def put_message(self, payload: dict[str, Any]) -> None: ...
+    def get_message(self, message_id: str) -> dict[str, Any] | None: ...
+    def list_messages(self, case_id: str) -> list[dict[str, Any]]: ...
+    def list_all_messages(self) -> list[dict[str, Any]]: ...
+    def count_messages(self, case_id: str) -> int: ...
 
 
 class SqlStore:
@@ -945,6 +966,51 @@ class SqlStore:
         )
         return [json.loads(r["payload"]) for r in rows]
 
+    # -- customer messages (R8) -------------------------------------------
+    def put_message(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO customer_messages (message_id, case_id, message_type, status, payload) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (message_id) DO UPDATE SET "
+            "status = excluded.status, payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO customer_messages (message_id, case_id, message_type, status, payload) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (message_id) DO UPDATE SET "
+            "status = EXCLUDED.status, payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["message_id"],
+                payload["case_id"],
+                payload["message_type"],
+                payload["status"],
+                json.dumps(payload),
+            ),
+        )
+
+    def get_message(self, message_id: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT payload FROM customer_messages WHERE message_id = ?", (message_id,)
+        )
+        return json.loads(row["payload"]) if row else None
+
+    def list_messages(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM customer_messages WHERE case_id = ? ORDER BY message_id",
+            (case_id,),
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
+    def list_all_messages(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT payload FROM customer_messages ORDER BY case_id, message_id")
+        return [json.loads(r["payload"]) for r in rows]
+
+    def count_messages(self, case_id: str) -> int:
+        rows = self._query(
+            "SELECT COUNT(*) AS n FROM customer_messages WHERE case_id = ?", (case_id,)
+        )
+        return int(rows[0]["n"]) if rows else 0
+
 
 class InMemoryStore:
     """Test double implementing the same port with dicts."""
@@ -969,9 +1035,10 @@ class InMemoryStore:
         self._warehouse_receipts: dict[str, dict] = {}
         self._grading_reports: dict[str, dict] = {}
         self._adjustments: dict[str, dict] = {}
+        self._messages: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
-        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007"]
+        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008"]
 
     def put_order(self, payload: dict[str, Any]) -> None:
         self._orders[payload["order_id"]] = payload
@@ -1237,3 +1304,22 @@ class InMemoryStore:
             for k in sorted(self._adjustments)
             if self._adjustments[k]["case_id"] == case_id
         ]
+
+    def put_message(self, payload: dict[str, Any]) -> None:
+        self._messages[payload["message_id"]] = payload
+
+    def get_message(self, message_id: str) -> dict[str, Any] | None:
+        return self._messages.get(message_id)
+
+    def list_messages(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._messages[k]
+            for k in sorted(self._messages)
+            if self._messages[k]["case_id"] == case_id
+        ]
+
+    def list_all_messages(self) -> list[dict[str, Any]]:
+        return [self._messages[k] for k in sorted(self._messages)]
+
+    def count_messages(self, case_id: str) -> int:
+        return sum(1 for m in self._messages.values() if m["case_id"] == case_id)
