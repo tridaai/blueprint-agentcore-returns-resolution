@@ -424,11 +424,56 @@ summary text itself is byte-identical to what R1–R7 produced —
 the eval gate asserts every feed case's standing summary verified
 clean against the generalised verifier.
 
+## Customer memory (R9)
+
+Memory is a port (`MemoryPort`), shaped on AgentCore Memory's
+long-term records, with one implementation: `LocalMemoryDouble`,
+a store-backed stand-in labelled on every record it writes. The
+port's surface is deliberately narrow — `write`, `find` (the
+write-side existence read), `existing_keys`, `retrieve`,
+`retention_status` — and its read takes an exact customer id and
+nothing else: no search, no filter, no cross-customer surface
+exists anywhere in the system, and the store enforces the
+predicate. Retrieval filters expired records and writes an
+access-log entry (customer, purpose, actor, returned ids) before
+returning; the log is a first-class read surface, because a
+memory nobody audits is a memory nobody should trust.
+
+Records are event-shaped and content-addressed. The service
+derives them in code at four milestones — case decided, refund
+executed, case graded, fraud review closed — from the artefacts
+of record: amounts, disposition, graded condition, refund delta,
+the fraud band (never score internals), the review outcome. A
+decision record also embeds the exact `CaseFact` the engine
+scored, which is what makes memory a complete history source for
+the engine rather than a summary of it. Writes are idempotent
+per (case, event, source artefact); `sync_memory` backfills
+milestones the live hooks predate, planted history included.
+
+Retention is data: the memory pack (`2026.10.1`) states the
+window (730 days) and each record's expiry derives from its
+event date. Expired records leave every consumer's view and are
+counted by the retention read — tombstones, never deletions; no
+code path in this build deletes a record.
+
+The two consumers are graded against the record. The fraud
+engine's history input is an explicit provenance-tagged bundle
+(`HistoryFacts.source: store | memory`); the score artefact
+carries the tag but excludes it from its content fingerprint, so
+a memory-sourced score over identical facts IS the store-path
+artefact — parity is an equality check, not a similarity check.
+Grading records' weigh-ins supersede intake weights on the
+memory path exactly as warehouse grading supersedes them on the
+store path. The messaging verifier's figure universe extends to
+the case's own customer's memory records (retrieved through the
+port, purpose `message_verification`): a prior refund is sayable
+only as memory states it, only for that customer, and only while
+the record is unexpired.
+
 ## What is deliberately not here yet
 
-Memory port (R9), injection quarantine (R10), Gateway + Policy
-ports (R11), model cost ledger (R12), console (R13), Postgres
-parity + production smoke (R15), access control (R16), reporting
-(R17), carrier exceptions (R18), red team (R19), deploy artefacts
-(R20). The README's honest status is the authoritative per-round
-account.
+Injection quarantine (R10), Gateway + Policy ports (R11), model
+cost ledger (R12), console (R13), Postgres parity + production
+smoke (R15), access control (R16), reporting (R17), carrier
+exceptions (R18), red team (R19), deploy artefacts (R20). The
+README's honest status is the authoritative per-round account.
