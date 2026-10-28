@@ -1909,7 +1909,7 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
                 lambda c=case: svc.execute_refund(
                     c.case_id, idempotency_key=f"trap-{c.case_id}", as_of=TRAP_DAY
                 ),
-                PaymentsError,
+                ApprovalError,
             ):
                 counters["trap_cap_boundaries_misgraded"] += 1
             if tier_bad == 1:
@@ -1979,19 +1979,8 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
     svc = CaseService(make_store(), OfflineComposer())
     svc.seed_orders()
     svc.ingest(PLANTED_REQUESTS[2])
-    variants = (
-        ("create_return_label",
-         {"case_id": "CASE-2003", "issued_by": "d.okafor", "issued_on": TRAP_DAY},
-         "Staff", "GP-CARRIER-WRITE-ACTORS"),
-        ("get_tracking_events",
-         {"case_id": "CASE-2003", "as_of": TRAP_DAY},
-         " staff", "GP-CARRIER-READ-ACTORS"),
-        ("execute_refund",
-         {"case_id": "CASE-2003",
-          "computation_id": svc.get_computation("CASE-2003").computation_id},
-         "STAFF", "GP-PAYMENT-ACTORS"),
-    )
-    for tool, arguments, actor, policy_id in variants:
+
+    def _trap_denied(svc, tool, arguments, actor, policy_id):
         env = svc.invoke_tool_envelope(
             tool, arguments, case_id="CASE-2003", called_on=TRAP_DAY, actor=actor
         )
@@ -2001,8 +1990,26 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
                 if c.tool == tool and c.actor == actor and c.status == "denied"
                 and c.policy_id == policy_id] == []:
             counters["trap_actor_variants_accepted"] += 1
+
+    _trap_denied(
+        svc, "create_return_label",
+        {"case_id": "CASE-2003", "issued_on": TRAP_DAY},
+        "Staff", "GP-CARRIER-WRITE-ACTORS",
+    )
     if svc.list_labels("CASE-2003"):
         counters["trap_actor_variants_accepted"] += 1
+    label = _trap_label(svc, "CASE-2003")
+    _trap_denied(
+        svc, "get_carrier_events",
+        {"case_id": "CASE-2003", "label_id": label.label_id, "as_of": TRAP_DAY},
+        " staff", "GP-CARRIER-READ-ACTORS",
+    )
+    _trap_denied(
+        svc, "execute_refund",
+        {"case_id": "CASE-2003",
+         "computation_id": svc.get_computation("CASE-2003").computation_id},
+        "STAFF", "GP-PAYMENT-ACTORS",
+    )
 
     # T-P2: the role cap — $500.00 is permitted by policy (the
     # handler then errors: no prepared execution), $500.01 denied.
