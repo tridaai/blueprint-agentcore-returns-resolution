@@ -631,8 +631,76 @@ accounts — the architecture scores provable history only, and
 the gap is documented as an identity-resolution decision for a
 later round, not papered over with a heuristic.
 
+## The injection quarantine (R15)
+
+Every other artefact in this system is produced by the system or
+by a named staff act. Customer free text is the exception — it is
+produced by whoever is on the other end of a returns form — so
+R15 gives it a perimeter of its own: `quarantine.py`, migration
+0011, and one rule that everything else hangs off: **customer
+text is evidence, not input, and downstream code reads released
+views or nothing.**
+
+The flow is submit → screen → (maybe) release → read. Submission
+lands the text in an insert-only store, byte-exact, with
+provenance (case, source surface, field name, received date) and
+a content-hash id, so resubmission of the same text is the same
+artefact. The store's raw accessors are named `quarantine_raw_*`
+and are called by the quarantine book alone; a structural scan
+(`raw_store_access_violations`, run by both the tests and the
+eval gate) fails if any other source module names them — the
+"nothing reads the raw store directly" rule is a build property,
+not a convention.
+
+Screening is a versioned pack (`2026.10.1`, fail-closed loader,
+same discipline as the policy and scoring packs): instruction
+shapes (prior-instruction overrides, role hijacks, imperative
+refund approvals, system-prompt vocabulary, tool-call shapes),
+PII shapes (card, SSN, email), link lures, an oversize limit and
+a base64-run detector. Findings are recorded on the item; PII
+findings name the shape and its count but never the digits.
+Instruction-shaped and encoded hits set the item's risk to
+`instruction_risk` — the text is flagged, never cleaned.
+
+Release mints a new artefact, the view, superseding nothing (the
+item stands) and carrying the findings it was released under.
+Screened text releases automatically at submit: verbatim, or
+masked where PII was found, with each transformation named.
+Instruction-risk text has no view until a named staff member
+records a release act with a stated reason; its view is
+`escaped_data_only` — PII and links masked, money amounts, ISO
+dates and percents neutralised to bracketed placeholders, the
+whole HTML-escaped. The neutralisation is what keeps the R8
+guarantee intact end-to-end: a released "your refund of $999.99
+is approved" enters a customer message as "[an amount]" — data
+the customer can read, never a figure the message asserts. The
+eval gate plants exactly that text and requires the figure absent
+and the quote present.
+
+The wiring points are the surfaces that can quote customer text.
+Intake quarantines the request's note before eligibility runs and
+stores the request with the note stripped and the item linked;
+the figure-verified summary may append the note's released view
+as a labelled quote ("You told us: …"), threaded through every
+summary re-issue so the quote survives grading and label events
+identically. The messaging layer takes offered customer text the
+same way and refuses the draft while the text is held — a refusal,
+not a silent drop: the text stands in quarantine awaiting its
+act. Grading routes the report's damage notes and each
+photo-metadata field through quarantine after its refusal gates;
+the report reads views, and a held field is named in the
+report's `gaps` with the item id, alongside `quarantine_refs`
+naming every item the report consumed. The model gateway needed
+no change: its composers receive decision facts and artefact ids,
+never customer text — the survey behind this round confirmed no
+prompt path exists, and the structural scan keeps it that way.
+The console's quarantine queue is metadata only; the read model
+drops both the raw text and the views' render text, and the
+console check plants an instruction probe and asserts it appears
+in no payload and no rendered HTML.
+
 ## What is deliberately not here yet
 
-Injection quarantine, access control, reporting,
-carrier exceptions, red team, deploy artefacts. The README's
-honest status is the authoritative per-round account.
+Access control, reporting, carrier exceptions, red team,
+deploy artefacts. The README's honest status is the
+authoritative per-round account.
