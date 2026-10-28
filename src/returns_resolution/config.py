@@ -14,6 +14,8 @@ class Config:
     evidence_bucket: str
     model_profile: str
     bedrock_model_arn: str | None
+    bedrock_model_id: str | None
+    nim_model_id: str | None
     aws_region: str
 
     @classmethod
@@ -25,5 +27,7 @@ class Config:
             evidence_bucket=os.environ.get("RETURNS_EVIDENCE_BUCKET", "returns-evidence"),
             model_profile=os.environ.get("RETURNS_MODEL_PROFILE", "offline"),
             bedrock_model_arn=os.environ.get("RETURNS_BEDROCK_MODEL_ARN") or None,
+            bedrock_model_id=os.environ.get("RETURNS_BEDROCK_MODEL_ID") or None,
+            nim_model_id=os.environ.get("RETURNS_NIM_MODEL_ID") or None,
             aws_region=os.environ.get("AWS_REGION", "us-east-1"),
         )

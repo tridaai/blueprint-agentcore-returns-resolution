@@ -15,6 +15,7 @@ from pydantic import BaseModel, field_validator
 
 from .gateway import PolicyDeniedError, ToolError
 from .intake import ReferenceFeed
+from .model_gateway import ModelBudgetError, ModelGatewayError
 from .models import ReturnRequest
 from .service import (
     ApprovalError,
@@ -182,6 +183,8 @@ def create_app(service: CaseService) -> FastAPI:
                 results.append({"request_id": request.request_id, "case_id": case.case_id, "status": case.status})
             except FigureVerificationError as exc:
                 results.append({"request_id": request.request_id, "status": "summary_failed", "violations": exc.violations})
+            except ModelGatewayError as exc:
+                results.append({"request_id": request.request_id, "status": "model_gateway_failed", "error": str(exc)})
         return {"ingested": results}
 
     @app.post("/returns", status_code=201)
@@ -192,6 +195,10 @@ def create_app(service: CaseService) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except FigureVerificationError as exc:
             raise HTTPException(status_code=422, detail={"violations": exc.violations}) from exc
+        except ModelBudgetError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        except ModelGatewayError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         return case.model_dump(mode="json")
 
     @app.get("/cases")
@@ -396,6 +403,31 @@ def create_app(service: CaseService) -> FastAPI:
         gateway evaluates in front of every invocation, in
         evaluation order."""
         return service.get_gateway_policy_pack().model_dump(mode="json")
+
+    # -- model gateway + cost ledger (R12) -------------------------------
+    @app.get("/model/config")
+    def model_config() -> dict:
+        """The model gateway's configuration (R12): the active
+        profile + model id, the price pack version, the per-case
+        call budget, and the profile's rate card."""
+        return service.get_model_config()
+
+    @app.get("/model/cost-ledger")
+    def cost_ledger() -> dict:
+        """The whole cost ledger (R12): every gateway call of
+        record, the totals computed from them, and the result of
+        re-performing every entry's arithmetic."""
+        return {
+            "entries": [e.model_dump(mode="json") for e in service.list_all_cost_entries()],
+            "totals": service.cost_totals(),
+            "verify_problems": service.verify_cost_ledger(),
+        }
+
+    @app.get("/cases/{case_id}/cost-ledger")
+    def case_cost_ledger(case_id: str) -> list[dict]:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return [e.model_dump(mode="json") for e in service.list_cost_entries(case_id)]
 
     @app.post("/tools/{tool}/invoke")
     def invoke_tool(tool: str, body: ToolInvokeRequest):
@@ -628,6 +660,10 @@ def create_app(service: CaseService) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except MessagingError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ModelBudgetError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        except ModelGatewayError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         return message.model_dump(mode="json")
 
     @app.get("/cases/{case_id}/messages")

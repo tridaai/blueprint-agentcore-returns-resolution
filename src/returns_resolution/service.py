@@ -95,6 +95,14 @@ from .messaging import (
     MessagingProviderError,
     load_disclosure_pack,
 )
+from .model_gateway import (
+    STATUS_OK as GATEWAY_STATUS_OK,
+    BaseGateway,
+    CostEntry,
+    ModelGatewayError,
+    OfflineGateway,
+    verify_cost_entry,
+)
 from .modelport import ModelPort
 from .models import (
     CarrierEvent,
@@ -214,6 +222,7 @@ class CaseService:
         self,
         store: Store,
         model_port: ModelPort,
+        model_gateway: BaseGateway | None = None,
         pack: PolicyPack | None = None,
         evidence_store: EvidenceStore | None = None,
         matrix: MatrixPack | None = None,
@@ -228,7 +237,19 @@ class CaseService:
         memory_port: MemoryPort | None = None,
     ):
         self._store = store
-        self._model = model_port
+        # The model gateway (R12): the ONE path every model-shaped
+        # call takes — summary composition and the message note
+        # slot alike — with its cost ledger bound to this store.
+        # A caller-supplied gateway wins; otherwise the model port
+        # handed in is wrapped in the gateway's offline profile,
+        # which meters and records its calls without touching its
+        # output, so offline artefacts stay byte-identical.
+        self._model_gateway: BaseGateway = model_gateway or OfflineGateway(model_port)
+        self._model_gateway.bind_store(
+            record_entry=store.put_cost_entry,
+            list_entries=store.list_cost_entries,
+        )
+        self._model = self._model_gateway
         self._pack = pack or load_policy_pack()
         self._evidence = evidence_store
         self._matrix = matrix or load_matrix_pack()
@@ -306,6 +327,10 @@ class CaseService:
     @property
     def memory_port(self) -> MemoryPort:
         return self._memory
+
+    @property
+    def model_gateway(self) -> BaseGateway:
+        return self._model_gateway
 
     # -- seeding ---------------------------------------------------------
     def seed_orders(self) -> int:
@@ -1533,6 +1558,66 @@ class CaseService:
         """The gateway policy pack of record — the data the gateway
         evaluates in front of every tool invocation."""
         return self._gateway_policy
+
+    # -- model gateway + cost ledger (R12) -------------------------------
+    def get_model_config(self) -> dict:
+        """The model gateway's configuration of record: the active
+        profile and model id, the price pack version, the per-case
+        call budget, and the profile's rate card."""
+        return self._model_gateway.config_view()
+
+    def list_cost_entries(self, case_id: str) -> list[CostEntry]:
+        """The case's cost ledger: every gateway call made on its
+        behalf — composed, noted, rejected, refused, failed — in
+        call order."""
+        return [
+            CostEntry.model_validate(p) for p in self._store.list_cost_entries(case_id)
+        ]
+
+    def list_all_cost_entries(self) -> list[CostEntry]:
+        return [
+            CostEntry.model_validate(p) for p in self._store.list_all_cost_entries()
+        ]
+
+    def cost_totals(self) -> dict:
+        """Ledger totals, computed in code from the entries of
+        record: per profile and per case — call counts by outcome
+        class, envelope/estimated usage, and the summed cost. Only
+        ok entries carry cost; the totals are sums, never stored."""
+        def _bucket() -> dict:
+            return {"calls": 0, "ok_calls": 0, "tokens_in": 0, "tokens_out": 0, "cost": Decimal("0.00")}
+
+        by_profile: dict[str, dict] = {}
+        by_case: dict[str, dict] = {}
+        for entry in self.list_all_cost_entries():
+            for bucket, key in ((by_profile, entry.profile), (by_case, entry.case_id)):
+                slot = bucket.setdefault(key, _bucket())
+                slot["calls"] += 1
+                if entry.status == GATEWAY_STATUS_OK:
+                    slot["ok_calls"] += 1
+                slot["tokens_in"] += entry.tokens_in
+                slot["tokens_out"] += entry.tokens_out
+                slot["cost"] += entry.cost
+
+        def _render(bucket: dict[str, dict]) -> dict:
+            return {
+                key: {**slot, "cost": str(slot["cost"])}
+                for key, slot in sorted(bucket.items())
+            }
+
+        return {"by_profile": _render(by_profile), "by_case": _render(by_case)}
+
+    def verify_cost_ledger(self) -> list[str]:
+        """Re-perform every ledger entry's arithmetic from its own
+        recorded tokens and the price pack's prices. An empty list
+        means every entry's cost is exactly the computed figure —
+        a tampered entry (a cost edited after the fact) is named."""
+        problems: list[str] = []
+        pack = self._model_gateway.price_pack
+        for entry in self.list_all_cost_entries():
+            for problem in verify_cost_entry(entry, pack):
+                problems.append(f"{entry.entry_id}: {problem}")
+        return problems
 
     def _gateway_facts(self, tool: str, case_id: str, arguments: dict) -> ToolFacts:
         """The facts a policy evaluation reads, built from the
@@ -3333,6 +3418,14 @@ class CaseService:
                 f"unknown message type {message_type!r}: no template exists for it, "
                 "so no text can be drafted"
             )
+        if model_note is not None and model_note.strip():
+            # The note is model text arriving at the model gateway
+            # (R12): budget-checked, validated as a structured
+            # draft and recorded in the cost ledger BEFORE it can
+            # be drafted into a message. A gateway refusal here —
+            # the case's budget exhausted above all — means no
+            # message is drafted at all.
+            self._model_gateway.submit_note(case_id=case.case_id, text=model_note)
         facts = self._message_facts(case, message_type)
         text = TEMPLATES[message_type](facts, model_note)
         _ctx, refs, fingerprint = self._message_universe(case, message_type, as_of=as_of)

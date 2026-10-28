@@ -21,7 +21,8 @@ from typing import Any
 from .config import Config
 from .evidence import LocalEvidenceStore
 from .intake import ReferenceFeed
-from .modelport import load_model_port
+from .model_gateway import ModelGatewayError, load_model_gateway
+from .modelport import OfflineComposer
 from .models import ReturnRequest
 from .gateway import PolicyDeniedError, ToolError
 from .service import (
@@ -54,11 +55,18 @@ def build_service(config: Config | None = None) -> CaseService:
     config = config or Config.from_env()
     store = SqlStore(database_url=config.database_url, sqlite_path=config.sqlite_path)
     store.migrate()
-    model_port = load_model_port(
-        config.model_profile, model_arn=config.bedrock_model_arn, region=config.aws_region
+    # The model gateway (R12) is the one model path. The offline
+    # profile wraps the deterministic composer; the hosted
+    # profiles (bedrock / nim) are built fail-closed — no transport
+    # is bound in this build, so selecting one refuses loudly at
+    # the first drafting call rather than falling back.
+    gateway = load_model_gateway(
+        config.model_profile,
+        bedrock_model_id=config.bedrock_model_id,
+        nim_model_id=config.nim_model_id,
     )
     evidence = LocalEvidenceStore(root=config.evidence_dir, bucket=config.evidence_bucket)
-    service = CaseService(store, model_port, evidence_store=evidence)
+    service = CaseService(store, OfflineComposer(), model_gateway=gateway, evidence_store=evidence)
     service.seed_orders()
     service.seed_history()
     return service
@@ -81,6 +89,7 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     get_receipt {case_id} | list_receipts | list_executions {case_id} |
     get_tool_definitions | invoke_tool {tool, case_id, arguments, called_on, actor?} |
     get_gateway_policy_pack |
+    get_model_config | get_case_cost_ledger {case_id} | get_cost_ledger |
     create_return_label {case_id, issued_on} |
     void_return_label {case_id, label_id, voided_by, reason, voided_on} |
     get_carrier_events {case_id, label_id, as_of} |
@@ -121,6 +130,8 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
                 results.append({"request_id": request.request_id, "case_id": case.case_id, "status": case.status})
             except FigureVerificationError as exc:
                 results.append({"request_id": request.request_id, "status": "summary_failed", "violations": exc.violations})
+            except ModelGatewayError as exc:
+                results.append({"request_id": request.request_id, "status": "model_gateway_failed", "error": str(exc)})
         return {"ingested": results}
     if action == "intake":
         request = ReturnRequest.model_validate(payload["request"])
@@ -129,6 +140,8 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
             return {"case": case.model_dump(mode="json")}
         except FigureVerificationError as exc:
             return {"status": "summary_failed", "violations": exc.violations}
+        except ModelGatewayError as exc:
+            return {"error": str(exc)}
     if action == "get_case":
         case = service.get_case(payload["case_id"])
         return {"case": case.model_dump(mode="json") if case else None}
@@ -232,6 +245,22 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         return {"tools": [d.model_dump(mode="json") for d in service.tool_definitions()]}
     if action == "get_gateway_policy_pack":
         return {"gateway_policy_pack": service.get_gateway_policy_pack().model_dump(mode="json")}
+    if action == "get_model_config":
+        return {"model_config": service.get_model_config()}
+    if action == "get_case_cost_ledger":
+        return {
+            "cost_entries": [
+                e.model_dump(mode="json") for e in service.list_cost_entries(payload["case_id"])
+            ]
+        }
+    if action == "get_cost_ledger":
+        return {
+            "cost_entries": [
+                e.model_dump(mode="json") for e in service.list_all_cost_entries()
+            ],
+            "cost_totals": service.cost_totals(),
+            "verify_problems": service.verify_cost_ledger(),
+        }
     if action == "invoke_tool":
         arguments = dict(payload.get("arguments") or {})
         for key in ("issued_on", "voided_on", "as_of", "scheduled_on", "graded_on"):
@@ -392,7 +421,7 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
                 model_note=payload.get("model_note"),
             )
             return {"message": message.model_dump(mode="json")}
-        except (LookupError, MessagingError) as exc:
+        except (LookupError, MessagingError, ModelGatewayError) as exc:
             return {"error": str(exc)}
     if action == "verify_message":
         try:
