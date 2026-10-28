@@ -14,6 +14,30 @@ import json
 from datetime import date, timedelta
 from decimal import Decimal
 
+from .access import (
+    ACT_APPROVE_REFUND,
+    ACT_CONFIRM_FRAUD_REVIEW,
+    ACT_EXECUTE_REFUND,
+    ACT_INTAKE_RETURN,
+    ACT_MANAGE_CASE,
+    ACT_RELEASE_QUARANTINE,
+    REASON_CASE_NOT_VISIBLE,
+    REASON_CUSTOMER_SCOPE,
+    ROLE_CUSTOMER,
+    SURFACE_CASE,
+    SURFACE_COST_LEDGER,
+    SURFACE_DENIAL_LOG,
+    SURFACE_FRAUD,
+    SURFACE_MEMORY,
+    SURFACE_MONEY,
+    SURFACE_ORDER,
+    SURFACE_QUARANTINE,
+    AccessControl,
+    AccessDeniedError,
+    AccessPack,
+    Principal,
+    load_access_pack,
+)
 from .carrier import CarrierPort, CarrierProviderError, LocalCarrierDouble
 from .disposition import (
     BASIS_GRADED,
@@ -249,6 +273,7 @@ class CaseService:
         memory_pack: MemoryPack | None = None,
         memory_port: MemoryPort | None = None,
         screening_pack: ScreeningPack | None = None,
+        access_pack: AccessPack | None = None,
     ):
         self._store = store
         # The model gateway (R12): the ONE path every model-shaped
@@ -313,6 +338,11 @@ class CaseService:
         # book is the only path back out — as released views. The
         # service never touches the store's raw quarantine rows.
         self._quarantine = QuarantineBook(store, screening_pack or load_screening_pack())
+        # The access layer (R16): the versioned access pack and
+        # the guard that evaluates it. The guarded methods below
+        # are the principal-carrying face of the service; the
+        # guard's denial log lives in the store (migration 0012).
+        self._access = AccessControl(store, access_pack or load_access_pack())
         # The tool gateway (R6, generalized R11): the ONLY path
         # tool-shaped actions take — carrier tools, refund execution
         # and the grading callback alike. Handlers are the _tool_*
@@ -584,6 +614,451 @@ class CaseService:
 
     def quarantine_state(self, item: QuarantineItem) -> str:
         return self._quarantine.state_of(item)
+
+    # -- access control (R16) --------------------------------------------
+    # The principal-carrying face of the service. Every method here
+    # takes an authenticated Principal (see authenticate_principal)
+    # and routes its checks through the access guard: surface
+    # grants first, then customer scoping, then act permissions.
+    # A refusal is recorded in the denial log BEFORE the
+    # AccessDeniedError propagates — the surfaces translate the
+    # hiding reasons (case_not_visible, customer_scope) into
+    # their not-found shape and every other reason into a named
+    # refusal. The methods above this section are the pre-R16
+    # trusted-local face, unchanged.
+
+    def get_access_pack(self) -> AccessPack:
+        return self._access.pack
+
+    def authenticate_principal(
+        self,
+        raw,
+        *,
+        surface: str,
+        target: str = "",
+        on: date | None = None,
+    ) -> Principal:
+        """Authenticate a carried principal against the pack. A
+        missing, malformed or unknown-role principal is refused
+        with its named reason (and recorded); there is no default
+        principal."""
+        return self._access.authenticate(raw, surface=surface, target=target, on=on)
+
+    def list_access_denials(self):
+        """The denial log, unguarded — the internal read the
+        surfaces gate with list_access_denials_as."""
+        return self._access.denials()
+
+    def list_access_denials_as(self, principal: Principal, *, on: date | None = None):
+        """The denial log as a surface: auditor and supervisor
+        only (the pack's denial_log surface)."""
+        self._access.require_read(
+            principal, SURFACE_DENIAL_LOG, target="access_denials", on=on
+        )
+        return self._access.denials()
+
+    def _hide_case(self, principal: Principal, case_id: str, *, surface: str, on) -> None:
+        """Record a case-visibility denial and raise it. The
+        surfaces render this reason as the not-found response —
+        the case is hidden, never confirmed or denied to exist."""
+        self._access.deny(
+            principal_id=principal.id,
+            role=principal.role,
+            surface=surface,
+            target=case_id,
+            reason=REASON_CASE_NOT_VISIBLE,
+            detail="case not visible to this principal",
+            on=on,
+        )
+
+    def _visible_case(
+        self, principal: Principal, case_id: str, *, surface: str, on
+    ) -> ReturnCase | None:
+        """The case, if this principal may know it exists: None
+        for a genuinely unknown case (no denial — nothing was
+        refused), a recorded hiding denial for another customer's
+        case."""
+        case = self.get_case(case_id)
+        if case is None:
+            return None
+        if principal.role == ROLE_CUSTOMER and case.customer_id != principal.id:
+            self._hide_case(principal, case_id, surface=surface, on=on)
+        return case
+
+    def get_case_as(
+        self, principal: Principal, case_id: str, *, on: date | None = None
+    ) -> ReturnCase | None:
+        self._access.require_read(principal, SURFACE_CASE, target=case_id, on=on)
+        return self._visible_case(principal, case_id, surface=SURFACE_CASE, on=on)
+
+    def list_cases_as(
+        self, principal: Principal, *, on: date | None = None
+    ) -> list[ReturnCase]:
+        """The case list, scoped: a customer sees only their own
+        cases; staff-side roles see the board. Scoping a list is
+        not a refusal — no denial is recorded for the cases a
+        customer simply does not see."""
+        self._access.require_read(principal, SURFACE_CASE, target="cases", on=on)
+        cases = self.list_cases()
+        if principal.role == ROLE_CUSTOMER:
+            return [c for c in cases if c.customer_id == principal.id]
+        return cases
+
+    def get_case_view_as(
+        self, principal: Principal, case_id: str, *, on: date | None = None
+    ) -> dict | None:
+        """One case as this principal may see it. Staff-side roles
+        get the artefact of record; a customer gets the narrowed
+        view — their decision, their refund figures, the messages
+        actually sent to them, and the STATE of their own
+        quarantined texts. No fraud internals, no screening
+        findings, no other customer's anything."""
+        case = self.get_case_as(principal, case_id, on=on)
+        if case is None:
+            return None
+        if principal.role != ROLE_CUSTOMER:
+            return case.model_dump(mode="json")
+        computation = self.get_computation(case_id)
+        receipt = self.get_receipt(case_id)
+        return {
+            "case_id": case.case_id,
+            "customer_id": case.customer_id,
+            "order_id": case.order_id,
+            "status": case.status,
+            "summary": case.summary,
+            "request": case.request.model_dump(mode="json"),
+            "decision": (
+                case.decision.model_dump(mode="json") if case.decision else None
+            ),
+            "refund": {
+                "refund_total": (
+                    str(computation.refund_total)
+                    if computation is not None and computation.refund_total is not None
+                    else None
+                ),
+                "is_final": computation.is_final if computation is not None else False,
+                "executed_amount": str(receipt.amount) if receipt is not None else None,
+                "executed_on": (
+                    receipt.executed_on.isoformat() if receipt is not None else None
+                ),
+            },
+            "messages": [
+                {
+                    "message_id": m.message_id,
+                    "message_type": m.message_type,
+                    "text": m.text,
+                }
+                for m in self.list_messages(case_id)
+                if m.status == "sent"
+            ],
+            "quarantine": [
+                {
+                    "quarantine_id": item.quarantine_id,
+                    "source_surface": item.source_surface,
+                    "field_name": item.field_name,
+                    "state": self.quarantine_state(item),
+                }
+                for item in self.list_quarantine_items(case_id)
+            ],
+        }
+
+    def get_order_as(
+        self, principal: Principal, order_id: str, *, on: date | None = None
+    ) -> Order | None:
+        """An order under the same scoping as its cases: another
+        customer's order is hidden, exactly like their case."""
+        self._access.require_read(principal, SURFACE_ORDER, target=order_id, on=on)
+        order = self.get_order(order_id)
+        if order is None:
+            return None
+        if principal.role == ROLE_CUSTOMER and order.customer_id != principal.id:
+            self._hide_case(principal, order_id, surface=SURFACE_ORDER, on=on)
+        return order
+
+    def list_orders_as(
+        self, principal: Principal, *, on: date | None = None
+    ) -> list[Order]:
+        self._access.require_read(principal, SURFACE_ORDER, target="orders", on=on)
+        orders = self.list_orders()
+        if principal.role == ROLE_CUSTOMER:
+            return [o for o in orders if o.customer_id == principal.id]
+        return orders
+
+    def get_fraud_score_as(
+        self, principal: Principal, case_id: str, *, on: date | None = None
+    ) -> FraudScore | None:
+        """The fraud surface: visibility first (a hidden case
+        stays hidden), then the pack's fraud grant — a customer
+        gets a named refusal for the surface even on their own
+        case; the score is staff-side data."""
+        case = self._visible_case(principal, case_id, surface=SURFACE_FRAUD, on=on)
+        if case is None:
+            return None
+        self._access.require_read(principal, SURFACE_FRAUD, target=case_id, on=on)
+        return self.get_fraud_score(case_id)
+
+    def list_cost_entries_as(
+        self, principal: Principal, case_id: str | None = None, *, on: date | None = None
+    ):
+        """The cost ledger as a surface: supervisor, auditor and
+        system only — the ledger is the business's data, never
+        the customer's."""
+        target = case_id or "cost_ledger"
+        if case_id is not None:
+            self._visible_case(principal, case_id, surface=SURFACE_COST_LEDGER, on=on)
+        self._access.require_read(principal, SURFACE_COST_LEDGER, target=target, on=on)
+        if case_id is not None:
+            return self.list_cost_entries(case_id)
+        return self.list_all_cost_entries()
+
+    def retrieve_memory_as(
+        self,
+        principal: Principal,
+        customer_id: str,
+        *,
+        as_of: date | None = None,
+        purpose: str = "api_read",
+        actor: str = "api",
+        on: date | None = None,
+    ) -> list[MemoryRecord]:
+        """Memory under access control: the surface grant, then
+        the customer scope — a customer principal reads only its
+        own memory; the scope refusal is recorded and rendered
+        by the surfaces as the not-found shape."""
+        self._access.require_read(principal, SURFACE_MEMORY, target=customer_id, on=on)
+        if principal.role == ROLE_CUSTOMER and customer_id != principal.id:
+            self._access.deny(
+                principal_id=principal.id,
+                role=principal.role,
+                surface=SURFACE_MEMORY,
+                target=customer_id,
+                reason=REASON_CUSTOMER_SCOPE,
+                detail="a customer principal reads only its own memory",
+                on=on,
+            )
+        return self.retrieve_memory(
+            customer_id, as_of=as_of, purpose=purpose, actor=actor
+        )
+
+    def list_memory_access_log_as(
+        self, principal: Principal, customer_id: str | None = None, *, on: date | None = None
+    ):
+        """The memory access log under the same scope: a customer
+        sees the entries about itself, and asking for another
+        customer's entries is a recorded scope refusal."""
+        self._access.require_read(
+            principal, SURFACE_MEMORY, target=customer_id or "memory_access_log", on=on
+        )
+        if principal.role == ROLE_CUSTOMER:
+            if customer_id is not None and customer_id != principal.id:
+                self._access.deny(
+                    principal_id=principal.id,
+                    role=principal.role,
+                    surface=SURFACE_MEMORY,
+                    target=customer_id,
+                    reason=REASON_CUSTOMER_SCOPE,
+                    detail="a customer principal reads only its own memory access log",
+                    on=on,
+                )
+            customer_id = principal.id
+        return self.list_memory_access_log(customer_id)
+
+    def quarantine_states_as(
+        self, principal: Principal, case_id: str, *, on: date | None = None
+    ) -> list[dict] | None:
+        """A case's quarantine as item STATES only — the customer
+        shape of the quarantine surface: their text's held /
+        released state, never its screening findings, never its
+        content. Staff-side roles use the full reads above."""
+        case = self._visible_case(
+            principal, case_id, surface=SURFACE_QUARANTINE, on=on
+        )
+        if case is None:
+            return None
+        self._access.require_read(
+            principal, SURFACE_QUARANTINE, target=case_id, on=on
+        )
+        return [
+            {
+                "quarantine_id": item.quarantine_id,
+                "case_id": item.case_id,
+                "source_surface": item.source_surface,
+                "field_name": item.field_name,
+                "received_on": item.received_on.isoformat(),
+                "state": self.quarantine_state(item),
+            }
+            for item in self.list_quarantine_items(case_id)
+        ]
+
+    # -- gated acts (R16): the pack decides who, the engines decide how --
+    def record_approval_as(
+        self,
+        principal: Principal,
+        case_id: str,
+        *,
+        as_of: date,
+        computation_id: str | None = None,
+    ) -> RefundApproval:
+        """The approval act under access control: the pack's
+        approve_refund grant (supervisor tier) first, then the
+        R5 gate itself — with the principal as the named approver,
+        so the act of record and the authenticated caller are the
+        same person."""
+        self._access.require_act(
+            principal, ACT_APPROVE_REFUND, surface=SURFACE_MONEY, target=case_id, on=as_of
+        )
+        return self.record_approval(
+            case_id,
+            approver=principal.id,
+            role=principal.role,
+            as_of=as_of,
+            computation_id=computation_id,
+        )
+
+    def record_fraud_review_as(
+        self,
+        principal: Principal,
+        case_id: str,
+        *,
+        outcome: str,
+        reason_code: str,
+        on: date | None = None,
+    ) -> FraudReviewDecision:
+        """The fraud-review decision under access control: the
+        fraud reviewer (or supervisor) only, named by the
+        principal, then the R4 act and its own refusals."""
+        self._access.require_act(
+            principal,
+            ACT_CONFIRM_FRAUD_REVIEW,
+            surface=SURFACE_FRAUD,
+            target=case_id,
+            on=on,
+        )
+        return self.record_fraud_review(
+            case_id, reviewer=principal.id, outcome=outcome, reason_code=reason_code
+        )
+
+    def release_quarantined_text_as(
+        self,
+        principal: Principal,
+        quarantine_id: str,
+        *,
+        reason: str,
+        released_on: date,
+        case_id: str = "",
+    ) -> ReleasedTextView:
+        """The quarantine release under access control: releasing
+        held (instruction-risk) text is a supervisor act; the
+        R15 book then applies its own rules — named actor, stated
+        reason, escaped form."""
+        self._access.require_act(
+            principal,
+            ACT_RELEASE_QUARANTINE,
+            surface=SURFACE_QUARANTINE,
+            target=case_id or quarantine_id,
+            on=released_on,
+        )
+        return self.release_quarantined_text(
+            quarantine_id,
+            released_by=principal.id,
+            reason=reason,
+            released_on=released_on,
+        )
+
+    def execute_refund_as(
+        self,
+        principal: Principal,
+        case_id: str,
+        *,
+        idempotency_key: str,
+        as_of: date,
+    ) -> RefundReceipt:
+        """Refund execution under access control: staff-side
+        roles only — and then every R5/R11 gate still applies;
+        access control decides who may ask, never whether the
+        money may move."""
+        self._access.require_act(
+            principal, ACT_EXECUTE_REFUND, surface=SURFACE_MONEY, target=case_id, on=as_of
+        )
+        return self.execute_refund(case_id, idempotency_key=idempotency_key, as_of=as_of)
+
+    def execute_top_up_as(
+        self,
+        principal: Principal,
+        case_id: str,
+        *,
+        idempotency_key: str,
+        as_of: date,
+    ) -> RefundReceipt:
+        self._access.require_act(
+            principal, ACT_EXECUTE_REFUND, surface=SURFACE_MONEY, target=case_id, on=as_of
+        )
+        return self.execute_top_up(case_id, idempotency_key=idempotency_key, as_of=as_of)
+
+    def require_manage_case(
+        self, principal: Principal, case_id: str, *, on: date | None = None
+    ) -> None:
+        """The working acts (grading, receipts, messaging
+        lifecycle, labels through the gateway): staff-side roles
+        hold manage_case; customers and auditors do not."""
+        self._access.require_act(
+            principal, ACT_MANAGE_CASE, surface=SURFACE_CASE, target=case_id, on=on
+        )
+
+    def require_intake(
+        self, principal: Principal, order_id: str, *, on: date | None = None
+    ) -> None:
+        """Intake under access control: the intake_return grant,
+        and for a customer principal the order must be theirs —
+        a return is opened against your own order, or not at all."""
+        self._access.require_act(
+            principal, ACT_INTAKE_RETURN, surface=SURFACE_CASE, target=order_id, on=on
+        )
+        if principal.role == ROLE_CUSTOMER:
+            order = self.get_order(order_id)
+            if order is not None and order.customer_id != principal.id:
+                self._access.deny(
+                    principal_id=principal.id,
+                    role=principal.role,
+                    surface=SURFACE_CASE,
+                    target=order_id,
+                    reason=REASON_CUSTOMER_SCOPE,
+                    detail="a customer principal intakes returns only against its own orders",
+                    on=on,
+                )
+
+    def submit_customer_text_as(
+        self,
+        principal: Principal,
+        case_id: str,
+        *,
+        source_surface: str,
+        field_name: str,
+        text: str,
+        received_on: date,
+    ) -> QuarantineItem:
+        """Text submission under access control: a customer
+        submits against its own case only (another's is hidden);
+        staff submit under manage_case. The text lands in
+        quarantine either way — access control never makes text
+        trusted."""
+        case = self.get_case(case_id)
+        if case is None:
+            raise LookupError(f"unknown case: {case_id}")
+        if principal.role == ROLE_CUSTOMER:
+            if case.customer_id != principal.id:
+                self._hide_case(
+                    principal, case_id, surface=SURFACE_QUARANTINE, on=received_on
+                )
+        else:
+            self.require_manage_case(principal, case_id, on=received_on)
+        return self.submit_customer_text(
+            case_id,
+            source_surface=source_surface,
+            field_name=field_name,
+            text=text,
+            received_on=received_on,
+        )
 
     def attach_evidence(self, case_id: str, kind: str, filename: str, content: bytes) -> dict:
         if self._evidence is None:
