@@ -1,4 +1,4 @@
-"""Eval gate for Blueprint #18 (R1–R12).
+"""Eval gate for Blueprint #18 (R1–R14).
 
 Profiles (R10): the full scenario body runs once per store profile
 — in-memory and SQLite always, PostgreSQL when DATABASE_URL (or
@@ -176,6 +176,31 @@ Zero-tolerance counters against planted truth:
   budget that landed, refusals that fail to name the budget or
   to record refused_budget, or one case's exhaustion consuming
   another case's budget.
+- trap_* (R14, the trap suite — docs/trap-suite.md): adversarial
+  fixtures whose expected outcomes were derived by hand from the
+  packs before the code path ran. Cap boundaries on the cent
+  (auto/single/dual at $50.00/$50.01/$150.00/$150.01); a stale
+  (superseded, approved) computation executing anywhere, or
+  failing to be DENIED at the gateway under GP-PAYMENT-APPROVAL;
+  a top-up paying past the graded total or a second top-up
+  landing; a recovery stated at anything but the exact
+  over-refund, or settled through the top-up path; a one-cent
+  label variance hidden or called matched; fraud band boundaries
+  misgraded (the planted 95.00, the engineered 60.00/59.00 cliff,
+  fractional totals — unreachable, every contribution being a
+  whole number of points); two accounts of one household scored
+  on merged history; review decisions acting beyond the one
+  score they decide, or a confirmed fraud lifting; grading
+  accepted before the carrier's received event or a second
+  grading landing; the graded disposition landing on the wrong
+  side of the matrix's age edge (30 fresh / 31 season); stale
+  messages delivered after supersession or a label void; a note
+  carrying a forbidden term AND a wrong figure refused with only
+  one violation recorded, or at all; a discount promise in a note
+  verifying; actor strings differing by case or whitespace
+  permitted at the gateway; the $500 role cap misgraded at
+  $500.00/$500.01; a lookalike customer id retrieving memory;
+  an expired record's figure verifying in a message.
 
 Prints the counters and GATE: PASS/FAIL; exit code follows.
 """
@@ -184,7 +209,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -196,8 +221,16 @@ from returns_resolution.intake import FRAUD_FEED_REQUESTS, PLANTED_REQUESTS
 from returns_resolution.memory import MemoryPack
 from returns_resolution.messaging import LocalMessagingDouble
 from returns_resolution.modelport import OfflineComposer
-from returns_resolution.models import Order, OrderLine, RefundApproval, ReturnRequest
+from returns_resolution.models import (
+    Order,
+    OrderLine,
+    RefundApproval,
+    ReturnCase,
+    ReturnRequest,
+    TenderPortion,
+)
 from returns_resolution.payments import LocalPaymentsDouble
+from returns_resolution.policy import load_policy_pack
 from returns_resolution.seed import CATALOGUE
 from returns_resolution.service import (
     ApprovalError,
@@ -293,6 +326,24 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
         "profile_fallbacks": 0,
         "cost_ledger_arithmetic_errors": 0,
         "budget_refusals_failed": 0,
+        "trap_cap_boundaries_misgraded": 0,
+        "trap_stale_executions_landed": 0,
+        "trap_top_up_overpayments": 0,
+        "trap_recovery_misstatements": 0,
+        "trap_label_cent_variances_hidden": 0,
+        "trap_fraud_boundaries_misgraded": 0,
+        "trap_household_histories_merged": 0,
+        "trap_review_scope_failures": 0,
+        "trap_grading_timing_accepted": 0,
+        "trap_second_gradings_accepted": 0,
+        "trap_matrix_edges_misgraded": 0,
+        "trap_stale_messages_sent": 0,
+        "trap_dual_violations_accepted": 0,
+        "trap_discount_promises_accepted": 0,
+        "trap_actor_variants_accepted": 0,
+        "trap_role_cap_edges_misgraded": 0,
+        "trap_memory_lookalikes_leaked": 0,
+        "trap_expired_figures_accepted": 0,
     }
 
     service = CaseService(make_store(), OfflineComposer())
@@ -1777,6 +1828,744 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
             counters["budget_refusals_failed"] += 1
     if budgeted.ingest(PLANTED_REQUESTS[2]).summary is None:
         counters["budget_refusals_failed"] += 1
+
+    # ---------------------------------------------------------------
+    # R14: the trap suite (docs/trap-suite.md). Every expected
+    # outcome below was derived by hand from the packs before the
+    # path ran. The traps run on their own services, so the
+    # cross-profile fingerprint below is untouched.
+    # ---------------------------------------------------------------
+    TRAP_DAY = date(2026, 10, 27)
+    TRAP_RECEIVED = date(2026, 10, 30)
+    TRAP_GRADED = date(2026, 10, 31)
+
+    def _trap_refused(fn, *exc_types) -> bool:
+        try:
+            fn()
+        except exc_types:
+            return True
+        except Exception:
+            return False
+        return False
+
+    def _trap_priced(svc, rid, oid, customer, price, *, sku="BOOT-TRL",
+                     condition="new_with_tags", delivered=None, requested=None):
+        svc._store.put_order(
+            Order(
+                order_id=oid, customer_id=customer,
+                placed_on=date(2026, 9, 20),
+                delivered_on=delivered or date(2026, 10, 1),
+                lines=[OrderLine(sku=sku, qty=1, unit_price=Decimal(price))],
+                shipping_paid=Decimal("0.00"),
+            ).model_dump(mode="json")
+        )
+        return svc.ingest(
+            ReturnRequest(
+                request_id=rid, order_id=oid, sku=sku, qty=1,
+                reason_code="changed_mind", condition_declared=condition,
+                requested_on=requested or date(2026, 10, 26),
+            )
+        )
+
+    def _trap_label(svc, case_id):
+        return svc.invoke_tool(
+            "create_return_label",
+            {"case_id": case_id, "issued_on": TRAP_DAY},
+            case_id=case_id, called_on=TRAP_DAY,
+        )
+
+    def _trap_grade_boots(svc, execute_first=False):
+        _trap_label(svc, "CASE-2003")
+        if execute_first:
+            svc.record_approval(
+                "CASE-2003", approver="d.okafor", role="returns_lead", as_of=TRAP_DAY
+            )
+            svc.execute_refund(
+                "CASE-2003", idempotency_key="trap-grade-boots", as_of=TRAP_DAY
+            )
+        svc.record_warehouse_receipt(
+            "CASE-2003", received_by="w.chen", received_on=TRAP_RECEIVED
+        )
+        return svc.record_grading(
+            "CASE-2003", grader="p.novak", graded_condition="used", graded_on=TRAP_GRADED
+        )
+
+    # T-M1..T-M4: the approval caps, on the cent.
+    svc = CaseService(make_store(), OfflineComposer())
+    for rid, price, tier_ok, tier_bad in (
+        ("REQ-TM1", "50.00", 0, None), ("REQ-TM2", "50.01", 1, 0),
+        ("REQ-TM3", "150.00", 1, None), ("REQ-TM4", "150.01", 2, 1),
+    ):
+        case = _trap_priced(svc, rid, f"ORD-{rid[4:]}", f"CUST-{rid[4:]}", price)
+        status = svc.approval_status(case.case_id)
+        if status["approvals_required"] != tier_ok:
+            counters["trap_cap_boundaries_misgraded"] += 1
+        if tier_bad is not None:
+            for approver in ("d.okafor", "m.haddad")[:tier_bad]:
+                svc.record_approval(
+                    case.case_id, approver=approver, role="returns_lead", as_of=TRAP_DAY
+                )
+            if not _trap_refused(
+                lambda c=case: svc.execute_refund(
+                    c.case_id, idempotency_key=f"trap-{c.case_id}", as_of=TRAP_DAY
+                ),
+                PaymentsError,
+            ):
+                counters["trap_cap_boundaries_misgraded"] += 1
+            if tier_bad == 1:
+                # The SAME approver's second act does not fill the dual tier.
+                if not _trap_refused(
+                    lambda c=case: svc.record_approval(
+                        c.case_id, approver="d.okafor", role="returns_lead",
+                        as_of=TRAP_DAY,
+                    ),
+                    ApprovalError,
+                ):
+                    counters["trap_cap_boundaries_misgraded"] += 1
+        for approver in ("d.okafor", "m.haddad")[tier_bad or 0:tier_ok]:
+            svc.record_approval(
+                case.case_id, approver=approver, role="returns_lead", as_of=TRAP_DAY
+            )
+        receipt = svc.execute_refund(
+            case.case_id, idempotency_key=f"trap-exec-{case.case_id}", as_of=TRAP_DAY
+        )
+        if receipt.amount != Decimal(price):
+            counters["trap_cap_boundaries_misgraded"] += 1
+
+    # T-M5 / T-P4: a superseded computation must not execute — and
+    # the gateway DENIES it (the R14 fix), it does not wave it
+    # through to a handler error.
+    svc = CaseService(make_store(), OfflineComposer())
+    svc.seed_orders()
+    svc.ingest(PLANTED_REQUESTS[2])
+    comp_a = svc.get_computation("CASE-2003")
+    svc.record_approval(
+        "CASE-2003", approver="d.okafor", role="returns_lead", as_of=TRAP_DAY
+    )
+    _trap_grade_boots(svc)
+    if svc.approval_status("CASE-2003")["satisfied"]:
+        counters["trap_stale_executions_landed"] += 1
+    if not _trap_refused(
+        lambda: svc.record_approval(
+            "CASE-2003", computation_id=comp_a.computation_id,
+            approver="m.haddad", role="returns_lead", as_of=TRAP_GRADED,
+        ),
+        ApprovalError,
+    ):
+        counters["trap_stale_executions_landed"] += 1
+    envelope = svc.invoke_tool_envelope(
+        "execute_refund",
+        {"case_id": "CASE-2003", "computation_id": comp_a.computation_id},
+        case_id="CASE-2003", called_on=TRAP_GRADED, actor="staff",
+    )
+    if envelope.outcome != "denied" or envelope.error["code"] != -32002:
+        counters["trap_stale_executions_landed"] += 1
+    if [c for c in svc.list_tool_calls("CASE-2003")
+            if c.tool == "execute_refund" and c.status == "denied"
+            and c.policy_id == "GP-PAYMENT-APPROVAL"] == []:
+        counters["trap_stale_executions_landed"] += 1
+    if svc.list_receipts():
+        counters["trap_stale_executions_landed"] += 1
+    svc.record_approval(
+        "CASE-2003", approver="d.okafor", role="returns_lead", as_of=TRAP_GRADED
+    )
+    receipt = svc.execute_refund(
+        "CASE-2003", idempotency_key="trap-tm5-live", as_of=TRAP_GRADED
+    )
+    if receipt.amount != Decimal("116.00"):
+        counters["trap_stale_executions_landed"] += 1
+
+    # T-P1: actor strings differing by case or whitespace are denied.
+    svc = CaseService(make_store(), OfflineComposer())
+    svc.seed_orders()
+    svc.ingest(PLANTED_REQUESTS[2])
+    variants = (
+        ("create_return_label",
+         {"case_id": "CASE-2003", "issued_by": "d.okafor", "issued_on": TRAP_DAY},
+         "Staff", "GP-CARRIER-WRITE-ACTORS"),
+        ("get_tracking_events",
+         {"case_id": "CASE-2003", "as_of": TRAP_DAY},
+         " staff", "GP-CARRIER-READ-ACTORS"),
+        ("execute_refund",
+         {"case_id": "CASE-2003",
+          "computation_id": svc.get_computation("CASE-2003").computation_id},
+         "STAFF", "GP-PAYMENT-ACTORS"),
+    )
+    for tool, arguments, actor, policy_id in variants:
+        env = svc.invoke_tool_envelope(
+            tool, arguments, case_id="CASE-2003", called_on=TRAP_DAY, actor=actor
+        )
+        if env.outcome != "denied" or env.error["code"] != -32002:
+            counters["trap_actor_variants_accepted"] += 1
+        if [c for c in svc.list_tool_calls("CASE-2003")
+                if c.tool == tool and c.actor == actor and c.status == "denied"
+                and c.policy_id == policy_id] == []:
+            counters["trap_actor_variants_accepted"] += 1
+    if svc.list_labels("CASE-2003"):
+        counters["trap_actor_variants_accepted"] += 1
+
+    # T-P2: the role cap — $500.00 is permitted by policy (the
+    # handler then errors: no prepared execution), $500.01 denied.
+    svc = CaseService(make_store(), OfflineComposer())
+    big = _trap_priced(svc, "REQ-TP2", "ORD-TP2", "CUST-TP2", "600.00")
+    for approver in ("d.okafor", "m.haddad"):
+        svc.record_approval(
+            big.case_id, approver=approver, role="returns_lead", as_of=TRAP_DAY
+        )
+    comp_big = svc.get_computation(big.case_id)
+    for amount, expected in (("500.00", "error"), ("500.01", "denied"),
+                             ("600.00", "denied")):
+        env = svc.invoke_tool_envelope(
+            "execute_refund",
+            {"case_id": big.case_id, "computation_id": comp_big.computation_id,
+             "amount": Decimal(amount)},
+            case_id=big.case_id, called_on=TRAP_DAY, actor="staff",
+        )
+        if env.outcome != expected:
+            counters["trap_role_cap_edges_misgraded"] += 1
+        if expected == "denied":
+            denied = [c for c in svc.list_tool_calls(big.case_id)
+                      if c.tool == "execute_refund" and c.status == "denied"
+                      and c.policy_id == "GP-PAYMENT-ROLE-CAP"]
+            if not denied:
+                counters["trap_role_cap_edges_misgraded"] += 1
+    if svc.list_receipts() or not _trap_refused(
+        lambda: svc.execute_refund(
+            big.case_id, idempotency_key="trap-tp2", as_of=TRAP_DAY
+        ),
+        PaymentsError,
+    ):
+        counters["trap_role_cap_edges_misgraded"] += 1
+
+    # T-M6 / T-G3 (age 30): a top-up settles exactly the delta.
+    svc = CaseService(make_store(), OfflineComposer())
+    jacket = _trap_priced(
+        svc, "REQ-TM6", "ORD-TM6", "CUST-TM6", "189.00", sku="JKT-ALPINE",
+        condition="used", delivered=date(2026, 9, 26), requested=date(2026, 10, 26),
+    )
+    for approver in ("d.okafor", "m.haddad"):
+        svc.record_approval(
+            jacket.case_id, approver=approver, role="returns_lead", as_of=TRAP_DAY
+        )
+    svc.execute_refund(
+        jacket.case_id, idempotency_key="trap-tm6-orig", as_of=TRAP_DAY
+    )
+    _trap_label(svc, jacket.case_id)
+    svc.record_warehouse_receipt(
+        jacket.case_id, received_by="w.chen", received_on=TRAP_RECEIVED
+    )
+    report = svc.record_grading(
+        jacket.case_id, grader="p.novak", graded_condition="like_new",
+        graded_on=TRAP_GRADED,
+    )
+    if report.refund_delta != Decimal("18.90"):
+        counters["trap_top_up_overpayments"] += 1
+    disp = svc.get_disposition(jacket.case_id)
+    if not (disp.cell_id == "M-APP-LN-FRESH" and disp.disposition == "RESTOCK"
+            and disp.age_band == "fresh" and disp.age_days == 30):
+        counters["trap_matrix_edges_misgraded"] += 1
+    for approver in ("d.okafor", "m.haddad"):
+        svc.record_approval(
+            jacket.case_id, approver=approver, role="returns_lead", as_of=TRAP_GRADED
+        )
+    top_up = svc.execute_top_up(
+        jacket.case_id, idempotency_key="trap-tm6-top", as_of=TRAP_GRADED
+    )
+    paid = sum((r.amount for r in svc.list_receipts()), Decimal("0.00"))
+    if top_up.amount != Decimal("18.90") or paid != Decimal("170.10"):
+        counters["trap_top_up_overpayments"] += 1
+    if not _trap_refused(
+        lambda: svc.execute_top_up(
+            jacket.case_id, idempotency_key="trap-tm6-top2", as_of=TRAP_GRADED
+        ),
+        PaymentsError,
+    ):
+        counters["trap_top_up_overpayments"] += 1
+
+    # T-G3 (age 31): the same jacket one day older grades to OUTLET.
+    season = _trap_priced(
+        svc, "REQ-TG3", "ORD-TG3", "CUST-TG3", "189.00", sku="JKT-ALPINE",
+        condition="used", delivered=date(2026, 9, 25), requested=date(2026, 10, 26),
+    )
+    _trap_label(svc, season.case_id)
+    svc.record_warehouse_receipt(
+        season.case_id, received_by="w.chen", received_on=TRAP_RECEIVED
+    )
+    svc.record_grading(
+        season.case_id, grader="p.novak", graded_condition="like_new",
+        graded_on=TRAP_GRADED,
+    )
+    disp = svc.get_disposition(season.case_id)
+    if not (disp.cell_id == "M-APP-LN-SEASON" and disp.disposition == "OUTLET"
+            and disp.age_band == "season" and disp.age_days == 31):
+        counters["trap_matrix_edges_misgraded"] += 1
+    if svc.list_adjustments(season.case_id):
+        counters["trap_matrix_edges_misgraded"] += 1
+
+    # T-M7: a recovery is exactly the over-refund, never collected
+    # through the top-up path.
+    svc = CaseService(make_store(), OfflineComposer())
+    svc.seed_orders()
+    svc.ingest(PLANTED_REQUESTS[2])
+    _trap_grade_boots(svc, execute_first=True)
+    adjustments = svc.list_adjustments("CASE-2003")
+    receipt = svc.get_receipt("CASE-2003")
+    if len(adjustments) != 1:
+        counters["trap_recovery_misstatements"] += 1
+    else:
+        adjustment = adjustments[0]
+        if not (adjustment.kind == "recovery_due"
+                and adjustment.amount == Decimal("14.50")
+                and adjustment.amount
+                == receipt.amount - svc.get_computation("CASE-2003").refund_total
+                and adjustment.status == "open"):
+            counters["trap_recovery_misstatements"] += 1
+    if not _trap_refused(
+        lambda: svc.execute_top_up(
+            "CASE-2003", idempotency_key="trap-tm7", as_of=TRAP_GRADED
+        ),
+        PaymentsError,
+    ):
+        counters["trap_recovery_misstatements"] += 1
+    if sum((r.amount for r in svc.list_receipts()), Decimal("0.00")) != Decimal("130.50"):
+        counters["trap_recovery_misstatements"] += 1
+
+    # T-M8: a one-cent label variance stands on the record.
+    variant = load_policy_pack().model_copy(deep=True)
+    variant.label_costs["ground"] = "6.96"
+    svc = CaseService(make_store(), OfflineComposer(), pack=variant)
+    stove = _trap_priced(
+        svc, "REQ-TM8", "ORD-TM8", "CUST-TM8", "59.95", sku="STOVE-PKT",
+        condition="used",
+    )
+    label = _trap_label(svc, stove.case_id)
+    rec = label.reconciliation
+    if not (rec.status == "variance" and rec.variance == Decimal("0.01")
+            and rec.deducted_amount == Decimal("6.95")
+            and rec.label_cost == Decimal("6.96")):
+        counters["trap_label_cent_variances_hidden"] += 1
+
+    # Fraud traps on their own service. Helper first.
+    def _trap_customer(svc, customer, prefix, n_orders, priors, live_sku,
+                       live_condition, tender):
+        for i, (sku, condition, requested_on) in enumerate(priors, start=1):
+            oid = f"ORD-{prefix}-{i:02d}"
+            line = OrderLine(sku=sku, qty=1, unit_price=CATALOGUE[sku].unit_price)
+            svc._store.put_order(
+                Order(
+                    order_id=oid, customer_id=customer,
+                    placed_on=requested_on - timedelta(days=43),
+                    delivered_on=requested_on - timedelta(days=40),
+                    lines=[line], shipping_paid=Decimal("0.00"),
+                    tenders=[TenderPortion(method=tender, amount=line.line_total)]
+                    if tender else None,
+                ).model_dump(mode="json")
+            )
+            svc._store.put_case(
+                ReturnCase(
+                    case_id=f"CASE-{prefix}-{i:02d}",
+                    request=ReturnRequest(
+                        request_id=f"REQ-{prefix}-{i:02d}", order_id=oid, sku=sku,
+                        qty=1, reason_code="changed_mind",
+                        condition_declared=condition, requested_on=requested_on,
+                    ),
+                    order_id=oid, customer_id=customer, status="closed",
+                ).model_dump(mode="json")
+            )
+        for j in range(n_orders - len(priors) - 1):
+            oid = f"ORD-{prefix}-X{j:02d}"
+            line = OrderLine(sku="STOVE-PKT", qty=1,
+                             unit_price=CATALOGUE["STOVE-PKT"].unit_price)
+            svc._store.put_order(
+                Order(
+                    order_id=oid, customer_id=customer,
+                    placed_on=date(2026, 7, 29) + timedelta(days=j * 5),
+                    delivered_on=date(2026, 8, 1) + timedelta(days=j * 5),
+                    lines=[line], shipping_paid=Decimal("0.00"),
+                    tenders=[TenderPortion(method=tender, amount=line.line_total)]
+                    if tender else None,
+                ).model_dump(mode="json")
+            )
+        live_oid = f"ORD-{prefix}-LIVE"
+        line = OrderLine(sku=live_sku, qty=1, unit_price=CATALOGUE[live_sku].unit_price)
+        live_on = date(2026, 10, 24)
+        svc._store.put_order(
+            Order(
+                order_id=live_oid, customer_id=customer,
+                placed_on=live_on - timedelta(days=43),
+                delivered_on=live_on - timedelta(days=40),
+                lines=[line], shipping_paid=Decimal("0.00"),
+                tenders=[TenderPortion(method=tender, amount=line.line_total)]
+                if tender else None,
+            ).model_dump(mode="json")
+        )
+        return svc.ingest(
+            ReturnRequest(
+                request_id=f"REQ-{prefix}-LIVE", order_id=live_oid, sku=live_sku,
+                qty=1, reason_code="changed_mind",
+                condition_declared=live_condition, requested_on=live_on,
+            )
+        ).case_id
+
+    svc = CaseService(make_store(), OfflineComposer())
+    svc.seed_history()
+    for request in FRAUD_FEED_REQUESTS:
+        svc.ingest(request)
+    # T-F1: the planted figures.
+    score = svc.get_fraud_score("CASE-3008")
+    signals = {s.signal_id: s.contribution for s in score.signals}
+    if not (score.total_score == Decimal("95.00") and score.band == "FRAUD_REVIEW"
+            and signals["return_velocity"] == Decimal("40.00")
+            and signals["serial_returner_share"] == Decimal("35.00")
+            and signals["card_churn"] == Decimal("20.00")):
+        counters["trap_fraud_boundaries_misgraded"] += 1
+    ward = svc.get_fraud_score("CASE-3103")
+    if not (ward.total_score == Decimal("36.00") and ward.band == "MONITOR"):
+        counters["trap_fraud_boundaries_misgraded"] += 1
+    # T-F2: band probes + the integrality invariant (94.99 is a
+    # band probe, never an engine output: contributions are whole).
+    band_pack = svc.get_scoring_pack()
+    if not (band_pack.band_for(Decimal("94.99")) == "FRAUD_REVIEW"
+            and band_pack.band_for(Decimal("60.00")) == "FRAUD_REVIEW"
+            and band_pack.band_for(Decimal("59.99")) == "MONITOR"):
+        counters["trap_fraud_boundaries_misgraded"] += 1
+    for any_score in svc.list_fraud_scores():
+        if any_score.total_score != any_score.total_score.to_integral_value():
+            counters["trap_fraud_boundaries_misgraded"] += 1
+    # T-F2a/T-F2b: the true cliff, engineered through the engine.
+    edge60 = _trap_customer(
+        svc, "CUST-EDGE60", "E60", 14,
+        [("BOOT-TRL", "used", date(2026, 8, 2) + timedelta(days=i * 11))
+         for i in range(7)],
+        "BOOT-TRL", "used", "card_visa_4411",
+    )
+    s60 = svc.get_fraud_score(edge60)
+    if not (s60.total_score == Decimal("60.00") and s60.band == "FRAUD_REVIEW"
+            and svc.refund_path_blocked(edge60)):
+        counters["trap_fraud_boundaries_misgraded"] += 1
+    edge59 = _trap_customer(
+        svc, "CUST-EDGE59", "E59", 8,
+        [("BOOT-TRL", "used", date(2026, 8, 6) + timedelta(days=i * 13))
+         for i in range(5)],
+        "BOOT-TRL", "used", "card_visa_4411",
+    )
+    s59 = svc.get_fraud_score(edge59)
+    if not (s59.total_score == Decimal("59.00") and s59.band == "MONITOR"
+            and not svc.refund_path_blocked(edge59)):
+        counters["trap_fraud_boundaries_misgraded"] += 1
+    # T-F3: the split household — scored per customer, never merged.
+    hh_priors = [
+        ("JKT-ALPINE", "new_with_tags", date(2026, 9, 12)),
+        ("BOOT-TRL", "new_with_tags", date(2026, 9, 26)),
+        ("JKT-ALPINE", "used", date(2026, 10, 3)),
+        ("BOOT-TRL", "used", date(2026, 10, 10)),
+    ]
+    hh_ids = {}
+    for customer, prefix in (("CUST-HHA", "HHA"), ("CUST-HHB", "HHB")):
+        hh_ids[customer] = _trap_customer(
+            svc, customer, prefix, 16, hh_priors,
+            "JKT-ALPINE", "new_with_tags", None,
+        )
+    hh_scores = [svc.get_fraud_score(cid) for cid in hh_ids.values()]
+    if any(s.total_score != Decimal("52.00") or s.band != "MONITOR"
+           for s in hh_scores):
+        counters["trap_household_histories_merged"] += 1
+    if set(hh_scores[0].input_case_ids) & set(hh_scores[1].input_case_ids):
+        counters["trap_household_histories_merged"] += 1
+    # T-F4a: a clearance decides one score, not the customer.
+    svc.record_fraud_review(
+        "CASE-3008", reviewer="r.alvarez",
+        outcome="cleared_with_reason",
+        reason_code="legitimate_pattern_explained",
+    )
+    line = OrderLine(sku="BOOT-TRL", qty=1, unit_price=CATALOGUE["BOOT-TRL"].unit_price)
+    svc._store.put_order(
+        Order(
+            order_id="ORD-3009", customer_id="CUST-SER",
+            placed_on=date(2026, 10, 12), delivered_on=date(2026, 10, 15),
+            lines=[line], shipping_paid=Decimal("0.00"),
+            tenders=[TenderPortion(method="card_visa_4411", amount=line.line_total)],
+        ).model_dump(mode="json")
+    )
+    next_case = svc.ingest(
+        ReturnRequest(
+            request_id="REQ-3009", order_id="ORD-3009", sku="BOOT-TRL", qty=1,
+            reason_code="changed_mind", condition_declared="used",
+            requested_on=date(2026, 10, 25),
+        )
+    )
+    if not (svc.get_fraud_score(next_case.case_id).total_score == Decimal("95.00")
+            and svc.refund_path_blocked(next_case.case_id)):
+        counters["trap_review_scope_failures"] += 1
+    # T-F4b/T-F4c: confirmed fraud is sticky; the vocabulary binds.
+    svc = CaseService(make_store(), OfflineComposer())
+    svc.seed_history()
+    for request in FRAUD_FEED_REQUESTS:
+        svc.ingest(request)
+    svc.record_fraud_review(
+        "CASE-3008", reviewer="r.alvarez",
+        outcome="confirmed_fraud", reason_code="pattern_verified",
+    )
+    if svc.get_case("CASE-3008").fraud_state != "fraud_confirmed":
+        counters["trap_review_scope_failures"] += 1
+    if not _trap_refused(
+        lambda: svc.record_approval(
+            "CASE-3008", approver="d.okafor", role="returns_lead", as_of=TRAP_DAY
+        ),
+        FraudHoldError,
+    ):
+        counters["trap_review_scope_failures"] += 1
+    if not _trap_refused(
+        lambda: svc.record_fraud_review(
+            "CASE-3008", reviewer="m.haddad",
+            outcome="cleared_with_reason",
+            reason_code="legitimate_pattern_explained",
+        ),
+        FraudReviewError,
+    ):
+        counters["trap_review_scope_failures"] += 1
+    svc.rescore_case("CASE-3008")
+    if svc.get_case("CASE-3008").fraud_state != "fraud_confirmed":
+        counters["trap_review_scope_failures"] += 1
+    if not _trap_refused(
+        lambda: svc.record_fraud_review(
+            "CASE-3103", reviewer="r.alvarez",
+            outcome="cleared_with_reason",
+            reason_code="legitimate_pattern_explained",
+        ),
+        FraudReviewError,
+    ):
+        counters["trap_review_scope_failures"] += 1
+
+    # T-G1 / T-P3: grading before the parcel exists — a handler
+    # error at "error" with no policy id, never a denial.
+    svc = CaseService(make_store(), OfflineComposer())
+    svc.seed_orders()
+    svc.ingest(PLANTED_REQUESTS[2])
+    _trap_label(svc, "CASE-2003")
+    if not _trap_refused(
+        lambda: svc.record_warehouse_receipt(
+            "CASE-2003", received_by="w.chen", received_on=date(2026, 10, 28)
+        ),
+        GradingError,
+    ):
+        counters["trap_grading_timing_accepted"] += 1
+    if not _trap_refused(
+        lambda: svc.record_grading(
+            "CASE-2003", grader="p.novak", graded_condition="used",
+            graded_on=date(2026, 10, 28),
+        ),
+        GradingError,
+    ):
+        counters["trap_grading_timing_accepted"] += 1
+    grading_calls = [c for c in svc.list_tool_calls("CASE-2003")
+                     if c.tool == "submit_grading_report"]
+    if not grading_calls or grading_calls[-1].status != "error" \
+            or grading_calls[-1].policy_id is not None:
+        counters["trap_grading_timing_accepted"] += 1
+    env = svc.invoke_tool_envelope(
+        "submit_grading_report",
+        {"case_id": "CASE-2001", "grader": "p.novak",
+         "graded_condition": "used", "graded_on": TRAP_DAY,
+         "functional_test_result": None, "data_wipe_status": None,
+         "damage_notes": "", "received_weight_grams": None,
+         "wear_evidence": False},
+        case_id="CASE-2001", called_on=TRAP_DAY, actor="warehouse",
+    )
+    if env.outcome != "error" or env.error["code"] == -32002:
+        counters["trap_grading_timing_accepted"] += 1
+    if any(c.status == "denied" for c in svc.list_tool_calls("CASE-2001")):
+        counters["trap_grading_timing_accepted"] += 1
+
+    # T-G2: a second grading is refused; the first cascade stands.
+    svc = CaseService(make_store(), OfflineComposer())
+    svc.seed_orders()
+    svc.ingest(PLANTED_REQUESTS[2])
+    _trap_grade_boots(svc)
+    before = sorted(
+        (c["computation_id"], str(c)) for c in svc._store.list_computations()
+    )
+    if not _trap_refused(
+        lambda: svc.record_grading(
+            "CASE-2003", grader="g.osei", graded_condition="like_new",
+            graded_on=TRAP_GRADED,
+        ),
+        GradingError,
+    ):
+        counters["trap_second_gradings_accepted"] += 1
+    after = sorted(
+        (c["computation_id"], str(c)) for c in svc._store.list_computations()
+    )
+    if len(svc.list_grading_reports("CASE-2003")) != 1 or before != after:
+        counters["trap_second_gradings_accepted"] += 1
+
+    # T-MS1: a queued summary is withdrawn by grading supersession.
+    trap_msg = LocalMessagingDouble()
+    svc = CaseService(make_store(), OfflineComposer(), messaging_port=trap_msg)
+    svc.seed_orders()
+    svc.ingest(PLANTED_REQUESTS[2])
+    queued = next(
+        m for m in svc.list_messages("CASE-2003")
+        if m.message_type == "return_summary" and m.status == "verified"
+    )
+    svc.queue_message(queued.message_id, as_of=TRAP_DAY)
+    _trap_grade_boots(svc)
+    if svc.get_message(queued.message_id).status != "withdrawn":
+        counters["trap_stale_messages_sent"] += 1
+    if not _trap_refused(
+        lambda: svc.send_message(queued.message_id, as_of=TRAP_GRADED),
+        MessagingError,
+    ) or trap_msg.delivery_count != 0:
+        counters["trap_stale_messages_sent"] += 1
+
+    # T-MS2: the label voided under queued instructions — the send
+    # withdraws, nothing is delivered.
+    trap_msg = LocalMessagingDouble()
+    svc = CaseService(make_store(), OfflineComposer(), messaging_port=trap_msg)
+    svc.seed_orders()
+    svc.ingest(PLANTED_REQUESTS[2])
+    label = _trap_label(svc, "CASE-2003")
+    drafted = svc.draft_message("CASE-2003", "label_instructions", as_of=TRAP_DAY)
+    svc.verify_message(drafted.message_id, as_of=TRAP_DAY)
+    svc.queue_message(drafted.message_id, as_of=TRAP_DAY)
+    svc.invoke_tool(
+        "void_return_label",
+        {"case_id": "CASE-2003", "label_id": label.label_id,
+         "voided_by": "d.okafor", "reason": "customer kept the item",
+         "voided_on": TRAP_DAY},
+        case_id="CASE-2003", called_on=TRAP_DAY,
+    )
+    if not _trap_refused(
+        lambda: svc.send_message(drafted.message_id, as_of=TRAP_DAY),
+        MessagingError,
+    ):
+        counters["trap_stale_messages_sent"] += 1
+    if svc.get_message(drafted.message_id).status != "withdrawn" \
+            or trap_msg.delivery_count != 0:
+        counters["trap_stale_messages_sent"] += 1
+
+    # T-MS3: one note, two violation families, both recorded.
+    trap_msg = LocalMessagingDouble()
+    svc = CaseService(make_store(), OfflineComposer(), messaging_port=trap_msg)
+    svc.seed_orders()
+    for request in PLANTED_REQUESTS:
+        svc.ingest(request)
+    drafted = svc.draft_message(
+        "CASE-2001", "return_summary", as_of=TRAP_DAY,
+        model_note=(
+            "Your return_velocity pattern scored 95 points, over the "
+            "review threshold. Your refund is $999.99."
+        ),
+    )
+    checked = svc.verify_message(drafted.message_id, as_of=TRAP_DAY)
+    if checked.status != "refused":
+        counters["trap_dual_violations_accepted"] += 1
+    if not (any("forbidden" in v and "return_velocity" in v
+                for v in checked.violations)
+            and any("amount $999.99" in v for v in checked.violations)):
+        counters["trap_dual_violations_accepted"] += 1
+    if trap_msg.delivery_count != 0:
+        counters["trap_dual_violations_accepted"] += 1
+
+    # T-MS4: the discount promise — the R14 disclosure regression.
+    trap_msg = LocalMessagingDouble()
+    svc = CaseService(make_store(), OfflineComposer(), messaging_port=trap_msg)
+    svc.seed_history()
+    for request in FRAUD_FEED_REQUESTS:
+        svc.ingest(request)
+    svc.record_fraud_review(
+        "CASE-3008", reviewer="r.alvarez",
+        outcome="cleared_with_reason",
+        reason_code="legitimate_pattern_explained",
+    )
+    drafted = svc.draft_message(
+        "CASE-3008", "fraud_review_notice", as_of=TRAP_DAY,
+        model_note=(
+            "As a goodwill gesture, a 20% discount will be applied "
+            "to your next order."
+        ),
+    )
+    checked = svc.verify_message(drafted.message_id, as_of=TRAP_DAY)
+    if checked.status != "refused" \
+            or not any("discount" in v for v in checked.violations):
+        counters["trap_discount_promises_accepted"] += 1
+    plain = svc.draft_message("CASE-3008", "fraud_review_notice", as_of=TRAP_DAY)
+    if svc.verify_message(plain.message_id, as_of=TRAP_DAY).status != "verified":
+        counters["trap_discount_promises_accepted"] += 1
+
+    # T-MEM1: a lookalike customer id retrieves nothing, logged.
+    svc = CaseService(make_store(), OfflineComposer())
+    svc.seed_orders()
+    svc.ingest(PLANTED_REQUESTS[2])
+    _trap_label(svc, "CASE-2003")
+    svc.record_approval(
+        "CASE-2003", approver="d.okafor", role="returns_lead", as_of=TRAP_DAY
+    )
+    svc.execute_refund(
+        "CASE-2003", idempotency_key="trap-mem-eval", as_of=TRAP_DAY
+    )
+    if not svc.retrieve_memory("CUST-CID", as_of=TRAP_DAY):
+        counters["trap_memory_lookalikes_leaked"] += 1
+    if svc.retrieve_memory("CUST-CIE", as_of=TRAP_DAY) != []:
+        counters["trap_memory_lookalikes_leaked"] += 1
+    if svc.has_customer("CUST-CIE"):
+        counters["trap_memory_lookalikes_leaked"] += 1
+    probes = svc.list_memory_access_log("CUST-CIE")
+    if not probes or probes[-1].returned_record_ids != []:
+        counters["trap_memory_lookalikes_leaked"] += 1
+
+    # T-MEM2: the expired figure, refused under the shipped pack.
+    note = (
+        "As with your earlier return, the refund of $130.50 was "
+        "sent to your original payment method."
+    )
+
+    def _trap_later_boots(svc, rid, oid, delivered, requested):
+        svc._store.put_order(
+            Order(
+                order_id=oid, customer_id="CUST-CID",
+                placed_on=delivered - timedelta(days=3),
+                delivered_on=delivered,
+                lines=[OrderLine(sku="BOOT-TRL", qty=1,
+                                 unit_price=Decimal("145.00"))],
+                shipping_paid=Decimal("0.00"),
+            ).model_dump(mode="json")
+        )
+        return svc.ingest(
+            ReturnRequest(
+                request_id=rid, order_id=oid, sku="BOOT-TRL", qty=1,
+                reason_code="changed_mind",
+                condition_declared="new_with_tags", requested_on=requested,
+            )
+        ).case_id
+
+    cid_2026_ids = {
+        r.record_id for r in svc.retrieve_memory("CUST-CID", as_of=TRAP_DAY)
+    }
+    live_case = _trap_later_boots(
+        svc, "REQ-2009", "ORD-1009", date(2026, 10, 28), date(2026, 11, 2)
+    )
+    drafted = svc.draft_message(
+        live_case, "return_summary", as_of=date(2026, 11, 2), model_note=note
+    )
+    if svc.verify_message(
+        drafted.message_id, as_of=date(2026, 11, 2)
+    ).status != "verified":
+        counters["trap_expired_figures_accepted"] += 1
+    expired_case = _trap_later_boots(
+        svc, "REQ-1099", "ORD-1099", date(2028, 12, 20), date(2029, 1, 15)
+    )
+    as_of_2029 = date(2029, 1, 15)
+    returned = svc.retrieve_memory("CUST-CID", as_of=as_of_2029)
+    if cid_2026_ids & {r.record_id for r in returned}:
+        counters["trap_expired_figures_accepted"] += 1
+    drafted = svc.draft_message(
+        expired_case, "return_summary", as_of=as_of_2029, model_note=note
+    )
+    checked = svc.verify_message(drafted.message_id, as_of=as_of_2029)
+    if checked.status != "refused" \
+            or not any("amount $130.50" in v for v in checked.violations):
+        counters["trap_expired_figures_accepted"] += 1
 
     # The cross-profile fingerprint (R10): the content-addressed
     # artefact ids the planted work minted on this profile's store.
