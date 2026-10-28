@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from returns_resolution.intake import ReferenceFeed
+from returns_resolution.intake import FRAUD_FEED_REQUESTS, ReferenceFeed
 from returns_resolution.modelport import OfflineComposer
 from returns_resolution.service import CaseService
 from returns_resolution.store import SqlStore
@@ -69,6 +69,36 @@ def main() -> int:
             print(f"  {case_id}  {disp.disposition:<18} via {disp.channel:<10} cell {route}")
             for unknown in disp.inspection_unknowns:
                 print(f"      inspection must establish: {unknown}")
+
+    print("\n--- fraud scoring (pack 2026.10.1, history seed loaded) ---")
+    service.seed_history()
+    for request in FRAUD_FEED_REQUESTS:
+        case = service.ingest(request)
+        score = case.fraud_score
+        parts = ", ".join(
+            f"{s.signal_id}={s.contribution}" if s.status == "computed" else f"{s.signal_id}:{s.status}"
+            for s in score.signals
+        )
+        print(f"  {case.case_id}  total={score.total_score}  band={score.band}  state={case.fraud_state}")
+        print(f"      [{parts}]")
+        if service.refund_path_blocked(case.case_id):
+            print("      refund path: BLOCKED — only a named fraud-review decision can lift this")
+
+    decision = service.record_fraud_review(
+        "CASE-3008",
+        reviewer="r.alvarez",
+        outcome="cleared_with_reason",
+        reason_code="legitimate_pattern_explained",
+    )
+    cleared = service.get_case("CASE-3008")
+    print(
+        f"  review {decision.review_id}: {decision.reviewer} recorded {decision.outcome} "
+        f"({decision.reason_code}) on score {decision.score_id}"
+    )
+    print(
+        f"  CASE-3008 state now {cleared.fraud_state}; the score artefact still reads "
+        f"{cleared.fraud_score.band} at {cleared.fraud_score.total_score} — the act lifted the block, not the arithmetic"
+    )
 
     for case_id in ("CASE-2003", "CASE-2004"):
         case = cases[case_id]

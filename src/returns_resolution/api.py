@@ -8,10 +8,24 @@ through one surface reads identically through the other.
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, field_validator
 
 from .intake import ReferenceFeed
 from .models import ReturnRequest
-from .service import CaseService, FigureVerificationError
+from .service import CaseService, FigureVerificationError, FraudReviewError
+
+
+class FraudReviewRequest(BaseModel):
+    reviewer: str
+    outcome: str
+    reason_code: str
+
+    @field_validator("reviewer")
+    @classmethod
+    def _named(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("a fraud-review decision requires a named reviewer")
+        return v.strip()
 
 
 def _order_view(order) -> dict:
@@ -134,6 +148,68 @@ def create_app(service: CaseService) -> FastAPI:
     @app.get("/disposition/channels")
     def channels() -> dict:
         return service.get_channels().model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/fraud-score")
+    def fraud_score(case_id: str) -> dict:
+        found = service.get_fraud_score(case_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="fraud score not found")
+        return found.model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/fraud-score/signals")
+    def fraud_signals(case_id: str) -> dict:
+        found = service.get_fraud_score(case_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="fraud score not found")
+        return {
+            "case_id": case_id,
+            "score_id": found.score_id,
+            "pack_version": found.pack_version,
+            "total_score": str(found.total_score),
+            "band": found.band,
+            "signals": [s.model_dump(mode="json") for s in found.signals],
+        }
+
+    @app.get("/cases/{case_id}/fraud-score/verify")
+    def fraud_score_verify(case_id: str) -> dict:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        problems = service.verify_stored_fraud_score(case_id)
+        return {"case_id": case_id, "ok": not problems, "problems": problems}
+
+    @app.post("/cases/{case_id}/fraud-score/rescore")
+    def fraud_rescore(case_id: str) -> dict:
+        found = service.rescore_case(case_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return found.model_dump(mode="json")
+
+    @app.get("/fraud-scores")
+    def fraud_scores() -> list[dict]:
+        return [s.model_dump(mode="json") for s in service.list_fraud_scores()]
+
+    @app.get("/fraud/scoring-pack")
+    def scoring_pack() -> dict:
+        return service.get_scoring_pack().model_dump(mode="json")
+
+    @app.post("/cases/{case_id}/fraud-review", status_code=201)
+    def fraud_review(case_id: str, body: FraudReviewRequest) -> dict:
+        try:
+            decision = service.record_fraud_review(
+                case_id, reviewer=body.reviewer, outcome=body.outcome, reason_code=body.reason_code
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FraudReviewError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return decision.model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/fraud-review")
+    def fraud_review_read(case_id: str) -> dict:
+        found = service.get_fraud_review(case_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="fraud review not found")
+        return found.model_dump(mode="json")
 
     @app.post("/cases/{case_id}/evidence")
     async def evidence(case_id: str, request: Request, kind: str = "photo", filename: str = "evidence.bin") -> dict:

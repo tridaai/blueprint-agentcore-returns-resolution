@@ -22,7 +22,7 @@ from .evidence import LocalEvidenceStore
 from .intake import ReferenceFeed
 from .modelport import load_model_port
 from .models import ReturnRequest
-from .service import CaseService, FigureVerificationError
+from .service import CaseService, FigureVerificationError, FraudReviewError
 from .store import SqlStore
 
 try:  # The pinned SDK is a hard dependency; this is a safety net.
@@ -48,6 +48,7 @@ def build_service(config: Config | None = None) -> CaseService:
     evidence = LocalEvidenceStore(root=config.evidence_dir, bucket=config.evidence_bucket)
     service = CaseService(store, model_port, evidence_store=evidence)
     service.seed_orders()
+    service.seed_history()
     return service
 
 
@@ -57,11 +58,20 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     get_computation {case_id} | verify_computation {case_id} |
     get_disposition {case_id} | verify_disposition {case_id} |
     list_dispositions | get_matrix | get_matrix_cell {cell_id} |
-    get_channels | list_cases | list_orders.
+    get_channels | list_cases | list_orders |
+    get_fraud_score {case_id} | get_fraud_signals {case_id} |
+    verify_fraud_score {case_id} | rescore_case {case_id} |
+    record_fraud_review {case_id, reviewer, outcome, reason_code} |
+    get_fraud_review {case_id} | get_scoring_pack | list_fraud_scores.
     """
     action = payload.get("action", "intake_feed")
     if action == "seed":
-        return {"seeded_orders": service.seed_orders()}
+        return {
+            "seeded_orders": service.seed_orders(),
+            "seeded_history_cases": service.seed_history(),
+        }
+    if action == "seed_history":
+        return {"seeded_history_cases": service.seed_history()}
     if action == "intake_feed":
         results = []
         for request in ReferenceFeed().fetch_requests():
@@ -102,6 +112,45 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         return {"cell": cell.model_dump(mode="json") if cell else None}
     if action == "get_channels":
         return {"channels": service.get_channels().model_dump(mode="json")}
+    if action == "get_fraud_score":
+        score = service.get_fraud_score(payload["case_id"])
+        return {"fraud_score": score.model_dump(mode="json") if score else None}
+    if action == "get_fraud_signals":
+        score = service.get_fraud_score(payload["case_id"])
+        if score is None:
+            return {"signals": None}
+        return {
+            "case_id": score.case_id,
+            "score_id": score.score_id,
+            "pack_version": score.pack_version,
+            "total_score": str(score.total_score),
+            "band": score.band,
+            "signals": [s.model_dump(mode="json") for s in score.signals],
+        }
+    if action == "verify_fraud_score":
+        problems = service.verify_stored_fraud_score(payload["case_id"])
+        return {"case_id": payload["case_id"], "ok": not problems, "problems": problems}
+    if action == "rescore_case":
+        score = service.rescore_case(payload["case_id"])
+        return {"fraud_score": score.model_dump(mode="json") if score else None}
+    if action == "record_fraud_review":
+        try:
+            decision = service.record_fraud_review(
+                payload["case_id"],
+                reviewer=payload.get("reviewer", ""),
+                outcome=payload.get("outcome", ""),
+                reason_code=payload.get("reason_code", ""),
+            )
+            return {"fraud_review": decision.model_dump(mode="json")}
+        except (LookupError, FraudReviewError) as exc:
+            return {"error": str(exc)}
+    if action == "get_fraud_review":
+        review = service.get_fraud_review(payload["case_id"])
+        return {"fraud_review": review.model_dump(mode="json") if review else None}
+    if action == "get_scoring_pack":
+        return {"scoring_pack": service.get_scoring_pack().model_dump(mode="json")}
+    if action == "list_fraud_scores":
+        return {"fraud_scores": [s.model_dump(mode="json") for s in service.list_fraud_scores()]}
     if action == "list_cases":
         return {"cases": [c.model_dump(mode="json") for c in service.list_cases()]}
     if action == "list_orders":
