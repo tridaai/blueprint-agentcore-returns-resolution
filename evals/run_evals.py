@@ -102,6 +102,18 @@ Zero-tolerance counters against planted truth:
   without their gates — receipt before the carrier's received
   event, the receiver grading their own parcel, grading before
   any warehouse receipt, or a second grading act.
+- unverified_message_sends: customer messages delivered by the
+  messaging port that were not verified, queued, stored texts —
+  or deliveries beyond the sends performed.
+- stale_message_sends: messages delivered after their underlying
+  artefacts were superseded — a stale send must instead refuse
+  with the message withdrawn and a verified replacement standing.
+- forbidden_content_sent: delivered message texts carrying
+  disclosure-pack content — fraud signal names, scores,
+  thresholds, or promises the policy pack does not make.
+- figure_fact_violations_sent: message drafts whose figures or
+  stated facts disagreed with the artefacts of record and were
+  not refused — an inflated refund, a wrong disposition.
 
 Prints the counters and GATE: PASS/FAIL; exit code follows.
 """
@@ -117,6 +129,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from returns_resolution.carrier import LocalCarrierDouble
 from returns_resolution.intake import FRAUD_FEED_REQUESTS, PLANTED_REQUESTS
+from returns_resolution.messaging import LocalMessagingDouble
 from returns_resolution.modelport import OfflineComposer
 from returns_resolution.models import RefundApproval, ReturnRequest
 from returns_resolution.payments import LocalPaymentsDouble
@@ -129,6 +142,7 @@ from returns_resolution.service import (
     FraudHoldError,
     FraudReviewError,
     GradingError,
+    MessagingError,
     PaymentsError,
 )
 from returns_resolution.store import InMemoryStore
@@ -196,6 +210,10 @@ def main() -> int:
         "ungated_top_ups": 0,
         "holds_finalised_without_fields": 0,
         "grading_gate_bypasses": 0,
+        "unverified_message_sends": 0,
+        "stale_message_sends": 0,
+        "forbidden_content_sent": 0,
+        "figure_fact_violations_sent": 0,
     }
 
     service = CaseService(InMemoryStore(), OfflineComposer())
@@ -1076,6 +1094,137 @@ def main() -> int:
     ):
         counters["grading_delta_mismatches"] += 1
     _check_unedited(fraud7, "CASE-2001", fraud_before)
+
+    # --- R8: customer messaging — templates, verifier, lifecycle ------
+    # Every ingested case's summary stands as a verified message.
+    # The happy path walks three message types to the messaging
+    # double and proves the delivered texts are exactly the stored
+    # verified texts. The four planted probes — an inflated figure,
+    # a wrong disposition fact, a fraud notice leaking its internals,
+    # a queued message going stale after grading — must never reach
+    # the customer.
+    DAY8 = date(2026, 10, 27)
+    RECEIVED8 = date(2026, 10, 30)
+    GRADED8 = date(2026, 10, 31)
+    msg_double = LocalMessagingDouble()
+    msg = CaseService(InMemoryStore(), OfflineComposer(), messaging_port=msg_double)
+    msg.seed_orders()
+    msg.seed_history()
+    for request in PLANTED_REQUESTS:
+        msg.ingest(request)
+    msg.ingest(FRAUD_FEED_REQUESTS[0])  # CASE-3008, the serial returner
+
+    summaries = [m for m in msg.list_all_messages() if m.message_type == "return_summary"]
+    if len(summaries) != len(PLANTED_REQUESTS) + 1 or any(
+        m.status != "verified" for m in summaries
+    ):
+        counters["figure_fact_violations_sent"] += 1  # an honest summary failed its own verifier
+
+    def _lifecycle8(case_id, message_type, on=DAY8, note=None):
+        draft = msg.draft_message(case_id, message_type, as_of=on, model_note=note)
+        msg.verify_message(draft.message_id, as_of=on)
+        msg.queue_message(draft.message_id, as_of=on)
+        return msg.send_message(draft.message_id, as_of=on)
+
+    _label7(msg, "CASE-2003")
+    sent_label = _lifecycle8("CASE-2003", "label_instructions")
+    msg.record_approval("CASE-2003", approver="d.okafor", role="returns_lead", as_of=DAY8)
+    msg.execute_refund("CASE-2003", idempotency_key="eval-r8-exec", as_of=DAY8)
+    sent_exec = _lifecycle8("CASE-2003", "refund_executed_notice")
+    msg.record_fraud_review(
+        "CASE-3008", reviewer="r.alvarez", outcome="cleared_with_reason",
+        reason_code="legitimate_pattern_explained",
+    )
+    sent_fraud = _lifecycle8("CASE-3008", "fraud_review_notice")
+    for sent in (sent_label, sent_exec, sent_fraud):
+        if sent.status != "sent" or msg_double.deliveries.get(sent.message_id) != sent.text:
+            counters["unverified_message_sends"] += 1
+    if msg_double.delivery_count != 3:
+        counters["unverified_message_sends"] += 1
+    # A repeat send is the same act — the count must not move.
+    msg.send_message(sent_label.message_id, as_of=DAY8)
+    if msg_double.delivery_count != 3:
+        counters["unverified_message_sends"] += 1
+
+    # Probe 1 — figure: a note slot inflating the refund is refused.
+    probe_fig = msg.draft_message(
+        "CASE-2003", "return_summary", as_of=DAY8, model_note="Your refund is $999.99."
+    )
+    refused_fig = msg.verify_message(probe_fig.message_id, as_of=DAY8)
+    if refused_fig.status != "refused" or not refused_fig.violations:
+        counters["figure_fact_violations_sent"] += 1
+    try:
+        msg.queue_message(probe_fig.message_id, as_of=DAY8)
+        counters["figure_fact_violations_sent"] += 1  # a refused message queued
+    except MessagingError:
+        pass
+    if probe_fig.message_id in msg_double.deliveries:
+        counters["figure_fact_violations_sent"] += 1
+
+    # Probe 2 — fact: CASE-2006 is HOLD_FOR_INSPECTION; a note
+    # claiming restock states a disposition the record does not hold.
+    probe_fact = msg.draft_message(
+        "CASE-2006", "return_summary", as_of=DAY8,
+        model_note="Good news: the item will be restocked right away.",
+    )
+    refused_fact = msg.verify_message(probe_fact.message_id, as_of=DAY8)
+    if refused_fact.status != "refused" or not any(
+        "fact" in v for v in refused_fact.violations
+    ):
+        counters["figure_fact_violations_sent"] += 1
+    if probe_fact.message_id in msg_double.deliveries:
+        counters["figure_fact_violations_sent"] += 1
+
+    # Probe 3 — forbidden: a fraud notice leaking the signal and the
+    # score is refused; and no delivered text anywhere may carry the
+    # disclosure pack's vocabulary.
+    probe_leak = msg.draft_message(
+        "CASE-3008", "fraud_review_notice", as_of=DAY8,
+        model_note="Your return_velocity pattern scored 95 points, over the review threshold.",
+    )
+    refused_leak = msg.verify_message(probe_leak.message_id, as_of=DAY8)
+    if refused_leak.status != "refused" or not any(
+        "forbidden" in v for v in refused_leak.violations
+    ):
+        counters["forbidden_content_sent"] += 1
+    if probe_leak.message_id in msg_double.deliveries:
+        counters["forbidden_content_sent"] += 1
+    for delivered_text in msg_double.deliveries.values():
+        if any(
+            term in delivered_text
+            for term in (
+                "return_velocity", "serial_returner_share", "wardrobing_indicator",
+                "weight_mismatch", "card_churn", "threshold", "FRAUD_REVIEW",
+            )
+        ):
+            counters["forbidden_content_sent"] += 1
+
+    # Probe 4 — stale: the lamp's summary is queued, then grading
+    # supersedes the artefacts it renders. The send must refuse, the
+    # message must stand withdrawn, nothing stale may be delivered,
+    # and the verified replacement must send cleanly.
+    _label7(msg, "CASE-2006")
+    queued_lamp = [m for m in msg.list_messages("CASE-2006") if m.status == "verified"][-1]
+    msg.queue_message(queued_lamp.message_id, as_of=DAY8)
+    msg.record_warehouse_receipt("CASE-2006", received_by="w.chen", received_on=RECEIVED8)
+    msg.record_grading(
+        "CASE-2006", grader="p.novak", graded_condition="used", graded_on=GRADED8,
+        functional_test_result="pass", data_wipe_status="verified",
+    )
+    try:
+        msg.send_message(queued_lamp.message_id, as_of=GRADED8)
+        counters["stale_message_sends"] += 1  # a stale send landed
+    except MessagingError:
+        pass
+    if msg.get_message(queued_lamp.message_id).status != "withdrawn":
+        counters["stale_message_sends"] += 1
+    if queued_lamp.message_id in msg_double.deliveries:
+        counters["stale_message_sends"] += 1
+    replacement = [m for m in msg.list_messages("CASE-2006") if m.status == "verified"][-1]
+    msg.queue_message(replacement.message_id, as_of=GRADED8)
+    sent_replacement = msg.send_message(replacement.message_id, as_of=GRADED8)
+    if msg_double.deliveries.get(sent_replacement.message_id) != sent_replacement.text:
+        counters["stale_message_sends"] += 1
 
     for name, value in counters.items():
         print(f"{name}: {value} (required 0)")

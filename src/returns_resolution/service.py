@@ -2279,14 +2279,22 @@ class CaseService:
             return model.model_dump(mode="json") if model is not None else None
 
         if message_type == "return_summary":
+            # The summary is verified against the disposition chain
+            # as well as the money: a grading that supersedes the
+            # disposition (the held lamp resolving to REFURBISH)
+            # moves the record under the message even when no figure
+            # changes, so the chain is part of the pin.
             payloads = {
                 "decision": dump(decision),
                 "computation": dump(computation),
+                "dispositions": [dump(d) for d in dispositions],
                 "label": dump(label),
             }
             refs = {"decision": f"decision:{case.case_id}"}
             if computation is not None:
                 refs["computation"] = computation.computation_id
+            if dispositions:
+                refs["dispositions"] = ",".join(d.disposition_id for d in dispositions)
             if label is not None:
                 refs["label"] = label.label_id
         elif message_type == "label_instructions":
