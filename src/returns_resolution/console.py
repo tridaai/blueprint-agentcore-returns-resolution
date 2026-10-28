@@ -145,7 +145,7 @@ def _case_summary(
             case,
             has_computation=computation is not None,
             has_disposition=disposition is not None,
-            approval_satisfied=bool(approval.get("satisfied")),
+            approval_satisfied=bool(approval.get("satisfied") and approval.get("approvers")),
             has_refund_receipt=bool(refund_receipts),
             has_label=bool(labels),
             has_grading=bool(grading_reports),

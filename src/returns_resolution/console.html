@@ -1,0 +1,676 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cascade Outfitters — Returns Operations Console</title>
+<style>
+  :root {
+    --ink: #0A0A0A;
+    --muted: #5D6472;
+    --line: #E4E4EC;
+    --panel: #F7F7FA;
+    --indigo: #4F46E5;
+    --indigo-dark: #3730A3;
+    --lavender: #EEF0FF;
+    --good: #087443;
+    --warn: #B54708;
+    --bad: #B42318;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    color: var(--ink);
+    background: #fff;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    line-height: 1.45;
+  }
+  a { color: var(--indigo); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header {
+    border-bottom: 1px solid var(--line);
+    padding: 22px clamp(18px, 4vw, 48px);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+  }
+  .brand { display: flex; align-items: center; gap: 16px; }
+  .brand img { width: 54px; height: 54px; border-radius: 14px; }
+  h1 { margin: 0; font-size: clamp(24px, 3vw, 38px); letter-spacing: -0.03em; }
+  h2 { margin: 0 0 14px; font-size: 22px; letter-spacing: -0.02em; }
+  h3 { margin: 22px 0 10px; font-size: 17px; }
+  .subtitle, .muted { color: var(--muted); }
+  .subtitle { margin: 3px 0 0; }
+  main { padding: 24px clamp(18px, 4vw, 48px) 42px; max-width: 1500px; margin: 0 auto; }
+  .operator-bar, .toolbar, .tabs, .stage-grid, .metric-grid {
+    display: flex; gap: 12px; flex-wrap: wrap; align-items: end;
+  }
+  .operator-bar {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px; margin-bottom: 18px;
+  }
+  label { display: grid; gap: 5px; font-size: 13px; font-weight: 650; }
+  input, select, textarea {
+    border: 1px solid #CFCFDB; border-radius: 9px; padding: 9px 10px;
+    font: inherit; background: #fff; color: var(--ink); min-height: 40px;
+  }
+  button {
+    border: 1px solid var(--indigo); background: var(--indigo); color: #fff;
+    border-radius: 9px; padding: 9px 13px; font: inherit; font-weight: 700; cursor: pointer;
+  }
+  button.secondary { background: #fff; color: var(--indigo); }
+  button.ghost { background: transparent; color: var(--muted); border-color: var(--line); }
+  button:hover { background: var(--indigo-dark); border-color: var(--indigo-dark); color: #fff; }
+  .tabs { margin: 18px 0; }
+  .tabs button.active { background: var(--ink); border-color: var(--ink); }
+  .view { display: none; }
+  .view.active { display: block; }
+  .stage-grid, .metric-grid { align-items: stretch; margin-bottom: 18px; }
+  .stage-card, .metric {
+    border: 1px solid var(--line); border-radius: 13px; padding: 13px; min-width: 126px;
+    background: #fff;
+  }
+  .stage-card strong, .metric strong { display: block; font-size: 26px; line-height: 1; }
+  .stage-card span, .metric span { color: var(--muted); font-size: 13px; }
+  .metric { min-width: 190px; background: var(--lavender); border-color: #D9dcff; }
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 13px; margin: 10px 0 20px; }
+  table { width: 100%; border-collapse: collapse; min-width: 760px; }
+  th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  th { background: var(--panel); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: #434A59; }
+  tr:last-child td { border-bottom: 0; }
+  .pill {
+    display: inline-block; padding: 2px 8px; border-radius: 999px; background: var(--lavender);
+    color: var(--indigo-dark); font-size: 12px; font-weight: 750; white-space: nowrap;
+  }
+  .pill.good { background: #E7F6EE; color: var(--good); }
+  .pill.warn { background: #FFF3E5; color: var(--warn); }
+  .pill.bad { background: #FDECEA; color: var(--bad); }
+  .detail-panel {
+    border: 1px solid #C9CCFF; border-radius: 16px; padding: 20px; margin-top: 22px;
+    background: linear-gradient(180deg, #FBFBFF, #fff);
+  }
+  .detail-head { display: flex; justify-content: space-between; gap: 18px; align-items: start; }
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
+  .fact { border: 1px solid var(--line); border-radius: 11px; padding: 10px; background: #fff; }
+  .fact span { display: block; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
+  .message-text { max-width: 560px; white-space: pre-wrap; }
+  .empty { color: var(--muted); border: 1px dashed #CFCFDB; border-radius: 12px; padding: 16px; }
+  .notice { border-radius: 11px; padding: 11px 13px; margin: 12px 0; display: none; }
+  .notice.show { display: block; }
+  .notice.ok { background: #E7F6EE; color: var(--good); }
+  .notice.error { background: #FDECEA; color: var(--bad); }
+  .action-form { display: flex; gap: 9px; flex-wrap: wrap; align-items: end; min-width: 390px; }
+  footer {
+    border-top: 1px solid var(--line); padding: 24px clamp(18px, 4vw, 48px);
+    display: flex; justify-content: space-between; gap: 22px; flex-wrap: wrap; align-items: center;
+  }
+  .footer-brand { display: flex; align-items: center; gap: 12px; }
+  .footer-brand img { width: 38px; height: 38px; border-radius: 10px; }
+  .footer-links { display: flex; gap: 18px; flex-wrap: wrap; }
+  @media (max-width: 720px) {
+    header, .detail-head { display: block; }
+    .brand { margin-bottom: 12px; }
+    table { min-width: 680px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <img src="https://trida.ai/logos-rounded/trida-rounded.png" alt="Trida AI">
+    <div>
+      <h1>Returns Operations Console</h1>
+      <p class="subtitle">Cascade Outfitters · governed case, money, review and gateway views</p>
+    </div>
+  </div>
+  <span class="pill">Artefacts of record only</span>
+</header>
+
+<main>
+  <section class="operator-bar" aria-label="Stated operator">
+    <label>Operator name
+      <input id="operatorName" autocomplete="name" placeholder="e.g. d.okafor">
+    </label>
+    <label>Approval role
+      <select id="operatorRole">
+        <option value="returns_lead">Returns lead</option>
+        <option value="finance_manager">Finance manager</option>
+        <option value="staff">Staff</option>
+      </select>
+    </label>
+    <label>Action date
+      <input id="actionDate" type="date">
+    </label>
+    <button id="refreshButton" class="secondary" type="button">Refresh</button>
+    <span class="muted">The console uses the API’s stated-actor convention. It has no login and stores no identity.</span>
+  </section>
+
+  <div id="notice" class="notice" role="status"></div>
+
+  <nav class="tabs" aria-label="Console views">
+    <button type="button" data-view="board" class="active">Case board</button>
+    <button type="button" data-view="queues">Queues</button>
+    <button type="button" data-view="money">Money</button>
+    <button type="button" data-view="gateway">Gateway &amp; policy</button>
+  </nav>
+
+  <section id="view-board" class="view active">
+    <h2>Case board</h2>
+    <div id="stageGrid" class="stage-grid"></div>
+    <div class="toolbar">
+      <label>Search cases
+        <input id="caseSearch" type="search" placeholder="Case, customer, order or SKU">
+      </label>
+      <label>Stage
+        <select id="stageFilter"><option value="">All stages</option></select>
+      </label>
+    </div>
+    <div id="caseTable"></div>
+    <div id="caseDetail"></div>
+  </section>
+
+  <section id="view-queues" class="view">
+    <h2>Queues</h2>
+    <h3>Review hold queue</h3>
+    <div id="reviewQueue"></div>
+    <h3>Approvals queue</h3>
+    <div id="approvalQueue"></div>
+    <h3>Recovery due</h3>
+    <div id="recoveryQueue"></div>
+  </section>
+
+  <section id="view-money" class="view">
+    <h2>Money view</h2>
+    <div id="moneyView"></div>
+  </section>
+
+  <section id="view-gateway" class="view">
+    <h2>Gateway &amp; policy</h2>
+    <div id="gatewayView"></div>
+  </section>
+</main>
+
+<footer>
+  <div>
+    <div class="footer-brand">
+      <img src="https://trida.ai/logos-rounded/trida-rounded.png" alt="Trida AI">
+      <strong>Trida AI</strong>
+    </div>
+    <p class="muted">Money figures on this page are sums of artefact figures returned by the API. The console sums those figures; it does not decide a case, price a refund, or create a money artefact.</p>
+  </div>
+  <div class="footer-links">
+    <a href="https://trida.ai/">Visit Trida AI →</a>
+    <a href="https://github.com/tridaai">View all blueprints →</a>
+  </div>
+</footer>
+
+<script>
+"use strict";
+
+const STAGES = ["intake", "decided", "computed", "dispositioned", "approved", "executed", "labelled", "graded", "closed"];
+const STAGE_LABELS = {
+  intake: "Intake", decided: "Decided", computed: "Computed", dispositioned: "Dispositioned",
+  approved: "Approved", executed: "Executed", labelled: "Labelled", graded: "Graded", closed: "Closed"
+};
+let DATA = null;
+let SELECTED_CASE = null;
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>'"]/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
+  }[ch]));
+}
+
+function moneyCents(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  const text = String(value).trim();
+  const match = /^(-?)(\d+)(?:\.(\d{1,2}))?$/.exec(text);
+  if (!match) return 0;
+  const cents = Number(match[2]) * 100 + Number((match[3] || "0").padEnd(2, "0"));
+  return match[1] ? -cents : cents;
+}
+
+function formatCents(cents) {
+  const sign = cents < 0 ? "-" : "";
+  const absolute = Math.abs(cents);
+  return `${sign}$${Math.floor(absolute / 100)}.${String(absolute % 100).padStart(2, "0")}`;
+}
+
+function money(value) {
+  return value === null || value === undefined || value === "" ? "—" : formatCents(moneyCents(value));
+}
+
+function sumAmounts(rows, field = "amount") {
+  return rows.reduce((total, row) => total + moneyCents(row[field]), 0);
+}
+
+function groupBoard(cases) {
+  const groups = Object.fromEntries(STAGES.map((stage) => [stage, []]));
+  for (const item of cases) {
+    if (!groups[item.stage]) groups[item.stage] = [];
+    groups[item.stage].push(item);
+  }
+  return groups;
+}
+
+function buildMoneyModel(data) {
+  const receipts = data.money.receipts || [];
+  const adjustments = data.money.adjustments || [];
+  const refundReceipts = receipts.filter((r) => r.kind === "refund");
+  const topUpReceipts = receipts.filter((r) => r.kind === "top_up");
+  const recoveryOpen = adjustments.filter((a) => a.kind === "recovery_due" && a.status === "open");
+  const topUpOpen = adjustments.filter((a) => a.kind === "top_up_due" && a.status === "open");
+  return {
+    receipts,
+    adjustments,
+    refundReceipts,
+    topUpReceipts,
+    recoveryOpen,
+    topUpOpen,
+    executedRefundsCents: sumAmounts(refundReceipts),
+    topUpsCents: sumAmounts(topUpReceipts),
+    recoveriesOutstandingCents: sumAmounts(recoveryOpen),
+    topUpsOutstandingCents: sumAmounts(topUpOpen)
+  };
+}
+
+function pill(text, tone = "") {
+  return `<span class="pill ${escapeHtml(tone)}">${escapeHtml(text)}</span>`;
+}
+
+function stagePill(stage) {
+  const tone = stage === "closed" ? "good" : (stage === "graded" ? "warn" : "");
+  return pill(STAGE_LABELS[stage] || stage, tone);
+}
+
+function renderStageGrid(data) {
+  const groups = groupBoard(data.cases || []);
+  return STAGES.map((stage) => `
+    <div class="stage-card"><strong>${groups[stage].length}</strong><span>${escapeHtml(STAGE_LABELS[stage])}</span></div>
+  `).join("");
+}
+
+function renderCaseRows(cases) {
+  if (!cases.length) return `<div class="empty">No cases match the current filter.</div>`;
+  const rows = cases.map((item) => `
+    <tr>
+      <td><button type="button" class="secondary open-case" data-case-id="${escapeHtml(item.case_id)}">${escapeHtml(item.case_id)}</button><br><span class="muted">${escapeHtml(item.customer_id)}</span></td>
+      <td>${stagePill(item.stage)}<br><span class="muted">${escapeHtml(item.requested_on)}</span></td>
+      <td>${escapeHtml(item.order_id)}<br><span class="muted">${escapeHtml(item.sku)} × ${escapeHtml(item.qty)}</span></td>
+      <td>${item.eligible ? "Eligible" : "Not eligible"}<br><span class="muted">${escapeHtml(item.disposition || item.disposition_status || "No disposition")}</span></td>
+      <td>${money(item.computed_refund)}<br><span class="muted">computed</span></td>
+      <td>${money(item.executed_refund_total)}<br><span class="muted">executed</span></td>
+      <td>${item.assessment ? `${escapeHtml(item.assessment.total)} · ${escapeHtml(item.assessment.band)}` : "—"}<br><span class="muted">${escapeHtml(item.review_state)}</span></td>
+    </tr>`).join("");
+  return `<div class="table-wrap"><table><thead><tr><th>Case</th><th>Stage</th><th>Order</th><th>Outcome</th><th>Computed</th><th>Executed</th><th>Assessment</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function outcomeOptions(outcomes, selected = "") {
+  return Object.keys(outcomes || {}).map((outcome) =>
+    `<option value="${escapeHtml(outcome)}" ${outcome === selected ? "selected" : ""}>${escapeHtml(outcome.replaceAll("_", " "))}</option>`
+  ).join("");
+}
+
+function reasonOptions(outcomes, outcome) {
+  return (outcomes?.[outcome] || []).map((reason) =>
+    `<option value="${escapeHtml(reason)}">${escapeHtml(reason.replaceAll("_", " "))}</option>`
+  ).join("");
+}
+
+function renderReviewQueue(data) {
+  const rows = data.queues.review || [];
+  if (!rows.length) return `<div class="empty">No cases are waiting for a review decision.</div>`;
+  const body = rows.map((item) => {
+    const firstOutcome = Object.keys(data.review_outcomes || {})[0] || "";
+    return `<tr>
+      <td><strong>${escapeHtml(item.case_id)}</strong><br><span class="muted">${escapeHtml(item.customer_id)}</span></td>
+      <td>${item.assessment ? `${escapeHtml(item.assessment.total)} · ${escapeHtml(item.assessment.band)}` : "—"}</td>
+      <td>${money(item.computed_refund)}</td>
+      <td><form class="action-form review-form" data-case-id="${escapeHtml(item.case_id)}">
+        <label>Outcome <select name="outcome">${outcomeOptions(data.review_outcomes, firstOutcome)}</select></label>
+        <label>Reason <select name="reason_code">${reasonOptions(data.review_outcomes, firstOutcome)}</select></label>
+        <button type="submit">Record review</button>
+      </form></td>
+    </tr>`;
+  }).join("");
+  return `<div class="table-wrap"><table><thead><tr><th>Case</th><th>Assessment</th><th>Computed refund</th><th>Review action</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function renderApprovalQueue(data) {
+  const rows = data.queues.approvals || [];
+  if (!rows.length) return `<div class="empty">No computed refunds are waiting for an approver.</div>`;
+  const body = rows.map((item) => `<tr>
+    <td><strong>${escapeHtml(item.case_id)}</strong><br><span class="muted">${escapeHtml(item.customer_id)}</span></td>
+    <td>${money(item.amount)}</td>
+    <td>${escapeHtml(item.tier)}<br><span class="muted">${escapeHtml((item.approvers || []).join(", ") || "No approver yet")}</span></td>
+    <td>${escapeHtml(item.missing || "")}</td>
+    <td><form class="action-form approval-form" data-case-id="${escapeHtml(item.case_id)}"><button type="submit">Record approval</button></form></td>
+  </tr>`).join("");
+  return `<div class="table-wrap"><table><thead><tr><th>Case</th><th>Amount</th><th>Tier</th><th>Still needed</th><th>Action</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function renderRecoveryQueue(data) {
+  const rows = data.queues.recovery || [];
+  if (!rows.length) return `<div class="empty">No recovery positions are open.</div>`;
+  const body = rows.map((item) => `<tr>
+    <td><strong>${escapeHtml(item.case_id)}</strong></td><td>${money(item.amount)}</td>
+    <td>${escapeHtml(item.created_on)}</td><td>${escapeHtml(item.reason)}</td><td>${pill(item.status, "warn")}</td>
+  </tr>`).join("");
+  return `<div class="table-wrap"><table><thead><tr><th>Case</th><th>Amount</th><th>Created</th><th>Reason</th><th>Status</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function renderMoney(data) {
+  const model = buildMoneyModel(data);
+  const receiptRows = model.receipts.map((r) => `<tr>
+    <td>${escapeHtml(r.case_id)}</td><td>${escapeHtml(r.kind === "top_up" ? "Top-up" : "Refund")}</td>
+    <td>${money(r.amount)}</td><td>${escapeHtml(r.executed_on)}</td><td>${escapeHtml(r.provider)}<br><span class="muted">${escapeHtml(r.provider_ref)}</span></td>
+    <td>${escapeHtml(r.receipt_id)}</td>
+  </tr>`).join("");
+  const adjustmentRows = model.adjustments.map((a) => `<tr>
+    <td>${escapeHtml(a.case_id)}</td><td>${escapeHtml(a.kind)}</td><td>${money(a.amount)}</td>
+    <td>${pill(a.status, a.status === "open" ? "warn" : "good")}</td><td>${escapeHtml(a.created_on)}</td><td>${escapeHtml(a.adjustment_id)}</td>
+  </tr>`).join("");
+  return `
+    <div class="metric-grid">
+      <div class="metric"><strong data-total="executed-refunds">${formatCents(model.executedRefundsCents)}</strong><span>Executed refunds</span></div>
+      <div class="metric"><strong data-total="top-ups">${formatCents(model.topUpsCents)}</strong><span>Executed top-ups</span></div>
+      <div class="metric"><strong data-total="recoveries-outstanding">${formatCents(model.recoveriesOutstandingCents)}</strong><span>Recoveries outstanding</span></div>
+      <div class="metric"><strong data-total="top-ups-outstanding">${formatCents(model.topUpsOutstandingCents)}</strong><span>Top-ups outstanding</span></div>
+    </div>
+    <h3>Receipts of record</h3>
+    <div class="table-wrap"><table><thead><tr><th>Case</th><th>Kind</th><th>Amount</th><th>Executed</th><th>Provider</th><th>Receipt</th></tr></thead><tbody>${receiptRows || `<tr><td colspan="6">No receipts.</td></tr>`}</tbody></table></div>
+    <h3>Adjustments of record</h3>
+    <div class="table-wrap"><table><thead><tr><th>Case</th><th>Kind</th><th>Amount</th><th>Status</th><th>Created</th><th>Adjustment</th></tr></thead><tbody>${adjustmentRows || `<tr><td colspan="6">No adjustments.</td></tr>`}</tbody></table></div>`;
+}
+
+function renderGateway(data) {
+  const calls = data.gateway.invocations || [];
+  const pack = data.gateway.policy_pack || { policies: [] };
+  const policyRows = (pack.policies || []).map((policy) => `<tr>
+    <td><strong>${escapeHtml(policy.policy_id)}</strong></td><td>${escapeHtml((policy.tools || []).join(", "))}</td>
+    <td>${escapeHtml(policy.kind)}</td><td>${escapeHtml((policy.actors || []).join(", "))}</td><td>${escapeHtml(policy.reason)}</td>
+  </tr>`).join("");
+  const callRows = calls.map((call) => `<tr>
+    <td>${escapeHtml(call.called_on)}</td><td>${escapeHtml(call.case_id)}</td><td>${escapeHtml(call.tool)}</td>
+    <td>${escapeHtml(call.actor)}</td><td>${pill(call.status, call.status === "denied" ? "bad" : (call.status === "ok" ? "good" : "warn"))}</td>
+    <td>${escapeHtml(call.policy_id || "—")}</td><td>${escapeHtml(call.result_ref || call.error || "—")}</td>
+  </tr>`).join("");
+  return `
+    <p class="muted">Policy pack ${escapeHtml(pack.version || "")} · ${calls.length} recorded invocations</p>
+    <h3>Policy pack</h3>
+    <div class="table-wrap"><table><thead><tr><th>Policy</th><th>Tools</th><th>Kind</th><th>Actors</th><th>Reason</th></tr></thead><tbody>${policyRows}</tbody></table></div>
+    <h3>Invocation log</h3>
+    <div class="table-wrap"><table><thead><tr><th>Date</th><th>Case</th><th>Tool</th><th>Actor</th><th>Outcome</th><th>Policy</th><th>Result / refusal</th></tr></thead><tbody>${callRows || `<tr><td colspan="7">No invocations.</td></tr>`}</tbody></table></div>`;
+}
+
+function fact(label, value) {
+  return `<div class="fact"><span>${escapeHtml(label)}</span>${escapeHtml(value ?? "—")}</div>`;
+}
+
+function simpleTable(headers, rows) {
+  if (!rows.length) return `<div class="empty">None on record.</div>`;
+  return `<div class="table-wrap"><table><thead><tr>${headers.map((h) => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table></div>`;
+}
+
+function renderCaseDetail(detail) {
+  const c = detail.case;
+  const decision = detail.decision || {};
+  const computationSections = (detail.computations || []).map((computation) => {
+    const lines = (computation.lines || []).map((line) => `<tr>
+      <td>${escapeHtml(line.line_id)}</td><td>${escapeHtml(line.kind)}</td><td>${line.amount === null ? "Not computable" : money(line.amount)}</td>
+      <td>${escapeHtml(line.rule || line.missing_input || "")}</td>
+    </tr>`).join("");
+    return `<h4>${escapeHtml(computation.computation_id)} · total ${money(computation.refund_total)} · ${computation.is_final ? "final" : "not final"}</h4>
+      ${simpleTable(["Line", "Kind", "Amount", "Derivation"], lines ? [lines] : [])}`;
+  }).join("");
+  const dispositionRows = (detail.dispositions || []).map((d) => `<tr>
+    <td>${escapeHtml(d.disposition_id)}</td><td>${escapeHtml(d.status)}</td><td>${escapeHtml(d.disposition || "—")}</td>
+    <td>${escapeHtml(d.channel || "—")}</td><td>${escapeHtml(d.basis)}</td><td>${escapeHtml(d.supersedes || "—")}</td>
+  </tr>`);
+  const assessmentRows = (detail.assessments || []).map((a) => `<tr>
+    <td>${escapeHtml(a.id)}</td><td>${escapeHtml(a.total)}</td><td>${escapeHtml(a.band)}</td><td>${escapeHtml(a.as_of)}</td><td>${escapeHtml(a.history_source)}</td>
+  </tr>`);
+  const reviewRows = (detail.review_decisions || []).map((r) => `<tr>
+    <td>${escapeHtml(r.reviewer)}</td><td>${escapeHtml(r.outcome)}</td><td>${escapeHtml(r.reason_code)}</td><td>${escapeHtml(r.score_id)}</td>
+  </tr>`);
+  const approvalRows = (detail.approvals || []).map((a) => `<tr>
+    <td>${escapeHtml(a.approver)}</td><td>${escapeHtml(a.role)}</td><td>${money(a.amount)}</td><td>${escapeHtml(a.tier)}</td><td>${escapeHtml(a.as_of)}</td>
+  </tr>`);
+  const executionRows = (detail.executions || []).map((e) => `<tr>
+    <td>${escapeHtml(e.execution_id)}</td><td>${money(e.amount)}</td><td>${escapeHtml(e.status)}</td>
+    <td>${escapeHtml((e.transitions || []).map((t) => `${t.state} ${t.at}`).join(" · "))}</td><td>${escapeHtml(e.receipt_id || "—")}</td>
+  </tr>`);
+  const receiptRows = (detail.receipts || []).map((r) => `<tr>
+    <td>${escapeHtml(r.receipt_id)}</td><td>${escapeHtml(r.kind)}</td><td>${money(r.amount)}</td><td>${escapeHtml(r.executed_on)}</td><td>${escapeHtml(r.provider_ref)}</td>
+  </tr>`);
+  const labelRows = (detail.labels || []).map((l) => `<tr>
+    <td>${escapeHtml(l.label_id)}</td><td>${escapeHtml(l.carrier_ref)}</td><td>${escapeHtml(l.status)}</td><td>${money(l.cost)}</td><td>${escapeHtml(l.reconciliation?.status || "")}</td>
+  </tr>`);
+  const gradingRows = (detail.grading_reports || []).map((g) => `<tr>
+    <td>${escapeHtml(g.report_id)}</td><td>${escapeHtml(g.grader)}</td><td>${escapeHtml(g.declared_condition)} → ${escapeHtml(g.graded_condition)}</td>
+    <td>${g.refund_delta === null ? "—" : money(g.refund_delta)}</td><td>${escapeHtml(g.graded_on)}</td>
+  </tr>`);
+  const adjustmentRows = (detail.adjustments || []).map((a) => `<tr>
+    <td>${escapeHtml(a.adjustment_id)}</td><td>${escapeHtml(a.kind)}</td><td>${money(a.amount)}</td><td>${escapeHtml(a.status)}</td><td>${escapeHtml(a.reason)}</td>
+  </tr>`);
+  const messageRows = (detail.messages || []).map((m) => `<tr>
+    <td>${escapeHtml(m.message_type)}</td><td>${pill(m.status, m.status === "sent" ? "good" : (m.status === "refused" ? "bad" : "warn"))}</td>
+    <td>${escapeHtml(m.created_on)}</td><td class="message-text">${escapeHtml(m.text)}</td><td>${escapeHtml((m.violations || []).join("; "))}</td>
+  </tr>`);
+  const memoryRows = (detail.memory_records || []).map((r) => `<tr>
+    <td>${escapeHtml(r.event_type)}</td><td>${escapeHtml(r.occurred_on)}</td><td>${escapeHtml(r.source_ref)}</td>
+    <td>${escapeHtml(r.disposition || "—")}</td><td>${r.refund_amount ? money(r.refund_amount) : (r.refund_total ? money(r.refund_total) : "—")}</td>
+  </tr>`);
+  const costRows = (detail.cost_entries || []).map((e) => `<tr>
+    <td>${escapeHtml(e.seq)}</td><td>${escapeHtml(e.purpose)}</td><td>${escapeHtml(e.profile)}</td><td>${escapeHtml(e.status)}</td><td>${money(e.cost)}</td>
+  </tr>`);
+  const timelineRows = (detail.timeline?.entries || []).map((e) => `<tr>
+    <td>${escapeHtml(e.at)}</td><td>${escapeHtml(e.stage)}</td><td>${escapeHtml(e.artefact_id)}</td><td>${escapeHtml(e.detail)}</td>
+  </tr>`);
+  const gaps = (detail.timeline?.gaps || []).map((g) => `<li><strong>${escapeHtml(g.kind)}:</strong> ${escapeHtml(g.detail)}</li>`).join("");
+
+  return `<article class="detail-panel">
+    <div class="detail-head"><div><h2>${escapeHtml(c.case_id)}</h2><p class="subtitle">${escapeHtml(c.customer_id)} · ${escapeHtml(c.order_id)} · stored status ${escapeHtml(c.status)}</p></div>
+    <button type="button" class="ghost" id="closeDetail">Close detail</button></div>
+
+    <h3>Request, order and decision</h3>
+    <div class="facts">
+      ${fact("SKU", c.request.sku)}${fact("Quantity", c.request.qty)}${fact("Declared condition", c.request.condition_declared)}
+      ${fact("Requested", c.request.requested_on)}${fact("Eligible", decision.eligible ? "Yes" : "No")}
+      ${fact("Decision refund", money(decision.refund_due))}${fact("Order total", money(detail.order?.order_total))}
+      ${fact("Review state", c.review_state)}
+    </div>
+    <p>${escapeHtml(c.summary || "")}</p>
+
+    <h3>Assessment chain</h3>
+    ${simpleTable(["Assessment", "Total", "Band", "As of", "History source"], assessmentRows)}
+    <h3>Review decisions</h3>
+    ${simpleTable(["Reviewer", "Outcome", "Reason", "Assessment"], reviewRows)}
+
+    <h3>Refund computations</h3>
+    ${computationSections || `<div class="empty">No computation on record.</div>`}
+    <h3>Approvals</h3>
+    <p class="muted">${escapeHtml(detail.approval_status?.missing || "Approval position satisfied for the current computation.")}</p>
+    ${simpleTable(["Approver", "Role", "Amount", "Tier", "Date"], approvalRows)}
+    <h3>Executions and receipts</h3>
+    ${simpleTable(["Execution", "Amount", "Status", "Transitions", "Receipt"], executionRows)}
+    ${simpleTable(["Receipt", "Kind", "Amount", "Executed", "Provider reference"], receiptRows)}
+
+    <h3>Disposition chain</h3>
+    ${simpleTable(["Disposition artefact", "Status", "Outcome", "Channel", "Basis", "Supersedes"], dispositionRows)}
+
+    <h3>Fulfilment and grading</h3>
+    ${simpleTable(["Label", "Carrier reference", "Status", "Cost", "Reconciliation"], labelRows)}
+    ${simpleTable(["Report", "Grader", "Condition change", "Refund delta", "Date"], gradingRows)}
+    ${simpleTable(["Adjustment", "Kind", "Amount", "Status", "Reason"], adjustmentRows)}
+
+    <h3>Messages and verifier status</h3>
+    ${simpleTable(["Type", "Status", "Created", "Text", "Violations"], messageRows)}
+
+    <h3>Memory records</h3>
+    ${simpleTable(["Event", "Date", "Source", "Disposition", "Amount"], memoryRows)}
+
+    <h3>Model cost ledger</h3>
+    ${simpleTable(["Sequence", "Purpose", "Profile", "Status", "Cost"], costRows)}
+
+    <h3>Timeline</h3>
+    ${simpleTable(["Date", "Stage", "Artefact", "Detail"], timelineRows)}
+    ${gaps ? `<h4>Named gaps</h4><ul>${gaps}</ul>` : ""}
+  </article>`;
+}
+
+function renderAll() {
+  document.getElementById("stageGrid").innerHTML = renderStageGrid(DATA);
+  const stageFilter = document.getElementById("stageFilter");
+  if (!stageFilter.options.length || stageFilter.options.length === 1) {
+    stageFilter.innerHTML = `<option value="">All stages</option>` + STAGES.map((s) => `<option value="${s}">${STAGE_LABELS[s]}</option>`).join("");
+  }
+  renderCaseTable();
+  document.getElementById("reviewQueue").innerHTML = renderReviewQueue(DATA);
+  document.getElementById("approvalQueue").innerHTML = renderApprovalQueue(DATA);
+  document.getElementById("recoveryQueue").innerHTML = renderRecoveryQueue(DATA);
+  document.getElementById("moneyView").innerHTML = renderMoney(DATA);
+  document.getElementById("gatewayView").innerHTML = renderGateway(DATA);
+  bindQueueForms();
+}
+
+function renderCaseTable() {
+  const query = (document.getElementById("caseSearch").value || "").toLowerCase();
+  const stage = document.getElementById("stageFilter").value;
+  const cases = (DATA.cases || []).filter((item) => {
+    const haystack = `${item.case_id} ${item.customer_id} ${item.order_id} ${item.sku}`.toLowerCase();
+    return (!query || haystack.includes(query)) && (!stage || item.stage === stage);
+  });
+  document.getElementById("caseTable").innerHTML = renderCaseRows(cases);
+  document.querySelectorAll(".open-case").forEach((button) => {
+    button.addEventListener("click", () => openCase(button.dataset.caseId));
+  });
+}
+
+function showNotice(text, ok = true) {
+  const notice = document.getElementById("notice");
+  notice.textContent = text;
+  notice.className = `notice show ${ok ? "ok" : "error"}`;
+}
+
+async function getJson(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  return response.json();
+}
+
+async function postJson(url, body) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.detail || `${response.status} ${response.statusText}`);
+  return payload;
+}
+
+async function refresh(selectCase = SELECTED_CASE) {
+  DATA = await getJson("/console/data");
+  renderAll();
+  if (selectCase) await openCase(selectCase, false);
+}
+
+async function openCase(caseId, scroll = true) {
+  SELECTED_CASE = caseId;
+  const detail = await getJson(`/console/cases/${encodeURIComponent(caseId)}`);
+  const host = document.getElementById("caseDetail");
+  host.innerHTML = renderCaseDetail(detail);
+  document.getElementById("closeDetail").addEventListener("click", () => {
+    SELECTED_CASE = null;
+    host.innerHTML = "";
+  });
+  if (scroll) host.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function operator() {
+  return document.getElementById("operatorName").value.trim();
+}
+
+function actionDate() {
+  return document.getElementById("actionDate").value;
+}
+
+function bindQueueForms() {
+  document.querySelectorAll(".review-form").forEach((form) => {
+    const outcome = form.querySelector('[name="outcome"]');
+    const reason = form.querySelector('[name="reason_code"]');
+    outcome.addEventListener("change", () => {
+      reason.innerHTML = reasonOptions(DATA.review_outcomes, outcome.value);
+    });
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const reviewer = operator();
+      if (!reviewer) return showNotice("Enter the operator name before recording a review.", false);
+      try {
+        await postJson(`/cases/${encodeURIComponent(form.dataset.caseId)}/fraud-review`, {
+          reviewer,
+          outcome: outcome.value,
+          reason_code: reason.value
+        });
+        showNotice(`Review recorded for ${form.dataset.caseId}.`);
+        await refresh(form.dataset.caseId);
+      } catch (error) {
+        showNotice(error.message, false);
+      }
+    });
+  });
+  document.querySelectorAll(".approval-form").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const approver = operator();
+      if (!approver) return showNotice("Enter the operator name before recording an approval.", false);
+      try {
+        await postJson(`/cases/${encodeURIComponent(form.dataset.caseId)}/approvals`, {
+          approver,
+          role: document.getElementById("operatorRole").value,
+          as_of: actionDate()
+        });
+        showNotice(`Approval recorded for ${form.dataset.caseId}.`);
+        await refresh(form.dataset.caseId);
+      } catch (error) {
+        showNotice(error.message, false);
+      }
+    });
+  });
+}
+
+if (typeof document !== "undefined") {
+  document.getElementById("actionDate").value = new Date().toISOString().slice(0, 10);
+  document.querySelectorAll(".tabs button").forEach((button) => {
+    button.addEventListener("click", () => {
+      document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("active", b === button));
+      document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === `view-${button.dataset.view}`));
+    });
+  });
+  document.getElementById("refreshButton").addEventListener("click", () => refresh().catch((e) => showNotice(e.message, false)));
+  document.getElementById("caseSearch").addEventListener("input", renderCaseTable);
+  document.getElementById("stageFilter").addEventListener("change", renderCaseTable);
+  refresh().catch((error) => showNotice(error.message, false));
+}
+
+globalThis.ReturnsConsole = {
+  STAGES,
+  moneyCents,
+  formatCents,
+  sumAmounts,
+  groupBoard,
+  buildMoneyModel,
+  renderStageGrid,
+  renderCaseRows,
+  renderReviewQueue,
+  renderApprovalQueue,
+  renderRecoveryQueue,
+  renderMoney,
+  renderGateway,
+  renderCaseDetail
+};
+</script>
+</body>
+</html>

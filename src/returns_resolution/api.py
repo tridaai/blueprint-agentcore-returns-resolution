@@ -8,11 +8,13 @@ through one surface reads identically through the other.
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, field_validator
 
+from .console import build_case_detail, build_console_data
 from .gateway import PolicyDeniedError, ToolError
 from .intake import ReferenceFeed
 from .model_gateway import ModelBudgetError, ModelGatewayError
@@ -162,6 +164,26 @@ def create_app(service: CaseService) -> FastAPI:
     @app.get("/readiness")
     def readiness() -> dict:
         return {"status": "ready", "orders": len(service.list_orders())}
+
+    @app.get("/console", include_in_schema=False)
+    def console() -> FileResponse:
+        """The single-file operations console (R13)."""
+        return FileResponse(
+            Path(__file__).with_name("console.html"), media_type="text/html"
+        )
+
+    @app.get("/console/data")
+    def console_data() -> dict:
+        """The console's read-only board, queue, money and gateway data."""
+        return build_console_data(service)
+
+    @app.get("/console/cases/{case_id}")
+    def console_case(case_id: str) -> dict:
+        """One case's console-safe artefact chain, in workflow order."""
+        found = build_case_detail(service, case_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return found
 
     @app.get("/orders")
     def orders() -> list[dict]:
