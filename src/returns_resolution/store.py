@@ -376,7 +376,16 @@ class SqlStore:
             self._dialect = "sqlite"
             path = Path(sqlite_path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(str(path))
+            # check_same_thread=False: the HTTP surfaces serve from a
+            # threadpool, and a connection created at startup must be
+            # usable from a request thread — with the default the API
+            # 500s on every store read under threaded serving (found
+            # by the R10 production smoke; psycopg has no such
+            # restriction, which is why Postgres never showed it).
+            # The store's operations are single short statements with
+            # an immediate commit, so cross-thread use stays safe for
+            # this single-process local profile.
+            self._conn = sqlite3.connect(str(path), check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
 
     # -- dialect helpers ------------------------------------------------
