@@ -15,6 +15,7 @@ and in the README's honest status.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from .config import Config
@@ -22,7 +23,14 @@ from .evidence import LocalEvidenceStore
 from .intake import ReferenceFeed
 from .modelport import load_model_port
 from .models import ReturnRequest
-from .service import CaseService, FigureVerificationError, FraudReviewError
+from .service import (
+    ApprovalError,
+    CaseService,
+    FigureVerificationError,
+    FraudHoldError,
+    FraudReviewError,
+    PaymentsError,
+)
 from .store import SqlStore
 
 try:  # The pinned SDK is a hard dependency; this is a safety net.
@@ -62,7 +70,11 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     get_fraud_score {case_id} | get_fraud_signals {case_id} |
     verify_fraud_score {case_id} | rescore_case {case_id} |
     record_fraud_review {case_id, reviewer, outcome, reason_code} |
-    get_fraud_review {case_id} | get_scoring_pack | list_fraud_scores.
+    get_fraud_review {case_id} | get_scoring_pack | list_fraud_scores |
+    record_approval {case_id, approver, role, as_of, computation_id?} |
+    list_approvals {case_id} | approval_status {case_id} |
+    execute_refund {case_id, idempotency_key, as_of} |
+    get_receipt {case_id} | list_receipts | list_executions {case_id}.
     """
     action = payload.get("action", "intake_feed")
     if action == "seed":
@@ -151,6 +163,42 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         return {"scoring_pack": service.get_scoring_pack().model_dump(mode="json")}
     if action == "list_fraud_scores":
         return {"fraud_scores": [s.model_dump(mode="json") for s in service.list_fraud_scores()]}
+    if action == "record_approval":
+        try:
+            approval = service.record_approval(
+                payload["case_id"],
+                approver=payload.get("approver", ""),
+                role=payload.get("role", ""),
+                as_of=date.fromisoformat(payload["as_of"]),
+                computation_id=payload.get("computation_id"),
+            )
+            return {"approval": approval.model_dump(mode="json")}
+        except (LookupError, ApprovalError, FraudHoldError) as exc:
+            return {"error": str(exc)}
+    if action == "list_approvals":
+        return {"approvals": [a.model_dump(mode="json") for a in service.list_approvals(payload["case_id"])]}
+    if action == "approval_status":
+        try:
+            return {"approval_status": service.approval_status(payload["case_id"])}
+        except LookupError as exc:
+            return {"error": str(exc)}
+    if action == "execute_refund":
+        try:
+            receipt = service.execute_refund(
+                payload["case_id"],
+                idempotency_key=payload.get("idempotency_key", ""),
+                as_of=date.fromisoformat(payload["as_of"]),
+            )
+            return {"receipt": receipt.model_dump(mode="json")}
+        except (LookupError, ApprovalError, FraudHoldError, PaymentsError) as exc:
+            return {"error": str(exc)}
+    if action == "get_receipt":
+        receipt = service.get_receipt(payload["case_id"])
+        return {"receipt": receipt.model_dump(mode="json") if receipt else None}
+    if action == "list_receipts":
+        return {"receipts": [r.model_dump(mode="json") for r in service.list_receipts()]}
+    if action == "list_executions":
+        return {"executions": [e.model_dump(mode="json") for e in service.list_executions(payload["case_id"])]}
     if action == "list_cases":
         return {"cases": [c.model_dump(mode="json") for c in service.list_cases()]}
     if action == "list_orders":

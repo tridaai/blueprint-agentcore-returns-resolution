@@ -100,6 +100,46 @@ def main() -> int:
         f"{cleared.fraud_score.band} at {cleared.fraud_score.total_score} — the act lifted the block, not the arithmetic"
     )
 
+    print("\n--- approval gates + refund execution (payments: LOCAL DOUBLE — no real money) ---")
+    from datetime import date as _date
+
+    from returns_resolution.service import ApprovalError, DuplicateRefundError
+
+    today = _date(2026, 10, 27)
+    double = service.payments_port
+    for case_id in ("CASE-2006", "CASE-2003", "CASE-2001"):
+        status = service.approval_status(case_id)
+        print(
+            f"  {case_id}  refund ${status['refund_total']}  tier={status['tier']}  "
+            f"approvals_required={status['approvals_required']}"
+        )
+    # Auto tier: CASE-2006 ($29.05 <= $50 cap) executes with no acts.
+    receipt = service.execute_refund("CASE-2006", idempotency_key="demo-refund-2006", as_of=today)
+    print(f"  CASE-2006 executed: receipt {receipt.receipt_id} via {receipt.provider} ref {receipt.provider_ref}")
+    again = service.execute_refund("CASE-2006", idempotency_key="demo-refund-2006", as_of=today)
+    print(
+        f"  retry with the same key returned receipt {again.receipt_id} (identical: {again.receipt_id == receipt.receipt_id}); "
+        f"money movements so far: {double.movement_count}"
+    )
+    # Single tier: CASE-2003 ($130.50) needs one named approver.
+    service.record_approval("CASE-2003", approver="d.okafor", role="returns_lead", as_of=today)
+    receipt = service.execute_refund("CASE-2003", idempotency_key="demo-refund-2003", as_of=today)
+    print(f"  CASE-2003 approved by d.okafor (returns_lead) and executed: receipt {receipt.receipt_id}")
+    # Dual tier: CASE-2001 ($189.00) needs a second, different approver.
+    service.record_approval("CASE-2001", approver="d.okafor", role="returns_lead", as_of=today)
+    try:
+        service.execute_refund("CASE-2001", idempotency_key="demo-refund-2001", as_of=today)
+    except ApprovalError as exc:
+        print(f"  CASE-2001 with one approval: execution refused — {exc}")
+    service.record_approval("CASE-2001", approver="m.osei", role="finance_manager", as_of=today)
+    receipt = service.execute_refund("CASE-2001", idempotency_key="demo-refund-2001", as_of=today)
+    print(f"  CASE-2001 second approval by m.osei (finance_manager); executed: receipt {receipt.receipt_id}")
+    try:
+        service.execute_refund("CASE-2001", idempotency_key="demo-refund-2001-RETRY", as_of=today)
+    except DuplicateRefundError as exc:
+        print(f"  CASE-2001 retried under a new key: refused — {exc}")
+    print(f"  total money movements on the double: {double.movement_count} (one per executed case, retries included)")
+
     for case_id in ("CASE-2003", "CASE-2004"):
         case = cases[case_id]
         print(f"\n--- {case_id} summary (figure-verified) ---")

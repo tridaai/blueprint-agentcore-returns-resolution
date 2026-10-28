@@ -7,12 +7,22 @@ through one surface reads identically through the other.
 
 from __future__ import annotations
 
+from datetime import date
+
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, field_validator
 
 from .intake import ReferenceFeed
 from .models import ReturnRequest
-from .service import CaseService, FigureVerificationError, FraudReviewError
+from .service import (
+    ApprovalError,
+    CaseService,
+    DuplicateRefundError,
+    FigureVerificationError,
+    FraudHoldError,
+    FraudReviewError,
+    PaymentsError,
+)
 
 
 class FraudReviewRequest(BaseModel):
@@ -25,6 +35,32 @@ class FraudReviewRequest(BaseModel):
     def _named(cls, v: str) -> str:
         if not v or not v.strip():
             raise ValueError("a fraud-review decision requires a named reviewer")
+        return v.strip()
+
+
+class ApprovalRequest(BaseModel):
+    approver: str
+    role: str
+    as_of: date
+    computation_id: str | None = None
+
+    @field_validator("approver")
+    @classmethod
+    def _named(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("a refund approval requires a named approver")
+        return v.strip()
+
+
+class ExecutionRequest(BaseModel):
+    idempotency_key: str
+    as_of: date
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _keyed(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("an idempotency key is mandatory on every refund execution")
         return v.strip()
 
 
@@ -210,6 +246,66 @@ def create_app(service: CaseService) -> FastAPI:
         if found is None:
             raise HTTPException(status_code=404, detail="fraud review not found")
         return found.model_dump(mode="json")
+
+    @app.post("/cases/{case_id}/approvals", status_code=201)
+    def record_approval(case_id: str, body: ApprovalRequest) -> dict:
+        try:
+            approval = service.record_approval(
+                case_id,
+                approver=body.approver,
+                role=body.role,
+                as_of=body.as_of,
+                computation_id=body.computation_id,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ApprovalError, FraudHoldError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return approval.model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/approvals")
+    def approvals(case_id: str) -> list[dict]:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return [a.model_dump(mode="json") for a in service.list_approvals(case_id)]
+
+    @app.get("/cases/{case_id}/approval-status")
+    def approval_status(case_id: str) -> dict:
+        try:
+            return service.approval_status(case_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/cases/{case_id}/refund-executions", status_code=201)
+    def execute_refund(case_id: str, body: ExecutionRequest) -> dict:
+        try:
+            receipt = service.execute_refund(
+                case_id, idempotency_key=body.idempotency_key, as_of=body.as_of
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ApprovalError, DuplicateRefundError, FraudHoldError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PaymentsError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return receipt.model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/receipt")
+    def receipt(case_id: str) -> dict:
+        found = service.get_receipt(case_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="receipt not found")
+        return found.model_dump(mode="json")
+
+    @app.get("/receipts")
+    def receipts() -> list[dict]:
+        return [r.model_dump(mode="json") for r in service.list_receipts()]
+
+    @app.get("/cases/{case_id}/executions")
+    def executions(case_id: str) -> list[dict]:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return [e.model_dump(mode="json") for e in service.list_executions(case_id)]
 
     @app.post("/cases/{case_id}/evidence")
     async def evidence(case_id: str, request: Request, kind: str = "photo", filename: str = "evidence.bin") -> dict:
