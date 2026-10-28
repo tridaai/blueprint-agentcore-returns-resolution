@@ -14,6 +14,15 @@ from .models import ReturnRequest
 from .service import CaseService, FigureVerificationError
 
 
+def _order_view(order) -> dict:
+    view = order.model_dump(mode="json")
+    # Totals are computed properties (never stored), so the API adds
+    # them explicitly — a reader should never have to re-derive money.
+    view["items_total"] = str(order.items_total)
+    view["order_total"] = str(order.order_total)
+    return view
+
+
 def create_app(service: CaseService) -> FastAPI:
     app = FastAPI(title="Returns Resolution & Disposition Agent")
 
@@ -27,14 +36,14 @@ def create_app(service: CaseService) -> FastAPI:
 
     @app.get("/orders")
     def orders() -> list[dict]:
-        return [o.model_dump(mode="json") for o in service.list_orders()]
+        return [_order_view(o) for o in service.list_orders()]
 
     @app.get("/orders/{order_id}")
     def order(order_id: str) -> dict:
         found = service.get_order(order_id)
         if found is None:
             raise HTTPException(status_code=404, detail="order not found")
-        return found.model_dump(mode="json")
+        return _order_view(found)
 
     @app.post("/intake/feed")
     def intake_feed() -> dict:
