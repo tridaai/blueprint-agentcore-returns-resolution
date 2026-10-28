@@ -455,6 +455,89 @@ def main() -> int:
     )
     print("  served by the API at GET /console, with its data at GET /console/data")
 
+    print("\n--- trap suite (R14; adversarial fixtures, outcomes derived from the packs — docs/trap-suite.md) ---")
+    from datetime import timedelta as _timedelta
+    from decimal import Decimal as _Dec
+
+    from returns_resolution.models import Order as _Order
+    from returns_resolution.models import OrderLine as _OrderLine
+    from returns_resolution.models import ReturnRequest as _ReturnRequest
+    from returns_resolution.store import InMemoryStore as _MemStore
+
+    traps = CaseService(_MemStore(), OfflineComposer())
+    for rid, price in (("REQ-D14-A", "50.00"), ("REQ-D14-B", "50.01")):
+        traps._store.put_order(
+            _Order(
+                order_id=f"ORD-{rid}", customer_id=f"CUST-{rid}",
+                placed_on=today - _timedelta(days=25), delivered_on=today - _timedelta(days=22),
+                lines=[_OrderLine(sku="BOOT-TRL", qty=1, unit_price=_Dec(price))],
+                shipping_paid=_Dec("0.00"),
+            ).model_dump(mode="json")
+        )
+        tcase = traps.ingest(
+            _ReturnRequest(
+                request_id=rid, order_id=f"ORD-{rid}", sku="BOOT-TRL", qty=1,
+                reason_code="changed_mind", condition_declared="new_with_tags",
+                requested_on=today - _timedelta(days=1),
+            )
+        )
+        status = traps.approval_status(tcase.case_id)
+        print(
+            f"  cap edge: a ${price} refund needs {status['approvals_required']} "
+            f"approval(s) — at the $50.00 cap is the auto tier, one cent over is not"
+        )
+
+    traps.seed_orders()
+    boots = traps.ingest(_PLANTED[2])
+    stale = traps.get_computation(boots.case_id)
+    traps.record_approval(boots.case_id, approver="d.okafor", role="returns_lead", as_of=today)
+    traps.invoke_tool(
+        "create_return_label", {"case_id": boots.case_id, "issued_on": today},
+        case_id=boots.case_id, called_on=today,
+    )
+    traps.record_warehouse_receipt(
+        boots.case_id, received_by="w.chen", received_on=today + _timedelta(days=3)
+    )
+    traps.record_grading(
+        boots.case_id, grader="p.novak", graded_condition="used",
+        graded_on=today + _timedelta(days=4),
+    )
+    envelope = traps.invoke_tool_envelope(
+        "execute_refund",
+        {"case_id": boots.case_id, "computation_id": stale.computation_id},
+        case_id=boots.case_id, called_on=today + _timedelta(days=4), actor="staff",
+    )
+    policy = envelope.error["data"]["policy_id"] if envelope.error else None
+    print(
+        f"  stale money: executing the superseded ${stale.refund_total} computation at the "
+        f"gateway -> {envelope.outcome} ({policy}); the graded $116.00 computation is the only live one"
+    )
+    variant = traps.invoke_tool_envelope(
+        "create_return_label", {"case_id": boots.case_id, "issued_on": today},
+        case_id=boots.case_id, called_on=today, actor="Staff",
+    )
+    print(
+        f"  actor exactness: actor 'Staff' (capital S) -> {variant.outcome} "
+        f"({variant.error['data']['policy_id'] if variant.error else None}); the pack's vocabulary is exact"
+    )
+
+    traps.seed_history()
+    for request in FRAUD_FEED_REQUESTS:
+        traps.ingest(request)
+    traps.record_fraud_review(
+        "CASE-3008", reviewer="r.alvarez",
+        outcome="cleared_with_reason", reason_code="legitimate_pattern_explained",
+    )
+    drafted = traps.draft_message(
+        "CASE-3008", "fraud_review_notice", as_of=today,
+        model_note="As a goodwill gesture, a 20% discount will be applied to your next order.",
+    )
+    checked = traps.verify_message(drafted.message_id, as_of=today)
+    print(
+        f"  the discount promise: a note offering 20% off -> {checked.status} "
+        f"({'; '.join(checked.violations)}) — no template makes that promise"
+    )
+
     for case_id in ("CASE-2003", "CASE-2004"):
         case = service.get_case(case_id)
         print(f"\n--- {case_id} summary (figure-verified) ---")

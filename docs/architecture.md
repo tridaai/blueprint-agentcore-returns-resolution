@@ -596,6 +596,41 @@ review and a named refund approval, posted to the existing
 endpoints with the page's stated operator. Identity remains a
 stated actor until R16; the console builds no login.
 
+## The trap suite (R14)
+
+R14 adds no new surface; it attacks the existing ones. The suite
+(`docs/trap-suite.md`) is a set of adversarial fixtures whose
+expected outcomes are derived from the packs by hand before the
+code runs, planted three ways: a pytest module, a family of
+zero-tolerance counters in the eval gate (run on every store
+profile, so a trap that passes in memory but fails on Postgres
+fails the gate), and a line in the trap doc naming the deciding
+law. The discipline matters more than the count: a failing trap
+is a defect report, not a test to tune.
+
+Two traps found real defects, both at seams between subsystems
+rather than inside one engine. The disclosure pack verified a
+message's *figures* and its *vocabulary* but never its *promises* —
+a discount offer rode through on an allowed percent — so the
+promotion vocabulary is now forbidden content, checked like any
+other character. And the gateway's fact builder answered "were
+this computation's approvals recorded?" where the policy asked
+"is this the computation whose approvals count?" — a superseded
+computation's approvals satisfied GP-PAYMENT-APPROVAL until the
+handler refused it; the fact now requires currency, and the
+denial the pack's reason text always described is the denial
+that happens.
+
+The suite also records two honest negatives. A fraud total of
+94.99 cannot be constructed: the scoring pack's contributions
+are whole points, so totals are integral, and the graded
+artefacts are that invariant plus the reachable cliff at
+60.00/59.00. And the split-household wardrobing pattern scores
+MONITOR per account because nothing of record links the
+accounts — the architecture scores provable history only, and
+the gap is documented as an identity-resolution decision for a
+later round, not papered over with a heuristic.
+
 ## What is deliberately not here yet
 
 Injection quarantine, access control, reporting,
