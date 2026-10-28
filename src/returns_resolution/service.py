@@ -750,7 +750,9 @@ class CaseService:
         """Compute as a principal: the pack's compute_report act —
         supervisor and system only; the auditor reads reports but
         computing one is refused read_only_role."""
-        self._access.require_act(principal, ACT_COMPUTE_REPORT, target=kind, on=on)
+        self._access.require_act(
+            principal, ACT_COMPUTE_REPORT, surface=SURFACE_REPORTS, target=kind, on=on
+        )
         return self.compute_report(
             kind, window_start=window_start, window_end=window_end, as_of=as_of
         )

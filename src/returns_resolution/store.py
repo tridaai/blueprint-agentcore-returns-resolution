@@ -1436,7 +1436,7 @@ class InMemoryStore:
         self._management_reports: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
-        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012"]
+        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013"]
 
     def put_order(self, payload: dict[str, Any]) -> None:
         self._orders[payload["order_id"]] = payload

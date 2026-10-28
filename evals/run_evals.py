@@ -2967,6 +2967,15 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
     )
     if _probe != {"report": None} or _probe != _missing:
         counters["report_customer_reads_served"] += 1
+    # Computing a report is an act: the auditor's read-only grant
+    # must refuse it (graded under the R16 auditor counter — an
+    # auditor landing any act is the same failure there).
+    try:
+        rep.compute_report_as(_auditor16, "money_summary", as_of=_asof17)
+        counters["access_auditor_acts_accepted"] += 1
+    except _AccessDenied as exc:
+        if exc.reason != "read_only_role":
+            counters["access_auditor_acts_accepted"] += 1
     # The main scenario service's reports join the cross-profile
     # fingerprint: identical planted work, identical report ids.
     for _kind in ("return_rate", "disposition_mix"):
