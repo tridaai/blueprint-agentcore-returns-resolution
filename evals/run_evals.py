@@ -232,6 +232,23 @@ Zero-tolerance counters against planted truth:
 - access_denials_unrecorded (R16): a graded refusal missing from
   the denial log, or recorded under a foreign pack version — a
   refusal that is not recorded did not happen, auditably.
+- report_figure_mismatches (R17): a stored report whose figures,
+  population or breakdown differ from an independent
+  re-performance over the artefacts of record, or from the
+  hand-derived planted truth (return rate 13/7 over October,
+  precision 1.0000 / recall 0.5000 over the two known outcomes).
+- report_unknown_outcomes_as_negatives (R17): a scored case with
+  no known outcome standing anywhere in the fraud report's
+  confusion counts — excluded means excluded, counted as
+  excluded, never as a true negative.
+- report_money_console_mismatches (R17): the money summary's
+  totals differing from the sums over the console money view's
+  own payload rows — the report must not fork the console's
+  arithmetic.
+- report_customer_reads_served (R17): a customer principal served
+  a report read (service or Runtime) — reports are not a
+  customer surface, and a probe must be indistinguishable from
+  probing a report that does not exist.
 
 Prints the counters and GATE: PASS/FAIL; exit code follows.
 """
@@ -385,6 +402,10 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
         "access_supervisor_acts_by_agent_accepted": 0,
         "access_auditor_acts_accepted": 0,
         "access_denials_unrecorded": 0,
+        "report_figure_mismatches": 0,
+        "report_unknown_outcomes_as_negatives": 0,
+        "report_money_console_mismatches": 0,
+        "report_customer_reads_served": 0,
     }
 
     service = CaseService(make_store(), OfflineComposer())
@@ -2809,6 +2830,150 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
     if any(d.pack_version != "2026.10.1" for d in _new_denials):
         counters["access_denials_unrecorded"] += 1
 
+    # --- R17: management reporting over planted truth ----------------
+    # Hand-derived truth on a fresh service (seed + both feeds):
+    # October holds 7 orders placed and 13 returns requested, 10
+    # decided, 5 eligible / 5 denied — return rate 13/7 = 1.8571.
+    # Fraud outcomes: the serial returner's review confirms
+    # (flagged, positive — a true positive); the jacket's grading
+    # proves misrepresentation the score never flagged (a false
+    # negative); the other 8 scored cases have NO known outcome
+    # and must stand as excluded — precision 1.0000, recall
+    # 0.5000, true negatives exactly 0.
+    rep = CaseService(make_store(), OfflineComposer())
+    rep.seed_orders()
+    rep.seed_history()
+    for _request in list(PLANTED_REQUESTS) + list(FRAUD_FEED_REQUESTS):
+        rep.ingest(_request)
+    rep.record_fraud_review(
+        "CASE-3008", reviewer="eval.reviewer", outcome="confirmed_fraud",
+        reason_code="pattern_verified",
+    )
+    rep.invoke_tool(
+        "create_return_label", {"case_id": "CASE-2001", "issued_on": date(2026, 10, 27)},
+        case_id="CASE-2001", called_on=date(2026, 10, 27),
+    )
+    rep.record_warehouse_receipt(
+        "CASE-2001", received_by="w.chen", received_on=date(2026, 10, 30)
+    )
+    rep.record_grading(
+        "CASE-2001", grader="p.novak", graded_condition="used",
+        graded_on=date(2026, 10, 31), wear_evidence=True, received_weight_grams=100,
+    )
+    _window17 = {"window_start": date(2026, 10, 1), "window_end": date(2026, 10, 31)}
+    _asof17 = date(2026, 11, 5)
+    _reports17 = [
+        rep.compute_report("return_rate", as_of=_asof17, **_window17),
+        rep.compute_report("disposition_mix", as_of=_asof17, **_window17),
+        rep.compute_report("fraud_outcomes", as_of=_asof17),
+        rep.compute_report("money_summary", as_of=_asof17),
+        rep.compute_report("cost_summary", as_of=_asof17),
+    ]
+    for _report in _reports17:
+        if rep.verify_management_report(_report):
+            counters["report_figure_mismatches"] += 1
+    _by_kind = {r.kind: r for r in _reports17}
+    _rr = _by_kind["return_rate"]
+    if (
+        _rr.population["orders_placed_in_window"] != 7
+        or _rr.population["returns_requested_in_window"] != 13
+        or _rr.population["returns_decided_in_window"] != 10
+        or _rr.population["returns_eligible_in_window"] != 5
+        or _rr.population["returns_denied_in_window"] != 5
+        or _rr.figures["return_rate"] != "1.8571"
+    ):
+        counters["report_figure_mismatches"] += 1
+    _mix = _by_kind["disposition_mix"]
+    if (
+        sum(int(row["cases"]) for row in _mix.breakdown)
+        != _mix.population["decided_cases"]
+        or _mix.population["decided_cases"] != 5
+        or _mix.figures["mix_total_share"] != "1.0000"
+    ):
+        counters["report_figure_mismatches"] += 1
+    _fr = _by_kind["fraud_outcomes"]
+    if (
+        _fr.population["known_outcome_cases"] != 2
+        or _fr.population["excluded_unknown_outcome"] != 8
+        or _fr.figures["precision"] != "1.0000"
+        or _fr.figures["recall"] != "0.5000"
+    ):
+        counters["report_figure_mismatches"] += 1
+    if (
+        _fr.figures["true_negatives"] != "0"
+        or _fr.population["scored_cases"]
+        != _fr.population["known_outcome_cases"]
+        + _fr.population["excluded_unknown_outcome"]
+    ):
+        counters["report_unknown_outcomes_as_negatives"] += 1
+    # The money summary must equal the console money view's own
+    # sums over its payload rows — no forked arithmetic.
+    _money_rows = _console_data(rep)["money"]
+    _top_up_ids = {
+        a["top_up_receipt_id"] for a in _money_rows["adjustments"] if a["top_up_receipt_id"]
+    }
+    _console_totals = {
+        "executed_refunds": sum(
+            Decimal(r["amount"]) for r in _money_rows["receipts"]
+            if r["receipt_id"] not in _top_up_ids
+        ),
+        "executed_top_ups": sum(
+            Decimal(r["amount"]) for r in _money_rows["receipts"]
+            if r["receipt_id"] in _top_up_ids
+        ),
+        "recoveries_outstanding": sum(
+            Decimal(a["amount"]) for a in _money_rows["adjustments"]
+            if a["kind"] == "recovery_due" and a["status"] == "open"
+        ),
+        "top_ups_outstanding": sum(
+            Decimal(a["amount"]) for a in _money_rows["adjustments"]
+            if a["kind"] == "top_up_due" and a["status"] == "open"
+        ),
+    }
+    _ms = _by_kind["money_summary"]
+    for _name, _total in _console_totals.items():
+        if _ms.figures[_name] != format(_total, ".2f"):
+            counters["report_money_console_mismatches"] += 1
+    _cost = _by_kind["cost_summary"]
+    _offline_rows = [b for b in _cost.breakdown if b["profile"] == "offline"]
+    if (
+        not _offline_rows
+        or _offline_rows[0]["total_cost"] != "0.00"
+        or _cost.figures["total_cost"] != "0.00"
+    ):
+        counters["report_figure_mismatches"] += 1
+    # Supersession: recompute over unmoved inputs returns the
+    # standing artefact; a moved input mints a successor.
+    _again = rep.compute_report("fraud_outcomes", as_of=_asof17)
+    if _again.report_id != _fr.report_id or _again.supersedes is not None:
+        counters["report_figure_mismatches"] += 1
+    # Reports are not a customer surface: the guarded read refuses
+    # with the hiding denial, and the Runtime renders a probe of a
+    # real report byte-identically to a probe of a missing one.
+    _customer17 = _Principal(id="CUST-ADA", role="customer")
+    try:
+        rep.get_report_as(_customer17, _fr.report_id)
+        counters["report_customer_reads_served"] += 1
+    except _AccessDenied as exc:
+        if exc.reason != "case_not_visible":
+            counters["report_customer_reads_served"] += 1
+    _probe = _dispatch(
+        rep, {"action": "get_report", "report_id": _fr.report_id,
+              "principal": {"id": "CUST-ADA", "role": "customer"}}
+    )
+    _missing = _dispatch(
+        rep, {"action": "get_report", "report_id": "RPT-0000000000000000",
+              "principal": {"id": "CUST-ADA", "role": "customer"}}
+    )
+    if _probe != {"report": None} or _probe != _missing:
+        counters["report_customer_reads_served"] += 1
+    # The main scenario service's reports join the cross-profile
+    # fingerprint: identical planted work, identical report ids.
+    for _kind in ("return_rate", "disposition_mix"):
+        service.compute_report(_kind, as_of=_asof17, **_window17)
+    for _kind in ("fraud_outcomes", "money_summary", "cost_summary"):
+        service.compute_report(_kind, as_of=_asof17)
+
     # The cross-profile fingerprint (R10): the content-addressed
     # artefact ids the planted work minted on this profile's store.
     # Identical planted work must mint identical ids on every store.
@@ -2848,6 +3013,9 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
         ),
         "access_denials": sorted(
             row["denial_id"] for row in service._store.list_access_denials()
+        ),
+        "reports": sorted(
+            row["report_id"] for row in service._store.list_management_reports()
         ),
     }
     return counters, fingerprint

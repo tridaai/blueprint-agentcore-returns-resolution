@@ -121,6 +121,16 @@ the pack prescribes. Regression: T-M5/T-P4.
 | T-A5 | A customer principal invokes a gateway tool claiming actor "staff"; then, honestly, as "customer" | The claim is refused `actor_mismatch` (recorded); the honest invocation reaches the gateway and is judged by the R11 pack — a policy denial envelope, not a label | A principal invokes only as the actor its role maps to; the access layer decides who, the policy pack decides what |
 | T-A6 | An approval whose body names a different approver than the calling supervisor principal | Refused `actor_mismatch` and recorded — the act of record and the authenticated caller must be the same person; the approval does not land under either name | Acts bind their named actor to the principal; a borrowed name is a refusal, never a rewrite |
 
+## Reporting traps (R17)
+
+| Trap | The trap | Expected outcome (hand-derived) | The deciding law |
+|---|---|---|---|
+| T-R1 | The fraud report over the planted record: 10 scored cases, of which a review confirms one flag and a grading proves one unflagged misrepresentation | Precision **1.0000**, recall **0.5000** over a known-outcome population of exactly **2**; the other 8 scored cases stand as **excluded**, and true negatives are **0** — an unjudged case is not a negative | Truth is adjudication (a review decision, or grading-proven misrepresentation); unknown outcomes are excluded and counted as excluded |
+| T-R2 | The money summary beside the console, over the console check's own walk (CASE-2003 graded down, CASE-2006 graded up and topped up) | The summary reads **159.55 / 4.50 / 14.50 / 0.00** and equals, figure for figure, the sums over the console payload's own receipt and adjustment rows | One arithmetic, two surfaces: the report sums the same artefacts the console sums, and the eval gate grades the equality |
+| T-R3 | A customer principal probes a real report id, then an invented one | Both answers are the endpoint's ordinary **404 body, byte-for-byte** (Runtime: the same `{"report": null}`); both probes stand in the denial log under the reports surface | Reports are not a customer surface at all; existence hiding covers artefacts beyond cases |
+| T-R4 | A report's inputs move after it is computed (a further case's outcome becomes known), then the report is recomputed | The recomputation mints a **new** artefact whose `supersedes` names the old one; the old report still stands, unedited, and now **fails** re-performance — the drift the verifier names is the reason it was superseded; recomputing over unmoved inputs returns the standing artefact unchanged | Reports are insert-only artefacts: supersession by recomputation, never edits |
+| T-R5 | A fraud report where no outcome is known at all, and a return rate over a window with no orders | Precision, recall and the rate all state **`not_computable`** — never 0, never 1 | A ratio over an empty population is undefined, and the report says so |
+
 ## What the suite deliberately does not trap
 
 - **A 94.99 fraud score** — unreachable by construction (T-F2);

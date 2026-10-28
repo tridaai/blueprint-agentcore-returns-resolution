@@ -655,11 +655,11 @@ def build_report(
 # Verification: an independent re-performance. The verifier does
 # NOT call the builders — it re-aggregates from the raw stored
 # payloads (the store's own rows, parsed here) by separately
-# written code, and compares every stated figure. A report whose
-# inputs were later superseded still verifies against the record
-# as it stood — verification re-derives from the same inputs the
-# fingerprint names, reached through the store; where the record
-# has since moved, the fingerprint check is what speaks.
+# written code, and compares every stated figure. Verification
+# speaks for the record as it stands NOW: a report whose inputs
+# have since been superseded no longer re-performs, and the
+# verifier says so — that drift is exactly why the recomputation
+# superseded it, and the successor is the report that verifies.
 # ---------------------------------------------------------------------------
 
 
@@ -669,12 +669,13 @@ def _raw_rows(store, method: str) -> list[dict]:
 
 def verify_report(service, report: ManagementReport) -> list[str]:
     """Re-perform one report from the stored record and return
-    its problems ([] when the report is exactly reproducible).
-    Checks: the pack version is the current pack's; the report is
-    stored, unaltered; its population, figures and breakdown
-    equal an independent re-aggregation over the raw stored
-    payloads; and its fingerprint recomputes from the input ids
-    that re-aggregation actually consumed."""
+    its problems ([] when the report is exactly reproducible
+    against the record as it stands). Checks: the pack version
+    is the current pack's; the report is stored, unaltered; its
+    population, figures and breakdown equal an independent
+    re-aggregation over the raw stored payloads; and its
+    fingerprint recomputes from the input ids that
+    re-aggregation actually consumed."""
     problems: list[str] = []
     pack = load_report_pack()
     if report.pack_version != pack.version:

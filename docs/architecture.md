@@ -760,8 +760,64 @@ the trusted-local operations path of R1–R15; in production,
 AgentCore Identity terminates caller identity in front of the
 surfaces, so every call carries one.
 
+## Management reporting (R17)
+
+The reporting layer reads the record the other sixteen rounds
+wrote; it writes exactly one new kind of artefact.
+
+- **Definitions before numbers.** `reporting.py` carries the
+  report pack (2026.10.1): for each of the five reports, a
+  population rule, a window rule and the measure list, as data.
+  A report artefact names its pack version; a definition change
+  is a new version, so figures from different packs are never
+  silently comparable.
+- **The five reports.** Return rate divides cases requested in
+  the window by orders placed in the window — the orders table
+  is the denominator because it is the order population that
+  exists; the eligible/denied split counts only cases carrying a
+  decision of record. The disposition mix reads chain-head
+  disposition decisions for cases requested in the window (a
+  disposition carries no date of its own; the pack states that
+  the return's period is the mix's period) and states shares
+  that sum to the decided population exactly, with
+  not-decidable and undecided cases counted outside the mix.
+  The fraud report is cumulative through its as-of over cases
+  with a chain-head score: the prediction is the head band; the
+  truth is the latest review decision of record, or, failing
+  one, grading-proven misrepresentation (the grading pack's
+  wildly-worse rank jump with wear evidence — the R7 re-score
+  trigger). Cases with neither stand excluded, counted in the
+  population as excluded; ratios over an empty denominator are
+  the named string `not_computable`. The money summary's four
+  totals are sums over receipts and adjustments through the
+  as-of, split by the adjustments' top-up receipt links — the
+  console money view's arithmetic, re-performed from the same
+  artefacts and graded equal to the console payload's rows.
+  The cost summary is cumulative over the R12 ledger grouped by
+  profile; entries carry no timestamps, so the pack states
+  plainly that no period cut exists.
+- **Artefacts, not queries.** A report (migration 0013) is
+  insert-only. Its id is content-addressed over kind, window,
+  as-of and a SHA-256 fingerprint of the sorted input artefact
+  ids; `compute_report` returns the standing head when the
+  recomputation's id equals it, and otherwise stores the new
+  report with `supersedes` naming the old head. `verify_report`
+  re-aggregates population, figures and breakdown from the raw
+  stored payloads through separately written code and
+  recomputes the fingerprint — a report verifies against the
+  record as it stands, so a superseded report's failure to
+  re-perform is itself the drift signal.
+- **Access.** The access pack gains a `reports` surface and a
+  `compute_report` act: staff_supervisor reads and computes,
+  the auditor reads (its surface list is all surfaces) and is
+  refused compute as `read_only_role`, system does both.
+  Customer principals are denied with the `case_not_visible`
+  hiding reason for any report id, real or invented — the API
+  renders the endpoint's ordinary 404 body and the Runtime the
+  action's empty result, byte-identical either way.
+
 ## What is deliberately not here yet
 
-Reporting, carrier exceptions, red team,
+Carrier exceptions, red team,
 deploy artefacts. The README's honest status is the
 authoritative per-round account.

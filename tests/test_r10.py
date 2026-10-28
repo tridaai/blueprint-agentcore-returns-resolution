@@ -135,7 +135,7 @@ def test_postgres_migration_ledger_applies_once(tmp_path):
         r["version"]
         for r in store._query("SELECT version FROM schema_migrations ORDER BY version")
     ]
-    assert versions == [f"000{i}" for i in range(1, 10)] + ["0010", "0011", "0012"]
+    assert versions == [f"000{i}" for i in range(1, 10)] + ["0010", "0011", "0012", "0013"]
 
 
 @pg_only
