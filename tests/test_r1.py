@@ -180,11 +180,13 @@ def test_sqlite_store_migrates_once_and_persists(tmp_path):
 
 
 @pytest.mark.skipif(
-    not os.environ.get("RETURNS_TEST_DATABASE_URL"),
-    reason="Postgres leg runs when RETURNS_TEST_DATABASE_URL is set (parity round R15)",
+    not (os.environ.get("RETURNS_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")),
+    reason="Postgres leg runs when RETURNS_TEST_DATABASE_URL is set (Postgres profile, R10)",
 )
 def test_postgres_store_dialect(tmp_path):
-    store = SqlStore(database_url=os.environ["RETURNS_TEST_DATABASE_URL"])
+    store = SqlStore(
+        database_url=os.environ.get("RETURNS_TEST_DATABASE_URL") or os.environ["DATABASE_URL"]
+    )
     store.migrate()
     service = CaseService(store, OfflineComposer())
     service.seed_orders()
