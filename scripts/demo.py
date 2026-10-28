@@ -20,7 +20,13 @@ from returns_resolution.store import SqlStore
 
 
 def main() -> int:
-    store = SqlStore(sqlite_path="./data/demo-returns.db")
+    # The demo is a walkthrough, not a store of record: start from a
+    # fresh demo database so the walkthrough always shows the current
+    # round's behaviour end to end.
+    demo_db = Path("./data/demo-returns.db")
+    if demo_db.exists():
+        demo_db.unlink()
+    store = SqlStore(sqlite_path=demo_db)
     store.migrate()
     service = CaseService(store, OfflineComposer())
     seeded = service.seed_orders()
