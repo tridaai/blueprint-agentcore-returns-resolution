@@ -21,6 +21,15 @@ TEMPLATE rendered from the case's artefacts of record:
   date, the tenders it went back to.
 - ``adjustment_notice`` — a grading adjustment position: a top-up
   sent, or a recovery standing on the record.
+- ``carrier_exception_notice`` (R18) — a carrier exception on the
+  case: the journey broke (label never tendered, parcel lost in
+  transit, parcel damaged in transit) or its resolution. The
+  wording is the exception pack's customer wording, rendered
+  from the exception's derived state: the exception is stated
+  plainly, transit damage is stated as the carrier's — never the
+  customer's — and no refund date is promised while an exception
+  makes one unkeepable (the disclosure pack's timing bans do
+  that work, as always).
 
 Free-form model text is allowed ONLY inside a template's stated
 note slot — one optional closing paragraph, appended verbatim and
@@ -52,6 +61,7 @@ from typing import Protocol
 
 from pydantic import BaseModel
 
+from .carrier_exceptions import load_exception_pack
 from .models import (
     DispositionDecision,
     FraudReviewDecision,
@@ -75,6 +85,7 @@ MESSAGE_TYPES = [
     "fraud_review_notice",
     "refund_executed_notice",
     "adjustment_notice",
+    "carrier_exception_notice",
 ]
 
 # Message lifecycle states. draft → verified → queued → sent is
@@ -216,6 +227,13 @@ class MessageFacts:
     receipt: RefundReceipt | None = None  # the original refund receipt
     top_up_receipt: RefundReceipt | None = None
     summary_text: str | None = None  # the composed body (return_summary)
+    # The standing carrier exception (R18), for the exception
+    # notice: its kind, its derived state and resolution path,
+    # and the carrier reference of the label it was raised on.
+    exception_kind: str | None = None
+    exception_state: str | None = None
+    exception_path: str | None = None
+    exception_label_ref: str | None = None
 
 
 def _with_note(text: str, model_note: str | None) -> str:
@@ -256,6 +274,34 @@ def _render_label_instructions(facts: MessageFacts, model_note: str | None) -> s
 
 def _render_grading_outcome(facts: MessageFacts, model_note: str | None) -> str:
     report = facts.report
+    if report.damage_attribution == "transit":
+        # R18: the damage is the carrier's. The notice says so,
+        # states the refund as standing on the declared condition,
+        # and never renders the graded condition's customer phrase
+        # — "damaged by the customer" would blame the customer for
+        # the carrier's record.
+        sentences = [
+            f"Your return of the {facts.product_name} reached us damaged in "
+            "transit — the carrier recorded the damage while the parcel was "
+            "in its care, so the damage is not attributed to you."
+        ]
+        computation = facts.computation
+        if computation is not None and computation.refund_total is not None:
+            sentences.append(
+                f"Your refund stands at ${computation.refund_total}, computed "
+                "on the condition you declared."
+            )
+        dispositions = {d.disposition_id: d for d in _dispositions_of(facts)}
+        new_disp = (
+            dispositions.get(report.new_disposition_id)
+            if report.new_disposition_id
+            else None
+        )
+        if new_disp is not None and new_disp.disposition is not None:
+            sentences.append(
+                f"The item will be {DISPOSITION_PHRASES[new_disp.disposition]}."
+            )
+        return _with_note(" ".join(sentences), model_note)
     declared_phrase = CONDITION_PHRASES[report.declared_condition]
     graded_phrase = CONDITION_PHRASES[report.graded_condition]
     sentences = [
@@ -360,6 +406,43 @@ def _render_adjustment(facts: MessageFacts, model_note: str | None) -> str:
     return _with_note(text, model_note)
 
 
+def _render_carrier_exception(facts: MessageFacts, model_note: str | None) -> str:
+    """The carrier exception, in the exception pack's own customer
+    wording — the pack is the data, this renderer only chooses the
+    wording key from the exception's derived state and fills its
+    slots (product, the exception label's carrier reference, the
+    refund figure of record). No wording exists outside the pack,
+    so no blame and no timing promise can be composed here."""
+    pack = load_exception_pack()
+    if facts.exception_state == "resolved" and facts.exception_path in (
+        "refund_as_received",
+        "customer_kept",
+        "reissue_label",
+    ):
+        key = f"resolved_{facts.exception_path}"
+    elif facts.exception_state == "resolved":
+        key = "damaged_in_transit"  # resolved by grading attribution
+    elif facts.exception_state == "escalated":
+        key = "escalated"
+    elif facts.exception_kind == "damaged_in_transit":
+        key = "damaged_in_transit"
+    elif facts.exception_kind == "lost_in_transit":
+        key = "lost_in_transit_open"
+    else:
+        key = "label_never_tendered_open"
+    total = (
+        facts.computation.refund_total
+        if facts.computation is not None
+        else None
+    )
+    text = pack.customer_wording[key].format(
+        product=facts.product_name,
+        ref=facts.exception_label_ref or "",
+        total=total,
+    )
+    return _with_note(text, model_note)
+
+
 # The template registry: message type -> renderer. This is the
 # whole universe of customer-facing text; drafting a type with no
 # entry here is refused by the service before any text exists.
@@ -370,6 +453,7 @@ TEMPLATES = {
     "fraud_review_notice": _render_fraud_review_outcome,
     "refund_executed_notice": _render_refund_executed,
     "adjustment_notice": _render_adjustment,
+    "carrier_exception_notice": _render_carrier_exception,
 }
 
 

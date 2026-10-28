@@ -4913,6 +4913,16 @@ class CaseService:
             dates.add(booking.scheduled_on)
         if score is not None:
             dates.add(score.as_of)
+        # Carrier exceptions (R18): the raising and handling dates
+        # are artefact dates of the case, sayable like the others.
+        # Claim amounts are NOT added — a claim is the house's
+        # recovery record against its carrier, never a customer
+        # figure, so no message may state one.
+        exceptions = self.list_exceptions(case.case_id)
+        for exception in exceptions:
+            dates.add(exception.raised_on)
+            for act in self.list_exception_acts(exception.exception_id):
+                dates.add(act.acted_on)
 
         percents: set[Decimal] = set()
         for comp in computations:
@@ -5058,6 +5068,24 @@ class CaseService:
                 refs["computations"] = ",".join(c.computation_id for c in computations)
             if receipts:
                 refs["receipts"] = ",".join(r.receipt_id for r in receipts)
+        elif message_type == "carrier_exception_notice":
+            current_exception = exceptions[-1] if exceptions else None
+            exception_acts = (
+                self.list_exception_acts(current_exception.exception_id)
+                if current_exception is not None
+                else []
+            )
+            payloads = {
+                "exception": dump(current_exception),
+                "exception_acts": [dump(a) for a in exception_acts],
+                "computation": dump(computation),
+                "labels": [dump(lbl) for lbl in labels],
+            }
+            refs = {}
+            if current_exception is not None:
+                refs["exception"] = current_exception.exception_id
+            if computation is not None:
+                refs["computation"] = computation.computation_id
         else:
             raise MessagingError(
                 f"unknown message type {message_type!r}: no template exists for it, "
@@ -5149,6 +5177,31 @@ class CaseService:
                     f"case {case.case_id} has no refund adjustment of record; "
                     "there is no adjustment to notify"
                 )
+        elif message_type == "carrier_exception_notice":
+            exceptions = self.list_exceptions(case.case_id)
+            if not exceptions:
+                raise MessagingError(
+                    f"case {case.case_id} has no carrier exception of record; "
+                    "there is no exception to notify"
+                )
+            current = exceptions[-1]
+            view = self.exception_view(current)
+            facts.exception_kind = current.kind
+            facts.exception_state = view["state"]
+            facts.exception_path = view["resolution_path"]
+            exception_label = self.get_label(current.label_id)
+            facts.exception_label_ref = (
+                exception_label.carrier_ref if exception_label is not None else None
+            )
+            if current.kind == "damaged_in_transit" or view["resolution_path"] == (
+                "refund_as_received"
+            ):
+                if facts.computation is None or facts.computation.refund_total is None:
+                    raise MessagingError(
+                        f"case {case.case_id} has no final refund figure of "
+                        "record; the exception notice states the refund, so "
+                        "it cannot be drafted without one"
+                    )
         return facts
 
     def _withdraw_message(self, message: CustomerMessage, *, at: date, detail: str) -> None:
