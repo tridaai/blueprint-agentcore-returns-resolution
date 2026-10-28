@@ -21,6 +21,9 @@ planted feed / POST /returns / Runtime invocation
         ├─ order lookup (store port; seeded gold-by-construction orders)
         ├─ eligibility.evaluate(pack, order, product, request)
         |     -> EligibilityDecision {eligible, pack version, clauses[], amounts, dates}
+        ├─ refunds.compute_refund(refund schedule) -> RefundComputation (R2)
+        ├─ disposition.decide_disposition(matrix, channels)   [eligible cases only]
+        |     -> DispositionDecision {cell, channel, reroutes[]} | not_decidable (R3)
         ├─ model port .compose_summary(decision)   [offline | hosted-bedrock]
         ├─ verifier.verify_summary(text, decision) -> violations?
         |     -> any violation: case stored summary_failed, NO summary stored
@@ -104,9 +107,41 @@ figure verifier's amount universe extends to the computation's
 lines, totals and allocations when a computation is supplied, so the
 summary quotes the computed refund — and still nothing else.
 
+## The disposition matrix (R3)
+
+`disposition.py` decides where a returned item goes. The matrix is a
+versioned pack (data, fail-closed loader): 36 primary cells over
+(category x declared condition x age band) plus stated fallback
+cells, each naming a disposition from a closed vocabulary (RESTOCK /
+REFURBISH / OUTLET / LIQUIDATE / RETURN_TO_VENDOR / RECYCLE /
+HOLD_FOR_INSPECTION) and the resale channel it flows through. Item
+age is banded from the request and delivery dates (fresh 0–30,
+season 31–90, aged 91+). Channel availability is a separate versioned
+table: when a cell's channel is closed for the category, the walk
+falls to the cell's *stated next cell* and records the hop as a
+reroute step on the decision — the shipped table closes the apparel
+liquidator, so aged used apparel lands on its fallback cell (RECYCLE
+via the recycler) with the reroute on the record. A fact set with no
+covering cell — an unknown category, a declared condition outside
+the matrix vocabulary, an age that bands nowhere, a closed channel
+with no stated next — returns `not_decidable` *naming the missing
+dimension*; there is no default disposition. Decisions are
+content-addressed artefacts pinned to the case, the computation,
+both pack versions and the channel table's fingerprint, and
+`verify_disposition` re-performs the walk to detect tampering,
+exactly as the refund verifier re-performs money. The R3 basis is
+the customer's *declared* condition (`basis: declared`); warehouse
+grading in R7 supersedes with a new decision linked by `supersedes`.
+HOLD_FOR_INSPECTION cells name the facts inspection must establish
+(for used electronics: functional test result, data-wipe status).
+The matrix covers the full grid, including cells the current policy
+windows make unreachable at intake — the matrix is the disposition
+policy of record for an item that arrives anyway, not an intake-only
+table.
+
 ## What is deliberately not here yet
 
-Disposition matrix (R3), fraud scoring (R4), approval gates and the
+Fraud scoring (R4), approval gates and the
 payments port (R5), carrier tools (R6), warehouse grading (R7),
 messaging verifier depth (R8), Memory port (R9), injection quarantine
 (R10), Gateway + Policy ports (R11), model cost ledger (R12), console
