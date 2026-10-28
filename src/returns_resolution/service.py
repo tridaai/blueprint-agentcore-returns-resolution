@@ -16,12 +16,25 @@ from decimal import Decimal
 
 from .carrier import CarrierPort, CarrierProviderError, LocalCarrierDouble
 from .disposition import (
+    BASIS_GRADED,
+    HOLD_FOR_INSPECTION,
     ChannelTable,
     MatrixPack,
     decide_disposition,
     load_channel_table,
     load_matrix_pack,
     verify_disposition,
+)
+from .grading import (
+    CONDITION_RANKS,
+    CONDITION_VOCABULARY,
+    DATA_WIPE_STATES,
+    FUNCTIONAL_RESULTS,
+    GRADING_PACK_VERSION,
+    WILDLY_WORSE_JUMP,
+    inspection_successor_decision,
+    resolve_inspection,
+    verify_inspection_decision,
 )
 from .eligibility import case_id_for, evaluate
 from .evidence import EvidenceStore
@@ -43,10 +56,12 @@ from .models import (
     ExecutionTransition,
     FraudReviewDecision,
     FraudScore,
+    GradingReport,
     LabelCostReconciliation,
     LabelVoid,
     Order,
     PickupBooking,
+    RefundAdjustment,
     RefundApproval,
     RefundComputation,
     RefundExecution,
@@ -54,6 +69,8 @@ from .models import (
     ReturnCase,
     ReturnLabel,
     ReturnRequest,
+    TenderAllocation,
+    WarehouseReceipt,
     money,
 )
 from .payments import (
@@ -105,6 +122,34 @@ class CarrierError(RuntimeError):
     """A carrier/label tool act was refused — the message names the
     unmet precondition (ineligible case, missing schedule entry,
     non-bulky pickup, already-voided label, …)."""
+
+
+class GradingError(RuntimeError):
+    """A warehouse receipt or grading act was refused — the message
+    names the unmet precondition (no carrier receipt yet, unnamed
+    grader, the receiver grading their own parcel, a held case
+    graded without its inspection facts, …)."""
+
+
+def _chain_order(payloads: list[dict], id_key: str) -> list[dict]:
+    """Order a supersession chain oldest-first by walking its links:
+    the root is the artefact that supersedes nothing in the set, and
+    each next member is the artefact whose `supersedes` names the
+    previous one's id. A chain that does not walk cleanly falls back
+    to id order — unreachable through the service, which only ever
+    appends heads."""
+    by_id = {p[id_key]: p for p in payloads}
+    successor = {p["supersedes"]: p for p in payloads if p.get("supersedes") in by_id}
+    roots = [p for p in payloads if p.get("supersedes") not in by_id]
+    ordered: list[dict] = []
+    for root in sorted(roots, key=lambda p: p[id_key]):
+        current: dict | None = root
+        while current is not None:
+            ordered.append(current)
+            current = successor.get(current[id_key])
+    if len(ordered) != len(payloads):
+        return sorted(payloads, key=lambda p: p[id_key])
+    return ordered
 
 
 class CaseService:
@@ -289,6 +334,16 @@ class CaseService:
     def list_computations(self) -> list[RefundComputation]:
         return [RefundComputation.model_validate(p) for p in self._store.list_computations()]
 
+    def list_computations_for_case(self, case_id: str) -> list[RefundComputation]:
+        """The case's computation chain, oldest first (R7): the
+        declared-basis original, then each graded re-run that
+        superseded it, in link order."""
+        payloads = self._store.list_computations_for_case(case_id)
+        return [
+            RefundComputation.model_validate(p)
+            for p in _chain_order(payloads, "computation_id")
+        ]
+
     # -- dispositions (R3) ---------------------------------------------------
     def _decide_for(
         self, order: Order, product, request: ReturnRequest, computation_id: str | None
@@ -327,7 +382,13 @@ class CaseService:
         return disposition
 
     def verify_stored_disposition(self, case_id: str) -> list[str]:
-        """Re-perform the stored disposition's walk; [] = intact."""
+        """Re-perform the stored (current) disposition; [] = intact.
+
+        Declared-basis decisions re-run the matrix walk; graded-basis
+        decisions (R7) re-run it over the graded facts; an
+        inspection-resolution decision (a GR-* cell) is re-performed
+        from the grading report it rests on.
+        """
         disposition = self.get_disposition(case_id)
         case = self.get_case(case_id)
         if disposition is None or case is None:
@@ -335,6 +396,21 @@ class CaseService:
         order = self.get_order(case.order_id)
         if order is None:
             return ["order missing for this case"]
+        if disposition.cell_id is not None and disposition.cell_id.startswith("GR-"):
+            report = self.get_grading_report(case_id)
+            if report is None:
+                return ["no grading report for this inspection-resolution disposition"]
+            held = next(
+                (
+                    d
+                    for d in self.list_dispositions_for_case(case_id)
+                    if d.disposition_id == disposition.supersedes
+                ),
+                None,
+            )
+            if held is None:
+                return ["the held decision this resolution supersedes is missing"]
+            return verify_inspection_decision(disposition, report=report, held_decision=held)
         product = CATALOGUE.get(case.request.sku)
         return verify_disposition(
             disposition,
@@ -343,12 +419,25 @@ class CaseService:
             case_id=case_id,
             computation_id=disposition.computation_id,
             category=product.category if product is not None else None,
-            condition_declared=case.request.condition_declared,
+            condition_declared=disposition.condition_declared,
             age_days=(case.request.requested_on - order.delivered_on).days,
+            basis=disposition.basis,
+            graded_condition=disposition.graded_condition,
+            supersedes=disposition.supersedes,
         )
 
     def list_dispositions(self) -> list[DispositionDecision]:
         return [DispositionDecision.model_validate(p) for p in self._store.list_dispositions()]
+
+    def list_dispositions_for_case(self, case_id: str) -> list[DispositionDecision]:
+        """The case's disposition chain, oldest first (R7): the
+        declared-basis decision, then each graded successor that
+        superseded it, in link order."""
+        payloads = self._store.list_dispositions_for_case(case_id)
+        return [
+            DispositionDecision.model_validate(p)
+            for p in _chain_order(payloads, "disposition_id")
+        ]
 
     def get_matrix(self) -> MatrixPack:
         return self._matrix
@@ -376,7 +465,16 @@ class CaseService:
         order = self.get_order(case.order_id)
         if order is None:
             return None
-        return self._fact_for(order, case.request)
+        fact = self._fact_for(order, case.request)
+        # The warehouse weigh-in (R7) is the weight of record once a
+        # grading report states it: it supersedes the intake drop-off
+        # scan, so scores taken after grading measure the parcel the
+        # warehouse actually weighed. The intake scan stays on the
+        # request artefact — the fact derivation is what changes.
+        reports = self.list_grading_reports(case.case_id)
+        if reports and reports[-1].received_weight_grams is not None:
+            fact.returned_weight_grams = reports[-1].received_weight_grams
+        return fact
 
     def _score_over(self, scored: CaseFact, supersedes: str | None = None) -> FraudScore:
         facts = [scored]
@@ -756,14 +854,16 @@ class CaseService:
         replayed = self._store.get_receipt_by_key(key)
         if replayed is not None:
             receipt = RefundReceipt.model_validate(replayed)
-            if receipt.case_id != case_id or (
-                computation is not None and receipt.computation_id != computation.computation_id
-            ):
+            if receipt.case_id != case_id:
                 raise PaymentsError(
                     f"idempotency key {key!r} was already used for case "
                     f"{receipt.case_id} / computation {receipt.computation_id}; "
                     "a key names one execution"
                 )
+            # The key names THIS case's execution, even if grading
+            # (R7) has since superseded the computation it settled:
+            # the replay returns the original receipt, and no money
+            # moves again.
             return receipt
 
         if computation is None:
@@ -795,6 +895,19 @@ class CaseService:
                 f"duplicate_refund: computation {computation.computation_id} already "
                 f"executed under idempotency key {already['idempotency_key']!r} "
                 f"(receipt {already['receipt_id']}); a second execution is refused"
+            )
+        settled_elsewhere = [r for r in self.list_receipts() if r.case_id == case_id]
+        if settled_elsewhere:
+            # The case's money already moved — against a computation
+            # grading has since superseded (R7). Executing the new
+            # computation in full would pay the settled part twice;
+            # the difference belongs to the grading adjustment path.
+            raise PaymentsError(
+                f"case {case_id}'s refund already executed against a superseded "
+                f"computation (receipt {settled_elsewhere[0].receipt_id}); the graded "
+                "difference is settled through the grading adjustment (execute_top_up "
+                "for a top-up, a recorded recovery position for an over-refund) — "
+                "never by re-executing the full computation"
             )
 
         # The execution record: created on first attempt for this
@@ -1314,8 +1427,670 @@ class CaseService:
             events_by_label={
                 label.label_id: self._carrier_events_for(label, as_of) for label in labels
             },
+            computation_chain=self.list_computations_for_case(case_id),
+            disposition_chain=self.list_dispositions_for_case(case_id),
+            warehouse_receipts=self.list_warehouse_receipts(case_id),
+            grading_reports=self.list_grading_reports(case_id),
+            adjustments=self.list_adjustments(case_id),
             as_of=as_of,
         )
+
+    # -- warehouse receipt + grading (R7) ------------------------------------
+    def record_warehouse_receipt(
+        self, case_id: str, *, received_by: str, received_on: date
+    ) -> WarehouseReceipt:
+        """The warehouse receipt act: a named receiver takes the
+        parcel into the warehouse. Refusals, each naming its gap:
+        an unnamed receiver; a case with no eligible return (there
+        is no parcel); no label of record; and — the carrier's word
+        governs — no `received` carrier event for the label as of
+        the receipt date. Re-recording the same act (same receiver,
+        same date, same label) returns the existing artefact; a
+        different act against an already-receipted label refuses."""
+        case = self.get_case(case_id)
+        if case is None:
+            raise LookupError(f"unknown case: {case_id}")
+        received_by = (received_by or "").strip()
+        if not received_by:
+            raise GradingError("a warehouse receipt requires a named receiver")
+        if case.decision is None or not case.decision.eligible:
+            raise GradingError(
+                f"case {case_id} has no eligible return; there is no parcel to receive"
+            )
+        label = self.get_label_for_case(case_id)
+        if label is None:
+            raise GradingError(
+                f"case {case_id} has no return label of record; a parcel cannot be "
+                "received before a label moves it"
+            )
+        existing = self._store.get_warehouse_receipt_for_label(label.label_id)
+        if existing is not None:
+            receipt = WarehouseReceipt.model_validate(existing)
+            if receipt.received_by == received_by and receipt.received_on == received_on:
+                return receipt
+            raise GradingError(
+                f"label {label.label_id} already has a warehouse receipt of record "
+                f"({receipt.warehouse_receipt_id}, by {receipt.received_by} on "
+                f"{receipt.received_on}); a parcel is received once"
+            )
+        events = self._carrier_events_for(label, received_on)
+        if not any(e.kind == "received" for e in events):
+            seen = ", ".join(e.kind for e in events) or "none"
+            raise GradingError(
+                f"the carrier has not recorded receipt of label {label.label_id} as of "
+                f"{received_on} (events of record: {seen}); the warehouse cannot receipt "
+                "a parcel the carrier still shows in transit"
+            )
+        blob = json.dumps(
+            {
+                "case_id": case_id,
+                "label_id": label.label_id,
+                "received_by": received_by,
+                "received_on": received_on.isoformat(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        receipt = WarehouseReceipt(
+            warehouse_receipt_id="WHR-" + hashlib.sha256(blob.encode()).hexdigest()[:16],
+            case_id=case_id,
+            label_id=label.label_id,
+            received_by=received_by,
+            received_on=received_on,
+        )
+        self._store.put_warehouse_receipt(receipt.model_dump(mode="json"))
+        return receipt
+
+    def list_warehouse_receipts(self, case_id: str) -> list[WarehouseReceipt]:
+        receipts = [
+            WarehouseReceipt.model_validate(p)
+            for p in self._store.list_warehouse_receipts(case_id)
+        ]
+        return sorted(receipts, key=lambda r: (r.received_on, r.warehouse_receipt_id))
+
+    def get_warehouse_receipt(self, case_id: str) -> WarehouseReceipt | None:
+        receipts = self.list_warehouse_receipts(case_id)
+        return receipts[-1] if receipts else None
+
+    def list_grading_reports(self, case_id: str) -> list[GradingReport]:
+        reports = [
+            GradingReport.model_validate(p) for p in self._store.list_grading_reports(case_id)
+        ]
+        return sorted(reports, key=lambda r: (r.graded_on, r.report_id))
+
+    def get_grading_report(self, case_id: str) -> GradingReport | None:
+        reports = self.list_grading_reports(case_id)
+        return reports[-1] if reports else None
+
+    def list_adjustments(self, case_id: str) -> list[RefundAdjustment]:
+        adjustments = [
+            RefundAdjustment.model_validate(p) for p in self._store.list_adjustments(case_id)
+        ]
+        return sorted(adjustments, key=lambda a: (a.created_on, a.adjustment_id))
+
+    def get_adjustment(self, adjustment_id: str) -> RefundAdjustment | None:
+        payload = self._store.get_adjustment(adjustment_id)
+        return RefundAdjustment.model_validate(payload) if payload else None
+
+    def record_grading(
+        self,
+        case_id: str,
+        *,
+        grader: str,
+        graded_condition: str,
+        graded_on: date,
+        functional_test_result: str | None = None,
+        data_wipe_status: str | None = None,
+        damage_notes: str = "",
+        received_weight_grams: int | None = None,
+        wear_evidence: bool = False,
+    ) -> GradingReport:
+        """The grading act and its supersession cascade, in order.
+
+        Gates first, each refusal naming its gap: the case is an
+        eligible return; a warehouse receipt of record exists; the
+        grader is named and is NOT the receiver of record
+        (separation of duties — the person who took the parcel in
+        does not grade it); the graded condition is in the pack's
+        vocabulary; no grading report stands yet for the case; and
+        when inspection facts are required — the current disposition
+        is HOLD_FOR_INSPECTION, or the graded facts would hold the
+        item again — the report records BOTH of them, or it does not
+        finalise.
+
+        The cascade then runs in its stated order, each step a new
+        linked artefact, the superseded ones never edited:
+
+        1. disposition — re-decided over the graded condition
+           (basis "graded") whenever the grade differs from the
+           declaration or a hold must resolve; a still-held item
+           resolves through the grading pack's inspection table.
+        2. computation — re-run over the graded condition whenever
+           the grade differs; the delta against the superseded total
+           is computed and recorded on this report.
+        3. adjustment — if money already executed against the
+           superseded computation, the delta becomes a stated
+           position: recovery_due (over-refunded; a recorded
+           receivable, no clawback built) or top_up_due
+           (under-refunded; settled only via execute_top_up).
+        4. summary — re-issued against the new computation and
+           figure-verified as always; a verification failure
+           refuses the whole act before anything is stored.
+        5. fraud re-score — when the grade is wildly worse than the
+           declaration (the pack's rank jump) AND the grader records
+           wear evidence, the case is re-scored through the R4
+           machinery; the report's weigh-in is the score's weight
+           of record by then.
+        """
+        case = self.get_case(case_id)
+        if case is None:
+            raise LookupError(f"unknown case: {case_id}")
+        grader = (grader or "").strip()
+        if not grader:
+            raise GradingError("a grading report requires a named grader")
+        decision = case.decision
+        if decision is None or not decision.eligible:
+            raise GradingError(
+                f"case {case_id} is not an eligible return; there is no item to grade"
+            )
+        if self.list_grading_reports(case_id):
+            existing = self.list_grading_reports(case_id)[-1]
+            raise GradingError(
+                f"case {case_id} already has a finalised grading report "
+                f"({existing.report_id} by {existing.grader}); grading is a single act "
+                "of record — a later disagreement is new evidence, not an edit"
+            )
+        receipt = self.get_warehouse_receipt(case_id)
+        if receipt is None:
+            raise GradingError(
+                f"case {case_id} has no warehouse receipt of record; the parcel must be "
+                "received into the warehouse before it can be graded"
+            )
+        if grader == receipt.received_by:
+            raise GradingError(
+                f"separation of duties: {grader} received this parcel into the warehouse "
+                f"(receipt {receipt.warehouse_receipt_id}) and cannot grade it; "
+                "a different grader must record the grading"
+            )
+        if graded_condition not in CONDITION_VOCABULARY:
+            raise GradingError(
+                f"graded condition {graded_condition!r} is not in the grading "
+                f"vocabulary ({', '.join(CONDITION_VOCABULARY)}); the warehouse states "
+                "one of these, never a nearest match"
+            )
+        if functional_test_result is not None and functional_test_result not in FUNCTIONAL_RESULTS:
+            raise GradingError(
+                f"functional_test_result {functional_test_result!r} is not a recorded "
+                f"outcome ({', '.join(sorted(FUNCTIONAL_RESULTS))})"
+            )
+        if data_wipe_status is not None and data_wipe_status not in DATA_WIPE_STATES:
+            raise GradingError(
+                f"data_wipe_status {data_wipe_status!r} is not a recorded state "
+                f"({', '.join(sorted(DATA_WIPE_STATES))})"
+            )
+        if received_weight_grams is not None and received_weight_grams <= 0:
+            raise GradingError("a warehouse weigh-in must be a positive weight in grams")
+
+        order = self.get_order(case.order_id)
+        if order is None:
+            raise GradingError(f"order missing for case {case_id}")
+        product = CATALOGUE.get(case.request.sku)
+        category = product.category if product is not None else None
+        declared = case.request.condition_declared
+        age_days = (case.request.requested_on - order.delivered_on).days
+        current_disposition = self.get_disposition(case_id)
+        current_computation = self.get_computation(case_id)
+
+        # -- step 2 (computed early, in memory): the refund re-run ----
+        new_computation: RefundComputation | None = None
+        refund_delta: Decimal | None = None
+        if graded_condition != declared and current_computation is not None:
+            new_computation = compute_refund(
+                self._pack,
+                order,
+                product,
+                case.request,
+                decision,
+                condition_override=graded_condition,
+                supersedes=current_computation.computation_id,
+            )
+            if (
+                new_computation.refund_total is not None
+                and current_computation.refund_total is not None
+            ):
+                refund_delta = money(
+                    new_computation.refund_total - current_computation.refund_total
+                )
+
+        # -- step 1 (in memory): the disposition over the grade -------
+        new_disposition: DispositionDecision | None = None
+        held_now = (
+            current_disposition is not None
+            and current_disposition.disposition == HOLD_FOR_INSPECTION
+        )
+        if graded_condition != declared or held_now:
+            pinned_computation = (
+                new_computation.computation_id
+                if new_computation is not None
+                else (current_computation.computation_id if current_computation else None)
+            )
+            walk = decide_disposition(
+                self._matrix,
+                self._channels,
+                case_id=case_id,
+                computation_id=pinned_computation,
+                category=category,
+                condition_declared=declared,
+                age_days=age_days,
+                basis=BASIS_GRADED,
+                graded_condition=graded_condition,
+                supersedes=(
+                    current_disposition.disposition_id if current_disposition else None
+                ),
+            )
+            required_unknowns: set[str] = set()
+            if held_now and current_disposition is not None:
+                required_unknowns |= set(current_disposition.inspection_unknowns)
+            if walk.status == "decided" and walk.disposition == HOLD_FOR_INSPECTION:
+                required_unknowns |= set(walk.inspection_unknowns)
+            established = {
+                "functional_test_result": functional_test_result,
+                "data_wipe_status": data_wipe_status,
+            }
+            missing = sorted(u for u in required_unknowns if established.get(u) is None)
+            if missing:
+                raise GradingError(
+                    f"case {case_id} is held for inspection: the grading report must "
+                    f"record {', '.join(missing)} — what inspection had to establish — "
+                    "or it does not finalise"
+                )
+            if walk.status == "decided" and walk.disposition == HOLD_FOR_INSPECTION:
+                rule = resolve_inspection(functional_test_result, data_wipe_status)
+                if rule is None:
+                    raise GradingError(
+                        "the recorded inspection facts resolve to no rule in the "
+                        "grading pack; the hold cannot be resolved on these facts"
+                    )
+                band = self._matrix.band_for(age_days) if age_days is not None else None
+                new_disposition = inspection_successor_decision(
+                    case_id=case_id,
+                    computation_id=pinned_computation,
+                    matrix_version=self._matrix.version,
+                    channel_table_version=self._channels.version,
+                    category=category,
+                    condition_declared=declared,
+                    graded_condition=graded_condition,
+                    age_days=age_days,
+                    age_band=band.band_id if band else None,
+                    rule=rule,
+                    supersedes=(
+                        current_disposition.disposition_id if current_disposition else ""
+                    ),
+                )
+            else:
+                new_disposition = walk
+
+        report_blob = json.dumps(
+            {
+                "case_id": case_id,
+                "warehouse_receipt_id": receipt.warehouse_receipt_id,
+                "grader": grader,
+                "graded_on": graded_on.isoformat(),
+                "graded_condition": graded_condition,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        report_id = "GR-" + hashlib.sha256(report_blob.encode()).hexdigest()[:16]
+
+        # -- step 3 (in memory): the adjustment position ---------------
+        adjustment: RefundAdjustment | None = None
+        if (
+            new_computation is not None
+            and current_computation is not None
+            and refund_delta is not None
+            and refund_delta != 0
+        ):
+            settled = self._store.get_receipt_by_computation(
+                current_computation.computation_id
+            )
+            if settled is not None:
+                amount = money(abs(refund_delta))
+                tier = approval_tier(self._pack, amount)
+                if refund_delta < 0:
+                    kind = "recovery_due"
+                    reason = (
+                        f"grading re-priced the refund from ${current_computation.refund_total} "
+                        f"to ${new_computation.refund_total}: the customer was over-refunded "
+                        f"by ${amount} under the declared condition {declared!r}; the graded "
+                        f"condition is {graded_condition!r}"
+                    )
+                    note = (
+                        f"collecting this recovery requires its own approval (tier {tier} "
+                        f"on ${amount} under policy pack {self._pack.version}); no clawback "
+                        "execution exists in this build — the position stands as a recorded "
+                        "receivable until a gated collection act is built"
+                    )
+                else:
+                    kind = "top_up_due"
+                    reason = (
+                        f"grading re-priced the refund from ${current_computation.refund_total} "
+                        f"to ${new_computation.refund_total}: the customer was under-refunded "
+                        f"by ${amount} under the declared condition {declared!r}; the graded "
+                        f"condition is {graded_condition!r}"
+                    )
+                    note = (
+                        "the top-up settles only through execute_top_up: approvals "
+                        f"re-checked against the new computation (its total falls under "
+                        f"tier {approval_tier(self._pack, new_computation.refund_total)}), "
+                        "the fraud guard consulted, and the idempotency key taken in the "
+                        "topup: key domain"
+                    )
+                adj_blob = json.dumps(
+                    {"report_id": report_id, "kind": kind, "amount": str(amount)},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                adjustment = RefundAdjustment(
+                    adjustment_id="ADJ-" + hashlib.sha256(adj_blob.encode()).hexdigest()[:16],
+                    case_id=case_id,
+                    kind=kind,
+                    amount=amount,
+                    reason=reason,
+                    from_computation_id=current_computation.computation_id,
+                    to_computation_id=new_computation.computation_id,
+                    source_receipt_id=settled["receipt_id"],
+                    grading_report_id=report_id,
+                    approval_tier=tier,
+                    approval_note=note,
+                    status="open",
+                    created_on=graded_on,
+                )
+
+        # -- step 4 (in memory): the re-issued, verified summary -------
+        summary_text: str | None = None
+        if new_computation is not None:
+            product_name = product.name if product else case.request.sku
+            active_label = self.get_active_label(case_id)
+            label_composer = getattr(self._model, "compose_label_summary", None)
+            refund_composer = getattr(self._model, "compose_refund_summary", None)
+            if active_label is not None and label_composer is not None:
+                summary_text = label_composer(
+                    decision, product_name, new_computation, active_label
+                )
+                violations = verify_summary(
+                    summary_text, decision, new_computation, active_label
+                )
+            elif refund_composer is not None:
+                summary_text = refund_composer(decision, product_name, new_computation)
+                violations = verify_summary(summary_text, decision, new_computation)
+            else:
+                summary_text = self._model.compose_summary(decision, product_name)
+                violations = verify_summary(summary_text, decision, new_computation)
+            if violations:
+                raise FigureVerificationError(violations)
+
+        # -- the fraud trigger (step 5's decision, on the record) -------
+        rank_jump = CONDITION_RANKS[graded_condition] - CONDITION_RANKS.get(declared, 0)
+        rescore_triggered = bool(rank_jump >= WILDLY_WORSE_JUMP and wear_evidence)
+
+        report = GradingReport(
+            report_id=report_id,
+            case_id=case_id,
+            label_id=receipt.label_id,
+            warehouse_receipt_id=receipt.warehouse_receipt_id,
+            grader=grader,
+            graded_on=graded_on,
+            declared_condition=declared,
+            graded_condition=graded_condition,
+            functional_test_result=functional_test_result,
+            data_wipe_status=data_wipe_status,
+            damage_notes=damage_notes,
+            received_weight_grams=received_weight_grams,
+            wear_evidence=wear_evidence,
+            grading_pack_version=GRADING_PACK_VERSION,
+            superseded_disposition_id=(
+                current_disposition.disposition_id
+                if new_disposition is not None and current_disposition is not None
+                else None
+            ),
+            new_disposition_id=new_disposition.disposition_id if new_disposition else None,
+            superseded_computation_id=(
+                current_computation.computation_id if new_computation is not None else None
+            ),
+            new_computation_id=new_computation.computation_id if new_computation else None,
+            refund_delta=refund_delta,
+            adjustment_id=adjustment.adjustment_id if adjustment else None,
+            fraud_rescore_triggered=rescore_triggered,
+        )
+
+        # -- persist: new artefacts only; the superseded ones stand ----
+        if new_disposition is not None:
+            self._store.put_disposition(new_disposition.model_dump(mode="json"))
+        if new_computation is not None:
+            self._store.put_computation(new_computation.model_dump(mode="json"))
+        if adjustment is not None:
+            self._store.put_adjustment(adjustment.model_dump(mode="json"))
+        self._store.put_grading_report(report.model_dump(mode="json"))
+
+        # -- step 5: the fraud re-score, through the R4 machinery ------
+        if rescore_triggered:
+            score = self.rescore_case(case_id)
+            if score is not None:
+                report.new_fraud_score_id = score.score_id
+                self._store.put_grading_report(report.model_dump(mode="json"))
+
+        # -- the case record follows its current artefacts --------------
+        fresh = self.get_case(case_id)
+        if fresh is not None:
+            if new_computation is not None:
+                fresh.computation = new_computation
+            if new_disposition is not None:
+                fresh.disposition = new_disposition
+            if summary_text is not None:
+                fresh.summary = summary_text
+                fresh.status = "summary_ready"
+            self._store.put_case(fresh.model_dump(mode="json"))
+            if summary_text is not None:
+                self._store.put_summary(
+                    case_id,
+                    verified=True,
+                    payload={
+                        "case_id": case_id,
+                        "text": summary_text,
+                        "violations": [],
+                        "profile": self._model.profile_name,
+                    },
+                )
+        return report
+
+    # -- the top-up execution (R7) --------------------------------------------
+    def execute_top_up(
+        self, case_id: str, *, idempotency_key: str, as_of: date
+    ) -> RefundReceipt:
+        """Settle an open `top_up_due` adjustment — the only money a
+        graded case may still move, and only through the R5 gates.
+
+        The key lives in the top-up domain: the caller's key is
+        stored as `topup:<key>`, so it can never collide with (or
+        replay) the original refund's execution. Preconditions, each
+        refusal naming the gap: an open top_up_due adjustment of
+        record; the fraud path open (the R4 guard); the adjustment's
+        computation still the case's current one and final; and the
+        approval gate RE-CHECKED against that new computation —
+        approvals pinned to the superseded computation do not count,
+        because they approved a different amount. A provider failure
+        records a failed execution and leaves the adjustment open.
+        """
+        key = (idempotency_key or "").strip()
+        if not key:
+            raise PaymentsError("an idempotency key is mandatory on every refund execution")
+        namespaced = f"topup:{key}"
+        case = self.get_case(case_id)
+        if case is None:
+            raise LookupError(f"unknown case: {case_id}")
+
+        replayed = self._store.get_receipt_by_key(namespaced)
+        if replayed is not None:
+            receipt = RefundReceipt.model_validate(replayed)
+            if receipt.case_id != case_id:
+                raise PaymentsError(
+                    f"idempotency key {namespaced!r} was already used for case "
+                    f"{receipt.case_id}; a key names one execution"
+                )
+            return receipt
+
+        adjustments = self.list_adjustments(case_id)
+        top_ups = [a for a in adjustments if a.kind == "top_up_due"]
+        adjustment = next((a for a in top_ups if a.status == "open"), None)
+        if adjustment is None:
+            settled = next((a for a in top_ups if a.status == "executed"), None)
+            if settled is not None:
+                raise DuplicateRefundError(
+                    f"duplicate_refund: the top-up for case {case_id} already executed "
+                    f"(receipt {settled.top_up_receipt_id}); a second top-up is refused"
+                )
+            raise PaymentsError(
+                f"case {case_id} has no open top-up adjustment; a top-up settles a "
+                "grading adjustment of record, and there is none to settle"
+            )
+        self.assert_refund_path_open(case_id)
+        computation = self.get_computation(case_id)
+        if computation is None or computation.computation_id != adjustment.to_computation_id:
+            raise PaymentsError(
+                f"the adjustment settles computation {adjustment.to_computation_id}, "
+                "which is no longer the case's current computation; the position must "
+                "be re-stated before it can settle"
+            )
+        if not computation.is_final or computation.refund_total is None:
+            raise PaymentsError(
+                "the graded computation is not final (a component is not computable); "
+                "a top-up cannot settle against a partial computation"
+            )
+        status = self.approval_status(case_id)
+        if not status["satisfied"]:
+            raise ApprovalError(
+                f"approval gate unmet for the top-up against computation "
+                f"{computation.computation_id}: {status['missing']}"
+            )
+
+        stored_execution = self._store.get_execution_by_key(namespaced)
+        if stored_execution is not None:
+            execution = RefundExecution.model_validate(stored_execution)
+            if execution.case_id != case_id or execution.computation_id != computation.computation_id:
+                raise PaymentsError(
+                    f"idempotency key {namespaced!r} already names an execution for case "
+                    f"{execution.case_id} / computation {execution.computation_id}"
+                )
+        else:
+            blob = json.dumps(
+                {
+                    "case_id": case_id,
+                    "computation_id": computation.computation_id,
+                    "idempotency_key": namespaced,
+                    "adjustment_id": adjustment.adjustment_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            execution = RefundExecution(
+                execution_id="RX-" + hashlib.sha256(blob.encode()).hexdigest()[:16],
+                case_id=case_id,
+                computation_id=computation.computation_id,
+                idempotency_key=namespaced,
+                amount=adjustment.amount,
+                provider=self._payments.provider_name,
+                status="requested",
+                transitions=[
+                    ExecutionTransition(
+                        state="requested", at=as_of, detail="top-up execution requested"
+                    )
+                ],
+            )
+        execution.status = "executing"
+        execution.failure_reason = None
+        execution.transitions.append(
+            ExecutionTransition(state="executing", at=as_of, detail="payments port called")
+        )
+        self._store.put_execution(execution.model_dump(mode="json"))
+
+        # The top-up's tender allocation: what each tender is still
+        # owed — the new computation's allocation less what the
+        # original receipt already paid that tender. Orders without
+        # tender data allocate nothing, exactly as their computations
+        # state.
+        allocations: list[TenderAllocation] = []
+        settled_payload = self._store.get_receipt_by_computation(
+            adjustment.from_computation_id
+        )
+        if settled_payload is not None:
+            settled_receipt = RefundReceipt.model_validate(settled_payload)
+            paid = {a.method: a.amount for a in settled_receipt.tender_allocations}
+            for alloc in computation.tender_allocations:
+                remaining = money(alloc.amount - paid.get(alloc.method, Decimal("0.00")))
+                if remaining > 0:
+                    allocations.append(
+                        TenderAllocation(method=alloc.method, amount=remaining)
+                    )
+
+        try:
+            provider_receipt = self._payments.execute_refund(
+                case_id=case_id,
+                computation_id=computation.computation_id,
+                amount=adjustment.amount,
+                tender_allocations=allocations,
+                idempotency_key=namespaced,
+            )
+        except PaymentsProviderError as exc:
+            execution.status = "failed"
+            execution.failure_reason = str(exc)
+            execution.transitions.append(
+                ExecutionTransition(state="failed", at=as_of, detail=str(exc))
+            )
+            self._store.put_execution(execution.model_dump(mode="json"))
+            raise PaymentsError(
+                f"payments provider failed for case {case_id}: {exc} "
+                "No receipt was written; the top-up adjustment stays open."
+            ) from exc
+
+        blob = json.dumps(
+            {
+                "case_id": case_id,
+                "computation_id": computation.computation_id,
+                "idempotency_key": namespaced,
+                "provider_ref": provider_receipt.provider_ref,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        receipt = RefundReceipt(
+            receipt_id="PR-" + hashlib.sha256(blob.encode()).hexdigest()[:16],
+            case_id=case_id,
+            computation_id=computation.computation_id,
+            execution_id=execution.execution_id,
+            idempotency_key=namespaced,
+            provider=provider_receipt.provider,
+            provider_ref=provider_receipt.provider_ref,
+            amount=adjustment.amount,
+            tender_allocations=allocations,
+            status="executed",
+            executed_on=as_of,
+        )
+        self._store.put_receipt(receipt.model_dump(mode="json"))
+        execution.status = "executed"
+        execution.receipt_id = receipt.receipt_id
+        execution.transitions.append(
+            ExecutionTransition(
+                state="executed", at=as_of, detail=f"receipt {receipt.receipt_id}"
+            )
+        )
+        self._store.put_execution(execution.model_dump(mode="json"))
+        adjustment.status = "executed"
+        adjustment.top_up_execution_id = execution.execution_id
+        adjustment.top_up_receipt_id = receipt.receipt_id
+        adjustment.idempotency_key = namespaced
+        self._store.put_adjustment(adjustment.model_dump(mode="json"))
+        return receipt
 
     # -- reads ---------------------------------------------------------------
     def get_case(self, case_id: str) -> ReturnCase | None:

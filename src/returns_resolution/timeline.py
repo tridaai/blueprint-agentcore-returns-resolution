@@ -1,13 +1,14 @@
 """The case timeline — a derived view, never stored prose (R6).
 
 Assembled in code at read time from the artefacts of record: the
-intake request, the eligibility decision, the refund computation,
-the disposition, the fraud score chain and its review decisions,
-approvals, refund executions and the receipt, labels and their
-voids, pickups, and the carrier events read back through the
-carrier port. Every entry carries the recorded date of its
-artefact and the artefact's own id, so a reader can walk from any
-line of the timeline to the record it summarises.
+intake request, the eligibility decision, the refund computation
+chain, the disposition chain, the fraud score chain and its review
+decisions, approvals, refund executions and the receipt, labels
+and their voids, pickups, the carrier events read back through the
+carrier port, and — from R7 — warehouse receipts, grading reports
+and refund adjustments. Every entry carries the recorded date of
+its artefact and the artefact's own id, so a reader can walk from
+any line of the timeline to the record it summarises.
 
 Gaps are first-class: an artefact type the case's state expects
 but the record lacks is NAMED in `gaps` — a refund executed with
@@ -27,8 +28,10 @@ from .models import (
     DispositionDecision,
     FraudReviewDecision,
     FraudScore,
+    GradingReport,
     LabelVoid,
     PickupBooking,
+    RefundAdjustment,
     RefundApproval,
     RefundComputation,
     RefundExecution,
@@ -37,6 +40,7 @@ from .models import (
     ReturnLabel,
     TimelineEntry,
     TimelineGap,
+    WarehouseReceipt,
 )
 
 # Same-day ordering follows the workflow: what was decided first
@@ -53,9 +57,12 @@ _STAGE_RANK = {
     "label_void": 75,
     "pickup": 80,
     "carrier_event": 85,
+    "warehouse_receipt": 87,
+    "grading": 88,
     "approval": 90,
     "refund_execution": 100,
     "receipt": 110,
+    "adjustment": 115,
 }
 
 
@@ -73,8 +80,25 @@ def build_timeline(
     voids: list[LabelVoid],
     pickups: list[PickupBooking],
     events_by_label: dict[str, list[CarrierEvent]],
+    computation_chain: list[RefundComputation] | None = None,
+    disposition_chain: list[DispositionDecision] | None = None,
+    warehouse_receipts: list[WarehouseReceipt] | None = None,
+    grading_reports: list[GradingReport] | None = None,
+    adjustments: list[RefundAdjustment] | None = None,
     as_of: date,
 ) -> CaseTimeline:
+    computation_chain = computation_chain or ([computation] if computation is not None else [])
+    disposition_chain = disposition_chain or ([disposition] if disposition is not None else [])
+    warehouse_receipts = warehouse_receipts or []
+    grading_reports = grading_reports or []
+    adjustments = adjustments or []
+    # A graded artefact's recorded date is the grading act's date —
+    # the report names the artefacts it created.
+    graded_dates: dict[str, date] = {}
+    for report in grading_reports:
+        for artefact_id in (report.new_computation_id, report.new_disposition_id):
+            if artefact_id is not None:
+                graded_dates[artefact_id] = report.graded_on
     staged: list[tuple[date, int, int, TimelineEntry]] = []
     seq = 0
 
@@ -105,25 +129,48 @@ def build_timeline(
             f"{decision.policy_pack_version}; clauses: {clauses}",
         )
 
-    if computation is not None:
-        if not computation.eligible:
+    for chain_computation in computation_chain:
+        if not chain_computation.eligible:
             detail = "refund computation of record: no refund due (eligibility denied), final $0.00"
-        elif computation.is_final:
-            detail = f"refund computed: ${computation.refund_total} final, under pack {computation.policy_pack_version}"
+        elif chain_computation.is_final:
+            detail = f"refund computed: ${chain_computation.refund_total} final, under pack {chain_computation.policy_pack_version}"
         else:
-            missing = ", ".join(c.missing_input for c in computation.not_computable)
+            missing = ", ".join(c.missing_input for c in chain_computation.not_computable)
             detail = f"refund computation NOT final — waiting on: {missing}"
-        add(decision.requested_on if decision else request.requested_on, "computation", computation.computation_id, detail)
+        if chain_computation.condition_basis == "graded":
+            detail += (
+                f" — graded re-run over condition {chain_computation.graded_condition}, "
+                f"superseding {chain_computation.supersedes}"
+            )
+        add(
+            graded_dates.get(
+                chain_computation.computation_id,
+                decision.requested_on if decision else request.requested_on,
+            ),
+            "computation",
+            chain_computation.computation_id,
+            detail,
+        )
 
-    if disposition is not None:
-        if disposition.status == "decided":
+    for chain_disposition in disposition_chain:
+        if chain_disposition.status == "decided":
             detail = (
-                f"disposition {disposition.disposition} via {disposition.channel} "
-                f"(cell {disposition.cell_id}, matrix {disposition.matrix_version}, basis: {disposition.basis})"
+                f"disposition {chain_disposition.disposition} via {chain_disposition.channel} "
+                f"(cell {chain_disposition.cell_id}, matrix {chain_disposition.matrix_version}, basis: {chain_disposition.basis})"
             )
         else:
-            detail = f"disposition NOT DECIDABLE — missing dimension: {disposition.missing_dimension}"
-        add(decision.requested_on if decision else request.requested_on, "disposition", disposition.disposition_id, detail)
+            detail = f"disposition NOT DECIDABLE — missing dimension: {chain_disposition.missing_dimension}"
+        if chain_disposition.basis == "graded":
+            detail += f" — graded condition {chain_disposition.graded_condition}, superseding {chain_disposition.supersedes}"
+        add(
+            graded_dates.get(
+                chain_disposition.disposition_id,
+                decision.requested_on if decision else request.requested_on,
+            ),
+            "disposition",
+            chain_disposition.disposition_id,
+            detail,
+        )
 
     score_dates = {s.score_id: s.as_of for s in fraud_scores}
     for score in fraud_scores:
@@ -175,6 +222,33 @@ def build_timeline(
                 event.event_id,
                 f"carrier event {event.kind} on label {label.carrier_ref}: {event.detail}",
             )
+
+    for wh_receipt in warehouse_receipts:
+        add(
+            wh_receipt.received_on,
+            "warehouse_receipt",
+            wh_receipt.warehouse_receipt_id,
+            f"parcel received into the warehouse by {wh_receipt.received_by} "
+            f"(label {wh_receipt.label_id})",
+        )
+    for report in grading_reports:
+        detail = (
+            f"warehouse grading by {report.grader}: declared {report.declared_condition} "
+            f"→ graded {report.graded_condition} (grading pack {report.grading_pack_version})"
+        )
+        if report.refund_delta is not None:
+            detail += f"; refund delta ${report.refund_delta}"
+        if report.new_disposition_id is not None:
+            detail += f"; disposition superseded by {report.new_disposition_id}"
+        add(report.graded_on, "grading", report.report_id, detail)
+    for adjustment in adjustments:
+        add(
+            adjustment.created_on,
+            "adjustment",
+            adjustment.adjustment_id,
+            f"refund adjustment {adjustment.kind}: ${adjustment.amount} {adjustment.status} "
+            f"— {adjustment.reason}",
+        )
 
     for approval in approvals:
         add(
@@ -249,6 +323,17 @@ def build_timeline(
                     detail=(
                         f"case is under fraud hold (state={case.fraud_state}) and no named "
                         "fraud-review decision is on record — the block waits on that act"
+                    ),
+                )
+            )
+        if warehouse_receipts and not grading_reports:
+            gaps.append(
+                TimelineGap(
+                    kind="warehouse_grading",
+                    detail=(
+                        "the parcel is received into the warehouse but no grading report "
+                        "is on record — the disposition and the refund still rest on the "
+                        "customer's declared condition"
                     ),
                 )
             )
