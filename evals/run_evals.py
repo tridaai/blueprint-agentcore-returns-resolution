@@ -1,4 +1,4 @@
-"""Eval gate for Blueprint #18 (R1 + R2 + R3 + R4).
+"""Eval gate for Blueprint #18 (R1 + R2 + R3 + R4 + R5).
 
 Zero-tolerance counters against planted truth:
 - eligibility_outcome_mismatches: decisions that differ from the
@@ -48,6 +48,24 @@ Zero-tolerance counters against planted truth:
 - fraud_lifted_without_decision: a blocked case found unblocked
   (or carrying a review artefact) after the bypass probes, before
   any legitimate decision act.
+- double_refunds: a computation whose money moved more than once —
+  same-key retries must replay the original receipt (provider
+  movement count stays 1), and a different key on an executed
+  computation must be refused as duplicate_refund.
+- unapproved_executions: executions that landed without the
+  approval tier satisfied — the planted ladder walks auto (no
+  acts), single (one approver) and dual (two DIFFERENT approvers;
+  a same-person second act is refused at record time).
+- stale_computation_approvals_accepted: approval acts pinning a
+  computation other than the case's current one, or stored
+  approvals pinned to a superseded/forged computation id that the
+  gates counted toward satisfaction.
+- fraud_blocked_executions: approval or execution acts on the
+  FRAUD_REVIEW case (CASE-3008) that were not refused by the R4
+  guard before its named review decision.
+- failed_execution_partial_receipts: receipts (or money movements)
+  left behind by an injected provider failure; the failed case
+  must stay executable and land exactly one receipt on retry.
 
 Prints the counters and GATE: PASS/FAIL; exit code follows.
 """
@@ -63,12 +81,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from returns_resolution.intake import FRAUD_FEED_REQUESTS, PLANTED_REQUESTS
 from returns_resolution.modelport import OfflineComposer
-from returns_resolution.models import ReturnRequest
+from returns_resolution.models import RefundApproval, ReturnRequest
+from returns_resolution.payments import LocalPaymentsDouble
 from returns_resolution.service import (
+    ApprovalError,
     CaseService,
+    DuplicateRefundError,
     FigureVerificationError,
     FraudHoldError,
     FraudReviewError,
+    PaymentsError,
 )
 from returns_resolution.store import InMemoryStore
 from returns_resolution.verifier import verify_summary
@@ -120,6 +142,11 @@ def main() -> int:
         "fraud_block_bypasses": 0,
         "fraud_score_irreproducibility": 0,
         "fraud_lifted_without_decision": 0,
+        "double_refunds": 0,
+        "unapproved_executions": 0,
+        "stale_computation_approvals_accepted": 0,
+        "fraud_blocked_executions": 0,
+        "failed_execution_partial_receipts": 0,
     }
 
     service = CaseService(InMemoryStore(), OfflineComposer())
@@ -483,6 +510,143 @@ def main() -> int:
         counters["fraud_block_bypasses"] += 1
     except FraudReviewError:
         pass
+
+    # --- R5: approval gates + the idempotent payments port -------------
+    # The planted ladder against the pack caps (auto $50 / dual $150):
+    # CASE-2006 $29.05 auto, CASE-2003 $130.50 single, CASE-2001
+    # $189.00 dual. The double counts actual money movements, so a
+    # double refund is a count, not an opinion.
+    DAY5 = date(2026, 10, 27)
+    double = LocalPaymentsDouble()
+    money = CaseService(InMemoryStore(), OfflineComposer(), payments_port=double)
+    money.seed_orders()
+    for request in PLANTED_REQUESTS:
+        money.ingest(request)
+
+    # Auto tier: executes with no approval acts at all.
+    r2006 = money.execute_refund("CASE-2006", idempotency_key="eval-2006", as_of=DAY5)
+    if r2006.amount != Decimal("29.05") or double.movement_count != 1:
+        counters["unapproved_executions"] += 1
+    # Same key retried: the original receipt replays, money unmoved.
+    replay = money.execute_refund("CASE-2006", idempotency_key="eval-2006", as_of=DAY5)
+    if replay.receipt_id != r2006.receipt_id or double.movement_count != 1:
+        counters["double_refunds"] += 1
+    # A different key on the executed computation: duplicate_refund.
+    try:
+        money.execute_refund("CASE-2006", idempotency_key="eval-2006-again", as_of=DAY5)
+        counters["double_refunds"] += 1  # a second refund landed
+    except DuplicateRefundError:
+        pass
+    if double.movement_count != 1 or len(money.list_receipts()) != 1:
+        counters["double_refunds"] += 1
+
+    # Single tier: refused with no approver, lands with one.
+    try:
+        money.execute_refund("CASE-2003", idempotency_key="eval-2003", as_of=DAY5)
+        counters["unapproved_executions"] += 1
+    except ApprovalError:
+        pass
+    money.record_approval("CASE-2003", approver="d.okafor", role="returns_lead", as_of=DAY5)
+    r2003 = money.execute_refund("CASE-2003", idempotency_key="eval-2003", as_of=DAY5)
+    if r2003.amount != Decimal("130.50"):
+        counters["unapproved_executions"] += 1
+
+    # Dual tier: one approver is not enough, the same person twice is
+    # refused at record time, two different approvers land it.
+    money.record_approval("CASE-2001", approver="d.okafor", role="returns_lead", as_of=DAY5)
+    try:
+        money.execute_refund("CASE-2001", idempotency_key="eval-2001", as_of=DAY5)
+        counters["unapproved_executions"] += 1
+    except ApprovalError:
+        pass
+    try:
+        money.record_approval("CASE-2001", approver="d.okafor", role="finance_manager", as_of=DAY5)
+        counters["unapproved_executions"] += 1  # same-person second act accepted
+    except ApprovalError:
+        pass
+    money.record_approval("CASE-2001", approver="m.osei", role="finance_manager", as_of=DAY5)
+    r2001 = money.execute_refund("CASE-2001", idempotency_key="eval-2001", as_of=DAY5)
+    if r2001.amount != Decimal("189.00"):
+        counters["unapproved_executions"] += 1
+
+    # Stale pins: an act naming a non-current computation is refused,
+    # and a stored approval pinned to a forged computation id does
+    # not count toward the gate.
+    case2003 = money.get_case("CASE-2003")
+    try:
+        money.record_approval(
+            "CASE-2003", approver="m.osei", role="finance_manager", as_of=DAY5,
+            computation_id="RC-not-the-current-one",
+        )
+        counters["stale_computation_approvals_accepted"] += 1
+    except ApprovalError:
+        pass
+    forged = RefundApproval(
+        approval_id="RA-evalforged0000", case_id="CASE-2003",
+        computation_id="RC-not-the-current-one", approver="x.y",
+        role="finance_manager", as_of=DAY5, amount=Decimal("130.50"),
+        tier="single", policy_pack_version=case2003.computation.policy_pack_version,
+    )
+    money._store.put_approval(forged.model_dump(mode="json"))
+    if money.approval_status("CASE-2003")["approvers"] != ["d.okafor"]:
+        counters["stale_computation_approvals_accepted"] += 1
+
+    # Fraud-blocked: CASE-3008 (fresh service, history loaded, the
+    # FRAUD_REVIEW case from R4) refuses approval AND execution
+    # through the R4 guard; after the named clearance it executes
+    # through the ordinary gates.
+    blocked_double = LocalPaymentsDouble()
+    blocked = CaseService(InMemoryStore(), OfflineComposer(), payments_port=blocked_double)
+    blocked.seed_orders()
+    blocked.seed_history()
+    blocked.ingest(FRAUD_FEED_REQUESTS[0])
+    try:
+        blocked.record_approval("CASE-3008", approver="d.okafor", role="returns_lead", as_of=DAY5)
+        counters["fraud_blocked_executions"] += 1
+    except FraudHoldError:
+        pass
+    try:
+        blocked.execute_refund("CASE-3008", idempotency_key="eval-3008", as_of=DAY5)
+        counters["fraud_blocked_executions"] += 1
+    except FraudHoldError:
+        pass
+    if blocked_double.movement_count != 0 or blocked.list_receipts():
+        counters["fraud_blocked_executions"] += 1
+    blocked.record_fraud_review(
+        "CASE-3008", reviewer="r.alvarez", outcome="cleared_with_reason",
+        reason_code="legitimate_pattern_explained",
+    )
+    blocked.record_approval("CASE-3008", approver="d.okafor", role="returns_lead", as_of=DAY5)
+    r3008 = blocked.execute_refund("CASE-3008", idempotency_key="eval-3008", as_of=DAY5)
+    if r3008.amount != Decimal("116.00") or blocked_double.movement_count != 1:
+        counters["fraud_blocked_executions"] += 1
+
+    # Failure path: an injected mid-execution failure leaves no
+    # receipt and no movement; the retry lands exactly one of each,
+    # and the execution record carries the whole trail.
+    flaky_double = LocalPaymentsDouble(fail_times={"eval-flaky": 1})
+    flaky = CaseService(InMemoryStore(), OfflineComposer(), payments_port=flaky_double)
+    flaky.seed_orders()
+    for request in PLANTED_REQUESTS:
+        flaky.ingest(request)
+    try:
+        flaky.execute_refund("CASE-2006", idempotency_key="eval-flaky", as_of=DAY5)
+        counters["failed_execution_partial_receipts"] += 1  # the failure did not raise
+    except PaymentsError:
+        pass
+    if flaky.get_receipt("CASE-2006") is not None or flaky.list_receipts():
+        counters["failed_execution_partial_receipts"] += 1
+    if flaky_double.movement_count != 0:
+        counters["failed_execution_partial_receipts"] += 1
+    failed_execution = flaky.get_execution_by_key("eval-flaky")
+    if failed_execution is None or failed_execution.status != "failed" or failed_execution.receipt_id is not None:
+        counters["failed_execution_partial_receipts"] += 1
+    landed = flaky.execute_refund("CASE-2006", idempotency_key="eval-flaky", as_of=DAY5)
+    if landed.amount != Decimal("29.05") or flaky_double.movement_count != 1 or len(flaky.list_receipts()) != 1:
+        counters["failed_execution_partial_receipts"] += 1
+    trail = [t.state for t in flaky.get_execution_by_key("eval-flaky").transitions]
+    if trail != ["requested", "executing", "failed", "executing", "executed"]:
+        counters["failed_execution_partial_receipts"] += 1
 
     for name, value in counters.items():
         print(f"{name}: {value} (required 0)")
