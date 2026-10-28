@@ -108,6 +108,11 @@ class ReturnRequest(BaseModel):
     condition_declared: str
     requested_on: date
     channel: str = "web"
+    # The carrier drop-off scan weight in grams, when the return was
+    # scanned at intake (R4). Absent means nobody weighed the parcel —
+    # the fraud engine then reports its weight signal as not
+    # computable and names this input, rather than assuming a weight.
+    returned_weight_grams: int | None = None
 
 
 class ClauseHit(BaseModel):
@@ -284,6 +289,74 @@ class DispositionDecision(BaseModel):
     supersedes: str | None = None
 
 
+class SignalResult(BaseModel):
+    """One fraud signal's verdict (R4), with its inputs on the record.
+
+    `status` is "computed" when the signal was measured; a signal
+    whose evidence base is too thin is "insufficient_data" and one
+    whose input is simply absent is "not_computable" — both name the
+    situation in `missing_input` and contribute exactly zero, stated,
+    never a silent assumption dressed as a measurement.
+    """
+
+    signal_id: str
+    status: str  # computed | insufficient_data | not_computable
+    raw_value: str | None = None
+    contribution: Decimal = Decimal("0")
+    inputs: dict[str, str] = {}
+    missing_input: str | None = None
+    rule: str = ""
+
+    @field_validator("contribution", mode="before")
+    @classmethod
+    def _decimal(cls, v: object) -> Decimal:
+        return Decimal(str(v)).quantize(Decimal("0.01"))
+
+
+class FraudScore(BaseModel):
+    """A case's fraud score (R4) — a content-addressed artefact.
+
+    Pinned to the case, the scoring pack version and the exact input
+    artefacts it was computed from (the customer's stored orders and
+    stored cases, by id, with a fingerprint over their contents and
+    the pack). A re-score after new evidence is a NEW artefact whose
+    `supersedes` names the score it replaces — scores are never
+    edited, so a block can never be lifted by rewriting history.
+    """
+
+    score_id: str
+    case_id: str
+    customer_id: str
+    pack_version: str
+    inputs_fingerprint: str
+    input_case_ids: list[str] = []
+    input_order_ids: list[str] = []
+    signals: list[SignalResult] = []
+    total_score: Decimal = Decimal("0")
+    band: str  # CLEAR | MONITOR | FRAUD_REVIEW
+    as_of: date
+    supersedes: str | None = None
+
+    @field_validator("total_score", mode="before")
+    @classmethod
+    def _decimal(cls, v: object) -> Decimal:
+        return Decimal(str(v)).quantize(Decimal("0.01"))
+
+
+class FraudReviewDecision(BaseModel):
+    """The named fraud-review act (R4) — the ONLY way a FRAUD_REVIEW
+    block is lifted or confirmed. It decides on one pinned score
+    artefact; the score itself is never touched by the decision."""
+
+    review_id: str
+    case_id: str
+    score_id: str
+    reviewer: str
+    outcome: str  # confirmed_fraud | cleared_with_reason
+    reason_code: str
+    pack_version: str
+
+
 class ReturnCase(BaseModel):
     case_id: str
     request: ReturnRequest
@@ -294,3 +367,10 @@ class ReturnCase(BaseModel):
     computation: RefundComputation | None = None
     disposition: DispositionDecision | None = None
     summary: str | None = None
+    # Fraud scoring (R4). `fraud_state` is derived from the current
+    # score's band plus any review decisions of record:
+    # clear | monitor | fraud_review (blocked) | fraud_confirmed
+    # (blocked, sticky) | fraud_cleared (block lifted by decision).
+    fraud_score: FraudScore | None = None
+    fraud_review: FraudReviewDecision | None = None
+    fraud_state: str = "clear"
