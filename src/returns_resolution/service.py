@@ -1664,7 +1664,21 @@ class CaseService:
                         a.approver
                         for a in self._approvals_for(case_id, computation.computation_id)
                     }
-                    facts.approval_satisfied = len(approvers) >= APPROVERS_REQUIRED[tier]
+                    # Currency is part of the approval fact, exactly
+                    # as GP-PAYMENT-APPROVAL's reason states: the
+                    # approvals pinned to a SUPERSEDED computation
+                    # approved a different amount and do not satisfy
+                    # the gate for it once the case has moved on —
+                    # the named computation must be the case's
+                    # current one for its approvals to count here.
+                    current = self.get_computation(case_id)
+                    is_current = (
+                        current is not None
+                        and current.computation_id == computation.computation_id
+                    )
+                    facts.approval_satisfied = (
+                        is_current and len(approvers) >= APPROVERS_REQUIRED[tier]
+                    )
                 existing = self._store.get_receipt_by_computation(computation.computation_id)
                 facts.computation_executed = (
                     existing is not None
