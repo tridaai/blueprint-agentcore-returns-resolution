@@ -1155,6 +1155,18 @@ class CaseService:
         reviews = self._reviews_for(case_id)
         return reviews[-1] if reviews else None
 
+    def list_fraud_reviews(self, case_id: str) -> list[FraudReviewDecision]:
+        """Every fraud-review decision of record for the case, oldest first."""
+        return self._reviews_for(case_id)
+
+    def list_fraud_scores_for_case(self, case_id: str) -> list[FraudScore]:
+        """The case's fraud-score chain, oldest first (R7-style link order)."""
+        payloads = self._store.list_fraud_scores(case_id)
+        return [
+            FraudScore.model_validate(p)
+            for p in _chain_order(payloads, "score_id")
+        ]
+
     # -- refund approvals (R5) ----------------------------------------------
     def list_approvals(self, case_id: str) -> list[RefundApproval]:
         """Every approval act of record for the case, oldest first —
@@ -1712,6 +1724,13 @@ class CaseService:
     def list_tool_calls(self, case_id: str) -> list[ToolCallRecord]:
         calls = [ToolCallRecord.model_validate(p) for p in self._store.list_tool_calls(case_id)]
         return sorted(calls, key=lambda c: (c.called_on, c.call_id))
+
+    def list_all_tool_calls(self) -> list[ToolCallRecord]:
+        """The whole gateway invocation log, in recorded order."""
+        calls: list[ToolCallRecord] = []
+        for case in self.list_cases():
+            calls.extend(self.list_tool_calls(case.case_id))
+        return sorted(calls, key=lambda c: (c.called_on, c.case_id, c.call_id))
 
     # -- label reads ---------------------------------------------------------
     def list_labels(self, case_id: str) -> list[ReturnLabel]:
@@ -2297,6 +2316,13 @@ class CaseService:
             RefundAdjustment.model_validate(p) for p in self._store.list_adjustments(case_id)
         ]
         return sorted(adjustments, key=lambda a: (a.created_on, a.adjustment_id))
+
+    def list_all_adjustments(self) -> list[RefundAdjustment]:
+        """Every refund adjustment of record, in recorded order."""
+        adjustments: list[RefundAdjustment] = []
+        for case in self.list_cases():
+            adjustments.extend(self.list_adjustments(case.case_id))
+        return sorted(adjustments, key=lambda a: (a.created_on, a.case_id, a.adjustment_id))
 
     def get_adjustment(self, adjustment_id: str) -> RefundAdjustment | None:
         payload = self._store.get_adjustment(adjustment_id)
