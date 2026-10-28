@@ -404,9 +404,9 @@ def test_runtime_parity_for_hiding_acts_and_the_denial_log():
 # -- the denial log itself --------------------------------------------------------
 
 def test_denial_log_is_insert_only_and_migration_0012_is_last():
-    assert MIGRATIONS[-2][0] == "0012"
+    assert MIGRATIONS[-3][0] == "0012"
     store = InMemoryStore()
-    assert store.migrate()[-2] == "0012"
+    assert store.migrate()[-3] == "0012"
     service = _service(store)
     customer = _customer(service)
     with pytest.raises(AccessDeniedError):

@@ -261,6 +261,9 @@ def test_money_summary_matches_the_console_arithmetic():
         "executed_top_ups": "4.50",
         "recoveries_outstanding": "14.50",
         "top_ups_outstanding": "0.00",
+        # R18's fifth line: no claims stand on this fixture, and
+        # the four customer totals above are exactly R17's.
+        "carrier_claims_settled": "0.00",
     }
     rows = build_console_data(service)["money"]
     top_up_ids = {a["top_up_receipt_id"] for a in rows["adjustments"] if a["top_up_receipt_id"]}
