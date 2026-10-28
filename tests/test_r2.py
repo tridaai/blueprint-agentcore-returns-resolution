@@ -248,7 +248,7 @@ def test_a_refund_figure_the_computation_did_not_produce_is_rejected():
 def test_computation_persists_through_the_sql_store(tmp_path):
     path = tmp_path / "returns.db"
     store = SqlStore(sqlite_path=path)
-    assert store.migrate() == ["0001", "0002", "0003", "0004", "0005", "0006"]
+    assert store.migrate() == ["0001", "0002", "0003", "0004", "0005", "0006", "0007"]
     assert store.migrate() == []
     service = CaseService(store, OfflineComposer())
     service.seed_orders()
