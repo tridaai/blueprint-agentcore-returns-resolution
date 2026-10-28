@@ -335,6 +335,40 @@ CREATE TABLE IF NOT EXISTS management_reports (
 );
 """
 
+# Migration 0014 — carrier exceptions and claims (R18): the
+# exception artefacts raised from the carrier event record, the
+# handling acts on them, the claim artefacts assembled from the
+# record, and the claim lifecycle acts. All four tables are
+# insert-only (conflict-ignore on the id): an exception, an act
+# and a claim are history, never state to rewrite — states are
+# folded from the acts at read time. The payloads are the whole
+# artefacts (JSON text in both dialects); the columns are the
+# read paths (per case, per exception, per claim).
+_MIGRATION_0014_SQLITE = """
+CREATE TABLE IF NOT EXISTS carrier_exceptions (
+    exception_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS carrier_exception_acts (
+    act_id TEXT PRIMARY KEY,
+    exception_id TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS carrier_claims (
+    claim_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS carrier_claim_acts (
+    act_id TEXT PRIMARY KEY,
+    claim_id TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("0001", _MIGRATION_0001_SQLITE, _MIGRATION_0001_PG),
     ("0002", _MIGRATION_0002_SQLITE, _MIGRATION_0002_SQLITE),
@@ -349,6 +383,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("0011", _MIGRATION_0011_SQLITE, _MIGRATION_0011_SQLITE),
     ("0012", _MIGRATION_0012_SQLITE, _MIGRATION_0012_SQLITE),
     ("0013", _MIGRATION_0013_SQLITE, _MIGRATION_0013_SQLITE),
+    ("0014", _MIGRATION_0014_SQLITE, _MIGRATION_0014_SQLITE),
 ]
 
 
@@ -465,6 +500,21 @@ class Store(Protocol):
     def put_management_report(self, payload: dict[str, Any]) -> None: ...
     def get_management_report(self, report_id: str) -> dict[str, Any] | None: ...
     def list_management_reports(self) -> list[dict[str, Any]]: ...
+    # Carrier exceptions and claims (R18): insert-only artefacts
+    # and their insert-only acts; states fold from the acts.
+    def put_carrier_exception(self, payload: dict[str, Any]) -> None: ...
+    def get_carrier_exception(self, exception_id: str) -> dict[str, Any] | None: ...
+    def list_carrier_exceptions(self, case_id: str) -> list[dict[str, Any]]: ...
+    def list_all_carrier_exceptions(self) -> list[dict[str, Any]]: ...
+    def put_carrier_exception_act(self, payload: dict[str, Any]) -> None: ...
+    def list_carrier_exception_acts(self, exception_id: str) -> list[dict[str, Any]]: ...
+    def put_carrier_claim(self, payload: dict[str, Any]) -> None: ...
+    def get_carrier_claim(self, claim_id: str) -> dict[str, Any] | None: ...
+    def list_carrier_claims(self, case_id: str) -> list[dict[str, Any]]: ...
+    def list_all_carrier_claims(self) -> list[dict[str, Any]]: ...
+    def put_carrier_claim_act(self, payload: dict[str, Any]) -> None: ...
+    def list_carrier_claim_acts(self, claim_id: str) -> list[dict[str, Any]]: ...
+    def list_all_carrier_claim_acts(self) -> list[dict[str, Any]]: ...
 
 
 class SqlStore:
@@ -1401,6 +1451,102 @@ class SqlStore:
         entries = [json.loads(r["payload"]) for r in rows]
         return sorted(entries, key=lambda e: e["report_id"])
 
+    # -- carrier exceptions and claims (R18): insert-only ------------
+    def put_carrier_exception(self, payload: dict[str, Any]) -> None:
+        self._execute(
+            "INSERT INTO carrier_exceptions (exception_id, case_id, payload) "
+            "VALUES (?, ?, ?) ON CONFLICT (exception_id) DO NOTHING",
+            (payload["exception_id"], payload["case_id"], json.dumps(payload)),
+        )
+
+    def get_carrier_exception(self, exception_id: str) -> dict[str, Any] | None:
+        rows = self._query(
+            "SELECT payload FROM carrier_exceptions WHERE exception_id = ?",
+            (exception_id,),
+        )
+        return json.loads(rows[0]["payload"]) if rows else None
+
+    def list_carrier_exceptions(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM carrier_exceptions WHERE case_id = ?", (case_id,)
+        )
+        entries = [json.loads(r["payload"]) for r in rows]
+        return sorted(entries, key=lambda e: e["exception_id"])
+
+    def list_all_carrier_exceptions(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT payload FROM carrier_exceptions")
+        entries = [json.loads(r["payload"]) for r in rows]
+        return sorted(entries, key=lambda e: e["exception_id"])
+
+    def put_carrier_exception_act(self, payload: dict[str, Any]) -> None:
+        self._execute(
+            "INSERT INTO carrier_exception_acts (act_id, exception_id, case_id, payload) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (act_id) DO NOTHING",
+            (
+                payload["act_id"],
+                payload["exception_id"],
+                payload["case_id"],
+                json.dumps(payload),
+            ),
+        )
+
+    def list_carrier_exception_acts(self, exception_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM carrier_exception_acts WHERE exception_id = ?",
+            (exception_id,),
+        )
+        entries = [json.loads(r["payload"]) for r in rows]
+        return sorted(entries, key=lambda e: (e["acted_on"], e["act_id"]))
+
+    def put_carrier_claim(self, payload: dict[str, Any]) -> None:
+        self._execute(
+            "INSERT INTO carrier_claims (claim_id, case_id, payload) "
+            "VALUES (?, ?, ?) ON CONFLICT (claim_id) DO NOTHING",
+            (payload["claim_id"], payload["case_id"], json.dumps(payload)),
+        )
+
+    def get_carrier_claim(self, claim_id: str) -> dict[str, Any] | None:
+        rows = self._query(
+            "SELECT payload FROM carrier_claims WHERE claim_id = ?", (claim_id,)
+        )
+        return json.loads(rows[0]["payload"]) if rows else None
+
+    def list_carrier_claims(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM carrier_claims WHERE case_id = ?", (case_id,)
+        )
+        entries = [json.loads(r["payload"]) for r in rows]
+        return sorted(entries, key=lambda e: e["claim_id"])
+
+    def list_all_carrier_claims(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT payload FROM carrier_claims")
+        entries = [json.loads(r["payload"]) for r in rows]
+        return sorted(entries, key=lambda e: e["claim_id"])
+
+    def put_carrier_claim_act(self, payload: dict[str, Any]) -> None:
+        self._execute(
+            "INSERT INTO carrier_claim_acts (act_id, claim_id, case_id, payload) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (act_id) DO NOTHING",
+            (
+                payload["act_id"],
+                payload["claim_id"],
+                payload["case_id"],
+                json.dumps(payload),
+            ),
+        )
+
+    def list_carrier_claim_acts(self, claim_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM carrier_claim_acts WHERE claim_id = ?", (claim_id,)
+        )
+        entries = [json.loads(r["payload"]) for r in rows]
+        return sorted(entries, key=lambda e: (e["acted_on"], e["act_id"]))
+
+    def list_all_carrier_claim_acts(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT payload FROM carrier_claim_acts")
+        entries = [json.loads(r["payload"]) for r in rows]
+        return sorted(entries, key=lambda e: (e["acted_on"], e["act_id"]))
+
 
 class InMemoryStore:
     """Test double implementing the same port with dicts."""
@@ -1434,9 +1580,13 @@ class InMemoryStore:
         self._quarantine_acts: dict[str, dict] = {}
         self._access_denials: dict[str, dict] = {}
         self._management_reports: dict[str, dict] = {}
+        self._carrier_exceptions: dict[str, dict] = {}
+        self._carrier_exception_acts: dict[str, dict] = {}
+        self._carrier_claims: dict[str, dict] = {}
+        self._carrier_claim_acts: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
-        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013"]
+        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014"]
 
     def put_order(self, payload: dict[str, Any]) -> None:
         self._orders[payload["order_id"]] = payload
@@ -1837,3 +1987,58 @@ class InMemoryStore:
 
     def list_management_reports(self) -> list[dict[str, Any]]:
         return [self._management_reports[k] for k in sorted(self._management_reports)]
+
+    # -- carrier exceptions and claims (R18): insert-only ------------
+    def put_carrier_exception(self, payload: dict[str, Any]) -> None:
+        self._carrier_exceptions.setdefault(payload["exception_id"], payload)
+
+    def get_carrier_exception(self, exception_id: str) -> dict[str, Any] | None:
+        return self._carrier_exceptions.get(exception_id)
+
+    def list_carrier_exceptions(self, case_id: str) -> list[dict[str, Any]]:
+        entries = [
+            p for p in self._carrier_exceptions.values() if p["case_id"] == case_id
+        ]
+        return sorted(entries, key=lambda e: e["exception_id"])
+
+    def list_all_carrier_exceptions(self) -> list[dict[str, Any]]:
+        return [
+            self._carrier_exceptions[k] for k in sorted(self._carrier_exceptions)
+        ]
+
+    def put_carrier_exception_act(self, payload: dict[str, Any]) -> None:
+        self._carrier_exception_acts.setdefault(payload["act_id"], payload)
+
+    def list_carrier_exception_acts(self, exception_id: str) -> list[dict[str, Any]]:
+        entries = [
+            p
+            for p in self._carrier_exception_acts.values()
+            if p["exception_id"] == exception_id
+        ]
+        return sorted(entries, key=lambda e: (e["acted_on"], e["act_id"]))
+
+    def put_carrier_claim(self, payload: dict[str, Any]) -> None:
+        self._carrier_claims.setdefault(payload["claim_id"], payload)
+
+    def get_carrier_claim(self, claim_id: str) -> dict[str, Any] | None:
+        return self._carrier_claims.get(claim_id)
+
+    def list_carrier_claims(self, case_id: str) -> list[dict[str, Any]]:
+        entries = [p for p in self._carrier_claims.values() if p["case_id"] == case_id]
+        return sorted(entries, key=lambda e: e["claim_id"])
+
+    def list_all_carrier_claims(self) -> list[dict[str, Any]]:
+        return [self._carrier_claims[k] for k in sorted(self._carrier_claims)]
+
+    def put_carrier_claim_act(self, payload: dict[str, Any]) -> None:
+        self._carrier_claim_acts.setdefault(payload["act_id"], payload)
+
+    def list_carrier_claim_acts(self, claim_id: str) -> list[dict[str, Any]]:
+        entries = [
+            p for p in self._carrier_claim_acts.values() if p["claim_id"] == claim_id
+        ]
+        return sorted(entries, key=lambda e: (e["acted_on"], e["act_id"]))
+
+    def list_all_carrier_claim_acts(self) -> list[dict[str, Any]]:
+        entries = list(self._carrier_claim_acts.values())
+        return sorted(entries, key=lambda e: (e["acted_on"], e["act_id"]))

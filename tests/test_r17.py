@@ -450,7 +450,9 @@ def test_runtime_report_actions_and_customer_hiding():
 
 # -- the migration --------------------------------------------------------------
 
-def test_migration_0013_is_the_tail():
-    assert MIGRATIONS[-1][0] == "0013"
+def test_migration_0013_is_in_the_ledger():
+    # R18 appended 0014 after this round's migration; 0013 stands
+    # in the ledger, no longer the tail.
+    assert "0013" in [version for version, _, _ in MIGRATIONS]
     store = InMemoryStore()
-    assert store.migrate()[-1] == "0013"
+    assert "0013" in store.migrate()

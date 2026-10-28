@@ -413,7 +413,7 @@ def test_runtime_policy_pack_and_denial_envelope():
 def test_sqlite_migrate_is_idempotent_across_stores(tmp_path):
     path = tmp_path / "twice.db"
     first = SqlStore(sqlite_path=path)
-    assert first.migrate() == [f"000{i}" for i in range(1, 10)] + ["0010", "0011", "0012", "0013"]
+    assert first.migrate() == [f"000{i}" for i in range(1, 10)] + ["0010", "0011", "0012", "0013", "0014"]
     assert first.migrate() == []
     second = SqlStore(sqlite_path=path)
     assert second.migrate() == [], "an already-migrated schema applies nothing, raises nothing"
@@ -429,7 +429,7 @@ def test_postgres_migrate_is_idempotent_across_stores(tmp_path):
     sep = "&" if "?" in PG_URL else "?"
     url = f"{PG_URL}{sep}options=-csearch_path%3D{schema}"
     first = SqlStore(database_url=url)
-    assert first.migrate() == [f"000{i}" for i in range(1, 10)] + ["0010", "0011", "0012", "0013"]
+    assert first.migrate() == [f"000{i}" for i in range(1, 10)] + ["0010", "0011", "0012", "0013", "0014"]
     second = SqlStore(database_url=url)
     assert second.migrate() == [], "no unique violation, nothing re-applied"
     assert first.migrate() == []

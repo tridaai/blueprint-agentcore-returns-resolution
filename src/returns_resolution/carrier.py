@@ -20,6 +20,13 @@ Determinism is the double's contract, so behaviour is gradable:
   issue date, in transit the next day, received three days after
   issue — and a read at `as_of` sees only the events whose day has
   arrived. Nothing is random and nothing reads a wall clock.
+- R18: a label's script can be set to one of the exception
+  scripts (`set_script`) — the journeys the fixed script cannot
+  express: a parcel never tendered, one whose scans stop in
+  transit, one the carrier records damaged in transit before it
+  is received. Scripting is the double's stand-in for the real
+  carrier's behaviour on those journeys; the service reads only
+  the events, never the script.
 """
 
 from __future__ import annotations
@@ -63,6 +70,31 @@ _EVENT_SCRIPT = [
     (1, time(14, 0), "in_transit", "parcel in transit to the returns centre"),
     (3, time(10, 30), "received", "parcel received at the returns centre"),
 ]
+
+# The named scripts a label's journey can follow (R18). "standard"
+# is the script above — every label's default. The exception
+# scripts are how the double stands in for the journeys that break:
+# the parcel is never handed over at all, its scans stop in
+# transit and it is never received, or the carrier records it
+# damaged in transit on the way in (and it is received, damaged).
+SCRIPT_STANDARD = "standard"
+SCRIPT_NEVER_TENDERED = "never_tendered"
+SCRIPT_STALLED_IN_TRANSIT = "stalled_in_transit"
+SCRIPT_DAMAGED_IN_TRANSIT = "damaged_in_transit"
+_EVENT_SCRIPTS: dict[str, list] = {
+    SCRIPT_STANDARD: _EVENT_SCRIPT,
+    SCRIPT_NEVER_TENDERED: [],
+    SCRIPT_STALLED_IN_TRANSIT: [
+        (0, time(9, 0), "tendered", "parcel tendered to the carrier"),
+        (1, time(14, 0), "in_transit", "parcel in transit to the returns centre"),
+    ],
+    SCRIPT_DAMAGED_IN_TRANSIT: [
+        (0, time(9, 0), "tendered", "parcel tendered to the carrier"),
+        (1, time(14, 0), "in_transit", "parcel in transit to the returns centre"),
+        (2, time(8, 15), "damaged", "parcel recorded damaged in transit by the carrier"),
+        (3, time(10, 30), "received", "parcel received at the returns centre"),
+    ],
+}
 
 
 class CarrierPort(Protocol):
@@ -115,8 +147,11 @@ class LocalCarrierDouble:
     - Voiding is by reference; voiding an unknown or already-voided
       reference raises, and a voided label's event script stops —
       a voided parcel is never reported received.
-    - Events are the fixed script above; `fetch_events` at `as_of`
-      returns only the events whose day has arrived, in order.
+    - Events are the label's script (the fixed script above by
+      default); `fetch_events` at `as_of` returns only the events
+      whose day has arrived, in order. `set_script` re-scripts an
+      issued label's journey — the stand-in for the carrier
+      behaving as it does on the journeys that break (R18).
     """
 
     provider_name = DOUBLE_CARRIER
@@ -124,8 +159,26 @@ class LocalCarrierDouble:
     def __init__(self) -> None:
         self._labels: dict[str, dict] = {}
         self._voided: set[str] = set()
+        self._scripts: dict[str, str] = {}
         self._pickups: dict[str, CarrierPickupResult] = {}
         self.label_count = 0
+
+    def set_script(self, *, carrier_ref: str, script: str) -> None:
+        """Set the journey script for one issued label (R18): one
+        of the named scripts in this module. Scripting an unknown
+        reference or an unknown script raises — a test that means
+        to break a journey must say so exactly."""
+        if carrier_ref not in self._labels:
+            raise CarrierProviderError(f"unknown carrier reference: {carrier_ref}")
+        if script not in _EVENT_SCRIPTS:
+            raise CarrierProviderError(
+                f"unknown event script {script!r} — the double knows: "
+                f"{', '.join(sorted(_EVENT_SCRIPTS))}"
+            )
+        self._scripts[carrier_ref] = script
+
+    def script_for(self, carrier_ref: str) -> str:
+        return self._scripts.get(carrier_ref, SCRIPT_STANDARD)
 
     def create_label(
         self,
@@ -173,8 +226,9 @@ class LocalCarrierDouble:
         # another port instance (e.g. before a restart) reads back
         # identically. A voided parcel is never reported received.
         is_voided = voided or carrier_ref in self._voided
+        script = _EVENT_SCRIPTS[self._scripts.get(carrier_ref, SCRIPT_STANDARD)]
         events: list[CarrierEvent] = []
-        for days, at_time, kind, detail in _EVENT_SCRIPT:
+        for days, at_time, kind, detail in script:
             if is_voided and kind == "received":
                 continue
             day = issued_on + timedelta(days=days)

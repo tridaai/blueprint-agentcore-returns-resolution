@@ -535,6 +535,18 @@ class GradingReport(BaseModel):
     damage_notes: str = ""
     received_weight_grams: int | None = None
     wear_evidence: bool = False
+    # Damage attribution (R18): when the carrier's own record
+    # carries a `damaged` event for this label and the graded
+    # condition is worse than the declaration, the worsening is
+    # attributed to transit — `damage_attribution` reads "transit"
+    # and `damage_event_id` names the carrier event. An attributed
+    # report never triggers the fraud re-score, never re-prices
+    # the refund against the customer and never opens a recovery
+    # position: the carrier's damage is remedied by the carrier
+    # claim, not by the customer's money. Absent both, the fields
+    # stay None and the cascade is R7's, unchanged.
+    damage_attribution: str | None = None  # "transit" | None
+    damage_event_id: str | None = None
     # Photo-evidence metadata (R15): the free-text fields that rode
     # along with the grading photos (device notes, EXIF-style
     # descriptions), as RELEASED VIEWS — key → the view's rendered
@@ -720,7 +732,7 @@ class CarrierEvent(BaseModel):
     event_id: str
     label_id: str
     carrier_ref: str
-    kind: str  # tendered | in_transit | received
+    kind: str  # tendered | in_transit | damaged | received
     at: str  # ISO datetime from the carrier
     detail: str = ""
 

@@ -469,7 +469,7 @@ def test_timeline_of_a_denied_case_is_short_and_gapless():
 def test_sql_store_persists_labels_voids_and_tool_calls(tmp_path):
     store = SqlStore(sqlite_path=tmp_path / "r6.db")
     applied = store.migrate()
-    assert applied == ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013"]
+    assert applied == ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014"]
     service = CaseService(store, OfflineComposer())
     service.seed_orders()
     service.ingest(PLANTED_REQUESTS[2])  # REQ-2003
