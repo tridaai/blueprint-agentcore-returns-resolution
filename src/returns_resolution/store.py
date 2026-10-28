@@ -320,6 +320,21 @@ CREATE TABLE IF NOT EXISTS access_denials (
 );
 """
 
+# Migration 0013 — management reports (R17): one row per computed
+# report. Insert-only like the cost and denial tables
+# (conflict-ignore on the id): a report is an artefact of record —
+# a recomputation over moved inputs mints a NEW row linked by
+# `supersedes` inside the payload, never an update to this one.
+# The payload is the whole ManagementReport; the columns are the
+# read paths (per kind).
+_MIGRATION_0013_SQLITE = """
+CREATE TABLE IF NOT EXISTS management_reports (
+    report_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("0001", _MIGRATION_0001_SQLITE, _MIGRATION_0001_PG),
     ("0002", _MIGRATION_0002_SQLITE, _MIGRATION_0002_SQLITE),
@@ -333,6 +348,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("0010", _MIGRATION_0010_SQLITE, _MIGRATION_0010_SQLITE),
     ("0011", _MIGRATION_0011_SQLITE, _MIGRATION_0011_SQLITE),
     ("0012", _MIGRATION_0012_SQLITE, _MIGRATION_0012_SQLITE),
+    ("0013", _MIGRATION_0013_SQLITE, _MIGRATION_0013_SQLITE),
 ]
 
 
@@ -445,6 +461,10 @@ class Store(Protocol):
     def put_access_denial(self, payload: dict[str, Any]) -> None: ...
     def list_access_denials(self) -> list[dict[str, Any]]: ...
     def count_access_denials(self) -> int: ...
+    # Management reports (R17): insert-only computed artefacts.
+    def put_management_report(self, payload: dict[str, Any]) -> None: ...
+    def get_management_report(self, report_id: str) -> dict[str, Any] | None: ...
+    def list_management_reports(self) -> list[dict[str, Any]]: ...
 
 
 class SqlStore:
@@ -1357,6 +1377,30 @@ class SqlStore:
         rows = self._query("SELECT COUNT(*) AS n FROM access_denials")
         return int(rows[0]["n"]) if rows else 0
 
+    # -- management reports (R17): insert-only artefacts ------------
+    def put_management_report(self, payload: dict[str, Any]) -> None:
+        self._execute(
+            "INSERT INTO management_reports (report_id, kind, payload) "
+            "VALUES (?, ?, ?) ON CONFLICT (report_id) DO NOTHING",
+            (
+                payload["report_id"],
+                payload["kind"],
+                json.dumps(payload),
+            ),
+        )
+
+    def get_management_report(self, report_id: str) -> dict[str, Any] | None:
+        rows = self._query(
+            "SELECT payload FROM management_reports WHERE report_id = ?",
+            (report_id,),
+        )
+        return json.loads(rows[0]["payload"]) if rows else None
+
+    def list_management_reports(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT payload FROM management_reports")
+        entries = [json.loads(r["payload"]) for r in rows]
+        return sorted(entries, key=lambda e: e["report_id"])
+
 
 class InMemoryStore:
     """Test double implementing the same port with dicts."""
@@ -1389,6 +1433,7 @@ class InMemoryStore:
         self._quarantine_views: dict[str, dict] = {}
         self._quarantine_acts: dict[str, dict] = {}
         self._access_denials: dict[str, dict] = {}
+        self._management_reports: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
         return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012"]
@@ -1782,3 +1827,13 @@ class InMemoryStore:
 
     def count_access_denials(self) -> int:
         return len(self._access_denials)
+
+    # -- management reports (R17): insert-only, like the SQL store --
+    def put_management_report(self, payload: dict[str, Any]) -> None:
+        self._management_reports.setdefault(payload["report_id"], payload)
+
+    def get_management_report(self, report_id: str) -> dict[str, Any] | None:
+        return self._management_reports.get(report_id)
+
+    def list_management_reports(self) -> list[dict[str, Any]]:
+        return [self._management_reports[k] for k in sorted(self._management_reports)]
