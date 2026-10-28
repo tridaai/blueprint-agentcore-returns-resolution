@@ -9,10 +9,18 @@ never exists anywhere in the system.
 
 from __future__ import annotations
 
+from .disposition import (
+    ChannelTable,
+    MatrixPack,
+    decide_disposition,
+    load_channel_table,
+    load_matrix_pack,
+    verify_disposition,
+)
 from .eligibility import case_id_for, evaluate
 from .evidence import EvidenceStore
 from .modelport import ModelPort
-from .models import Order, RefundComputation, ReturnCase, ReturnRequest
+from .models import DispositionDecision, Order, RefundComputation, ReturnCase, ReturnRequest
 from .policy import PolicyPack, load_policy_pack
 from .refunds import compute_refund, verify_computation
 from .seed import CATALOGUE, ORDERS
@@ -33,11 +41,15 @@ class CaseService:
         model_port: ModelPort,
         pack: PolicyPack | None = None,
         evidence_store: EvidenceStore | None = None,
+        matrix: MatrixPack | None = None,
+        channels: ChannelTable | None = None,
     ):
         self._store = store
         self._model = model_port
         self._pack = pack or load_policy_pack()
         self._evidence = evidence_store
+        self._matrix = matrix or load_matrix_pack()
+        self._channels = channels or load_channel_table()
 
     # -- seeding ---------------------------------------------------------
     def seed_orders(self) -> int:
@@ -63,6 +75,16 @@ class CaseService:
         computation = compute_refund(self._pack, order, product, request, decision)
         self._store.put_computation(computation.model_dump(mode="json"))
 
+        # Disposition (R3): only an eligible return has an item on its
+        # way back to be disposed of — a denied case gets no decision,
+        # rather than a decision nobody may act on. An eligible case
+        # whose facts the matrix cannot cover gets a stored
+        # not_decidable artefact naming the missing dimension.
+        disposition = None
+        if decision.eligible:
+            disposition = self._decide_for(order, product, request, computation.computation_id)
+            self._store.put_disposition(disposition.model_dump(mode="json"))
+
         product_name = product.name if product else request.sku
         refund_composer = getattr(self._model, "compose_refund_summary", None)
         if refund_composer is not None and decision.eligible:
@@ -78,6 +100,7 @@ class CaseService:
             status="summary_ready" if not violations else "summary_failed",
             decision=decision,
             computation=computation,
+            disposition=disposition,
             summary=summary_text if not violations else None,
         )
         self._store.put_case(case.model_dump(mode="json"))
@@ -136,6 +159,73 @@ class CaseService:
 
     def list_computations(self) -> list[RefundComputation]:
         return [RefundComputation.model_validate(p) for p in self._store.list_computations()]
+
+    # -- dispositions (R3) ---------------------------------------------------
+    def _decide_for(
+        self, order: Order, product, request: ReturnRequest, computation_id: str | None
+    ) -> DispositionDecision:
+        age_days = (request.requested_on - order.delivered_on).days
+        return decide_disposition(
+            self._matrix,
+            self._channels,
+            case_id=case_id_for(request.request_id),
+            computation_id=computation_id,
+            category=product.category if product is not None else None,
+            condition_declared=request.condition_declared,
+            age_days=age_days,
+        )
+
+    def get_disposition(self, case_id: str) -> DispositionDecision | None:
+        """The stored disposition; decided+stored on demand for an
+        eligible case decided before R3 (its facts are still pinned)."""
+        stored = self._store.get_disposition(case_id)
+        if stored is not None:
+            return DispositionDecision.model_validate(stored)
+        case = self.get_case(case_id)
+        if case is None or case.decision is None or not case.decision.eligible:
+            return None
+        order = self.get_order(case.order_id)
+        if order is None:
+            return None
+        computation = self.get_computation(case_id)
+        disposition = self._decide_for(
+            order,
+            CATALOGUE.get(case.request.sku),
+            case.request,
+            computation.computation_id if computation else None,
+        )
+        self._store.put_disposition(disposition.model_dump(mode="json"))
+        return disposition
+
+    def verify_stored_disposition(self, case_id: str) -> list[str]:
+        """Re-perform the stored disposition's walk; [] = intact."""
+        disposition = self.get_disposition(case_id)
+        case = self.get_case(case_id)
+        if disposition is None or case is None:
+            return ["no disposition for this case"]
+        order = self.get_order(case.order_id)
+        if order is None:
+            return ["order missing for this case"]
+        product = CATALOGUE.get(case.request.sku)
+        return verify_disposition(
+            disposition,
+            self._matrix,
+            self._channels,
+            case_id=case_id,
+            computation_id=disposition.computation_id,
+            category=product.category if product is not None else None,
+            condition_declared=case.request.condition_declared,
+            age_days=(case.request.requested_on - order.delivered_on).days,
+        )
+
+    def list_dispositions(self) -> list[DispositionDecision]:
+        return [DispositionDecision.model_validate(p) for p in self._store.list_dispositions()]
+
+    def get_matrix(self) -> MatrixPack:
+        return self._matrix
+
+    def get_channels(self) -> ChannelTable:
+        return self._channels
 
     # -- reads ---------------------------------------------------------------
     def get_case(self, case_id: str) -> ReturnCase | None:

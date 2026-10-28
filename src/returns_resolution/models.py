@@ -236,6 +236,54 @@ class RefundComputation(BaseModel):
         return amounts
 
 
+class RerouteStep(BaseModel):
+    """One hop of a channel reroute: the cell whose channel was closed
+    and the matrix-stated next cell the walk fell to. Recorded on the
+    decision — a reroute that is not on the record did not happen
+    (and one that happened is never silent)."""
+
+    from_cell_id: str
+    closed_channel: str
+    to_cell_id: str
+
+
+class DispositionDecision(BaseModel):
+    """Where the returned item goes (R3) — a content-addressed artefact.
+
+    Pinned to the case, the refund computation it was decided
+    alongside (where one exists), the matrix version and the channel
+    table version, and the exact facts evaluated: category, the
+    customer's declared condition, item age in days and its band.
+    `basis` is "declared" in R3 — the decision rests on the declared
+    condition; warehouse grading (R7) will supersede it with a new
+    linked decision via `supersedes`, never an in-place edit.
+
+    `status` is "decided" exactly when a cell fired through an open
+    channel; otherwise "not_decidable" with `missing_dimension`
+    naming what the matrix could not be evaluated over — never a
+    default disposition standing in for a missing fact.
+    """
+
+    disposition_id: str
+    case_id: str
+    computation_id: str | None = None
+    matrix_version: str
+    channel_table_version: str
+    status: str  # decided | not_decidable
+    disposition: str | None = None
+    basis: str = "declared"
+    cell_id: str | None = None
+    channel: str | None = None
+    category: str | None = None
+    condition_declared: str
+    age_days: int | None = None
+    age_band: str | None = None
+    missing_dimension: str | None = None
+    reroutes: list[RerouteStep] = []
+    inspection_unknowns: list[str] = []
+    supersedes: str | None = None
+
+
 class ReturnCase(BaseModel):
     case_id: str
     request: ReturnRequest
@@ -244,4 +292,5 @@ class ReturnCase(BaseModel):
     status: str  # decided | summary_ready | summary_failed
     decision: EligibilityDecision | None = None
     computation: RefundComputation | None = None
+    disposition: DispositionDecision | None = None
     summary: str | None = None

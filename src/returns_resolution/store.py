@@ -73,9 +73,22 @@ CREATE TABLE IF NOT EXISTS computations (
 );
 """
 
+# Migration 0003 — disposition decisions (R3): one artefact per
+# case, keyed by its content-addressed disposition id.
+_MIGRATION_0003_SQLITE = """
+CREATE TABLE IF NOT EXISTS dispositions (
+    disposition_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL UNIQUE,
+    matrix_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("0001", _MIGRATION_0001_SQLITE, _MIGRATION_0001_PG),
     ("0002", _MIGRATION_0002_SQLITE, _MIGRATION_0002_SQLITE),
+    ("0003", _MIGRATION_0003_SQLITE, _MIGRATION_0003_SQLITE),
 ]
 
 
@@ -97,6 +110,9 @@ class Store(Protocol):
     def put_computation(self, payload: dict[str, Any]) -> None: ...
     def get_computation(self, case_id: str) -> dict[str, Any] | None: ...
     def list_computations(self) -> list[dict[str, Any]]: ...
+    def put_disposition(self, payload: dict[str, Any]) -> None: ...
+    def get_disposition(self, case_id: str) -> dict[str, Any] | None: ...
+    def list_dispositions(self) -> list[dict[str, Any]]: ...
 
 
 class SqlStore:
@@ -304,6 +320,33 @@ class SqlStore:
     def list_computations(self) -> list[dict[str, Any]]:
         return [json.loads(r["payload"]) for r in self._query("SELECT payload FROM computations ORDER BY case_id")]
 
+    # -- dispositions (R3) ---------------------------------------------------
+    def put_disposition(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO dispositions (disposition_id, case_id, matrix_version, status, payload) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (disposition_id) DO UPDATE SET payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO dispositions (disposition_id, case_id, matrix_version, status, payload) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (disposition_id) DO UPDATE SET payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["disposition_id"],
+                payload["case_id"],
+                payload["matrix_version"],
+                payload["status"],
+                json.dumps(payload),
+            ),
+        )
+
+    def get_disposition(self, case_id: str) -> dict[str, Any] | None:
+        row = self._query_one("SELECT payload FROM dispositions WHERE case_id = ?", (case_id,))
+        return json.loads(row["payload"]) if row else None
+
+    def list_dispositions(self) -> list[dict[str, Any]]:
+        return [json.loads(r["payload"]) for r in self._query("SELECT payload FROM dispositions ORDER BY case_id")]
+
 
 class InMemoryStore:
     """Test double implementing the same port with dicts."""
@@ -315,9 +358,10 @@ class InMemoryStore:
         self._summaries: dict[str, dict] = {}
         self._evidence: dict[str, dict] = {}
         self._computations: dict[str, dict] = {}
+        self._dispositions: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
-        return ["0001", "0002"]
+        return ["0001", "0002", "0003"]
 
     def put_order(self, payload: dict[str, Any]) -> None:
         self._orders[payload["order_id"]] = payload
@@ -369,3 +413,12 @@ class InMemoryStore:
 
     def list_computations(self) -> list[dict[str, Any]]:
         return [self._computations[k] for k in sorted(self._computations)]
+
+    def put_disposition(self, payload: dict[str, Any]) -> None:
+        self._dispositions[payload["case_id"]] = payload
+
+    def get_disposition(self, case_id: str) -> dict[str, Any] | None:
+        return self._dispositions.get(case_id)
+
+    def list_dispositions(self) -> list[dict[str, Any]]:
+        return [self._dispositions[k] for k in sorted(self._dispositions)]

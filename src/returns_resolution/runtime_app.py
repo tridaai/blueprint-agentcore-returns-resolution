@@ -55,7 +55,9 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     """The one dispatch every surface shares. Actions:
     seed | intake_feed | intake {request} | get_case {case_id} |
     get_computation {case_id} | verify_computation {case_id} |
-    list_cases | list_orders.
+    get_disposition {case_id} | verify_disposition {case_id} |
+    list_dispositions | get_matrix | get_matrix_cell {cell_id} |
+    get_channels | list_cases | list_orders.
     """
     action = payload.get("action", "intake_feed")
     if action == "seed":
@@ -85,6 +87,21 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     if action == "verify_computation":
         problems = service.verify_stored_computation(payload["case_id"])
         return {"case_id": payload["case_id"], "ok": not problems, "problems": problems}
+    if action == "get_disposition":
+        disposition = service.get_disposition(payload["case_id"])
+        return {"disposition": disposition.model_dump(mode="json") if disposition else None}
+    if action == "verify_disposition":
+        problems = service.verify_stored_disposition(payload["case_id"])
+        return {"case_id": payload["case_id"], "ok": not problems, "problems": problems}
+    if action == "list_dispositions":
+        return {"dispositions": [d.model_dump(mode="json") for d in service.list_dispositions()]}
+    if action == "get_matrix":
+        return {"matrix": service.get_matrix().model_dump(mode="json")}
+    if action == "get_matrix_cell":
+        cell = service.get_matrix().cell_by_id(payload["cell_id"])
+        return {"cell": cell.model_dump(mode="json") if cell else None}
+    if action == "get_channels":
+        return {"channels": service.get_channels().model_dump(mode="json")}
     if action == "list_cases":
         return {"cases": [c.model_dump(mode="json") for c in service.list_cases()]}
     if action == "list_orders":

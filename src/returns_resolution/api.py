@@ -102,6 +102,39 @@ def create_app(service: CaseService) -> FastAPI:
     def computations() -> list[dict]:
         return [c.model_dump(mode="json") for c in service.list_computations()]
 
+    @app.get("/cases/{case_id}/disposition")
+    def disposition(case_id: str) -> dict:
+        found = service.get_disposition(case_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="disposition not found")
+        return found.model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/disposition/verify")
+    def disposition_verify(case_id: str) -> dict:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        problems = service.verify_stored_disposition(case_id)
+        return {"case_id": case_id, "ok": not problems, "problems": problems}
+
+    @app.get("/dispositions")
+    def dispositions() -> list[dict]:
+        return [d.model_dump(mode="json") for d in service.list_dispositions()]
+
+    @app.get("/disposition/matrix")
+    def matrix() -> dict:
+        return service.get_matrix().model_dump(mode="json")
+
+    @app.get("/disposition/matrix/cells/{cell_id}")
+    def matrix_cell(cell_id: str) -> dict:
+        cell = service.get_matrix().cell_by_id(cell_id)
+        if cell is None:
+            raise HTTPException(status_code=404, detail="matrix cell not found")
+        return cell.model_dump(mode="json")
+
+    @app.get("/disposition/channels")
+    def channels() -> dict:
+        return service.get_channels().model_dump(mode="json")
+
     @app.post("/cases/{case_id}/evidence")
     async def evidence(case_id: str, request: Request, kind: str = "photo", filename: str = "evidence.bin") -> dict:
         if service.get_case(case_id) is None:
