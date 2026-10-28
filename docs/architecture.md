@@ -789,10 +789,12 @@ wrote; it writes exactly one new kind of artefact.
   trigger). Cases with neither stand excluded, counted in the
   population as excluded; ratios over an empty denominator are
   the named string `not_computable`. The money summary's four
-  totals are sums over receipts and adjustments through the
-  as-of, split by the adjustments' top-up receipt links — the
-  console money view's arithmetic, re-performed from the same
-  artefacts and graded equal to the console payload's rows.
+  customer totals are sums over receipts and adjustments
+  through the as-of, split by the adjustments' top-up receipt
+  links — the console money view's arithmetic, re-performed
+  from the same artefacts and graded equal to the console
+  payload's rows. (R18 adds a fifth line, carrier claims
+  settled, beside the customer money and never inside it.)
   The cost summary is cumulative over the R12 ledger grouped by
   profile; entries carry no timestamps, so the pack states
   plainly that no period cut exists.
@@ -816,8 +818,90 @@ wrote; it writes exactly one new kind of artefact.
   renders the endpoint's ordinary 404 body and the Runtime the
   action's empty result, byte-identical either way.
 
+## Carrier exception flows (R18)
+
+The rounds above assumed the parcel's journey completes. This
+layer handles the journeys that break — in code, from the
+carrier's own record, under a versioned exception pack
+(2026.10.1) whose windows, paths, claim formula, settlement
+threshold, transit disposition row, customer wording and blame
+vocabulary are data.
+
+- **Raising.** Detection runs per label over the carrier event
+  record (the local double gained named journey scripts —
+  standard, never-tendered, stalled, damaged — so broken
+  journeys plant exactly). A `damaged` event raises
+  `damaged_in_transit`, bound to the events ending at the
+  damage; past the pack's 5-day tender window with no tender,
+  `label_never_tendered`; past the 10-day transit window,
+  tendered and never received with no warehouse receipt of
+  record, `lost_in_transit`. A received journey raises nothing.
+  The artefact (migration 0014) is content-addressed over its
+  raising facts; re-detection returns the standing artefact,
+  and `verify_exception` re-reads the events as of the raising
+  date, re-checks the window and rebuilds the artefact whole —
+  a premature or event-less raising fails.
+- **Handling.** The exception's state is the fold of its
+  insert-only acts: escalate, or one of the pack's resolution
+  paths *for that kind*, each carrying the consequence the pack
+  states (shown on the exception's view while it stands open).
+  `execute_refund` consults the fold before any money moves:
+  open or escalated bars execution with the paths named;
+  customer-kept bars it permanently. A damaged exception with
+  no resolution act is resolved by grading's transit
+  attribution — a fact of record, folded in, never written as
+  an act nobody performed.
+- **Attribution in the cascade.** The grading cascade checks
+  the carrier record before it prices anything: a `damaged`
+  event on the receipted label as of the grading date, with
+  the graded condition's rank worse than the declared, marks
+  the report `damage_attribution = transit` with the event id.
+  The refund re-run is skipped (the computation stands on the
+  declared condition), no adjustment is created, the re-score
+  trigger is suppressed, and the disposition successor is
+  built by the exception pack's transit row
+  (`EX-TRANSIT-DAMAGE` → `RETURN_TO_VENDOR`, vendor channel)
+  — re-performed by its own branch of
+  `verify_stored_disposition` from the grading report. Without
+  the carrier event, the identical grade jump runs R7's
+  cascade untouched. The fraud report's truth rule, in both
+  the model-level builder and the raw-row verifier, skips
+  transit-attributed reports: the carrier's damage is not the
+  customer's misrepresentation.
+- **The claim.** Filed per exception, assembled only from
+  artefacts of record — exception, label, events as of filing,
+  warehouse receipt, the transit-attributed grading report
+  (damaged), the computation, the decision's item amount, the
+  label's cost — at the pack's formula (lost: item + label;
+  damaged: label + the pack's rate of the item), under an
+  evidence fingerprint over every binding. Gates: a lost claim
+  needs the exception escalated or resolved (never
+  customer-kept); a damaged claim needs the attributed report
+  for the same label. The lifecycle is insert-only acts —
+  acknowledged, then settled (the amount the carrier paid, an
+  external fact, bounded above by the claimed amount) or
+  denied (a reason from the pack's vocabulary).
+  `verify_carrier_claim` re-assembles every bound field and
+  recomputes amount, fingerprint and id. Settlement lands in
+  the money summary as its own measure,
+  `carrier_claims_settled` — computed in the builder and
+  re-performed in the verifier from the raw claim acts — while
+  the four customer totals are computed exactly as before.
+- **Surfaces and access.** The access pack gains the
+  `exceptions` surface and the `settle_carrier_claim` act:
+  exception handling and claim work are `manage_case`; a
+  settlement above the pack's threshold is the supervisor act,
+  chosen in code from the amount. A customer's status read is
+  narrowed to kind, state and raised-on over their own case;
+  claims are refused to customers with the hiding denial.
+  Customer wording comes only from the pack, rendered by the
+  `carrier_exception_notice` template and the grading
+  template's transit branch, inside the R8 verified universe —
+  which deliberately never admits claim amounts. API and
+  Runtime carry the surface at parity with the reports
+  pattern, hiding refusals included.
+
 ## What is deliberately not here yet
 
-Carrier exceptions, red team,
-deploy artefacts. The README's honest status is the
+Red team, deploy artefacts. The README's honest status is the
 authoritative per-round account.

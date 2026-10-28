@@ -1,4 +1,4 @@
-"""Eval gate for Blueprint #18 (R1–R16).
+"""Eval gate for Blueprint #18 (R1–R18).
 
 Profiles (R10): the full scenario body runs once per store profile
 — in-memory and SQLite always, PostgreSQL when DATABASE_URL (or
@@ -249,6 +249,29 @@ Zero-tolerance counters against planted truth:
   a report read (service or Runtime) — reports are not a
   customer surface, and a probe must be indistinguishable from
   probing a report that does not exist.
+- exception_raised_without_events (R18): an exception standing
+  where the carrier record does not state it — a window not yet
+  run out, a journey that completed — or a premature raising
+  passing its re-performance.
+- exception_refund_executed_into_open (R18): a refund executed
+  while a carrier exception stood open or escalated on the
+  case, or after a customer-kept resolution.
+- transit_damage_scored_as_fraud (R18): transit-attributed
+  damage re-priced against the customer, adjusted, re-scored,
+  or counted as misrepresentation in the fraud truth.
+- claim_assembly_mismatches (R18): a carrier claim whose amount
+  or bindings differ from the artefacts of record, a claim
+  filed against the gates, or a forged claim passing
+  verification.
+- claim_settlement_moved_customer_figures (R18): a settlement
+  after which any customer money total differs, or the money
+  summary's claims line is not the settled total.
+- blame_language_in_customer_payloads (R18): the exception
+  pack's blame terms appearing in any customer-facing payload
+  on an exception case.
+- exception_status_leaks (R18): a customer principal served
+  another customer's exception status, an un-narrowed status
+  shape, or a claim read.
 
 Prints the counters and GATE: PASS/FAIL; exit code follows.
 """
@@ -406,6 +429,13 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
         "report_unknown_outcomes_as_negatives": 0,
         "report_money_console_mismatches": 0,
         "report_customer_reads_served": 0,
+        "exception_raised_without_events": 0,
+        "exception_refund_executed_into_open": 0,
+        "transit_damage_scored_as_fraud": 0,
+        "claim_assembly_mismatches": 0,
+        "claim_settlement_moved_customer_figures": 0,
+        "blame_language_in_customer_payloads": 0,
+        "exception_status_leaks": 0,
     }
 
     service = CaseService(make_store(), OfflineComposer())
@@ -2983,6 +3013,237 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
     for _kind in ("fraud_outcomes", "money_summary", "cost_summary"):
         service.compute_report(_kind, as_of=_asof17)
 
+    # -- R18: carrier exception flows -------------------------------------
+    # When the journey itself breaks. Detection raises the
+    # exception in code from the carrier event record under the
+    # pack's windows; transit damage is attributed, never scored
+    # as the customer's fraud; the carrier claim assembles only
+    # from artefacts of record; and a settlement moves no
+    # customer figure — the money summary gains its own line.
+    from returns_resolution.carrier_exceptions import (
+        CarrierExceptionError as _CarrierExceptionError,
+    )
+    from returns_resolution.carrier_exceptions import (
+        build_exception as _build_exception,
+    )
+    from returns_resolution.carrier_exceptions import (
+        load_exception_pack as _load_exception_pack,
+    )
+
+    _pack18 = _load_exception_pack()
+    _carrier18 = LocalCarrierDouble()
+    exc18 = CaseService(make_store(), OfflineComposer(), carrier_port=_carrier18)
+    exc18.seed_orders()
+    for _request in PLANTED_REQUESTS:
+        exc18.ingest(_request)
+    _d27 = date(2026, 10, 27)
+
+    def _issue18(case_id: str):
+        exc18.invoke_tool(
+            "create_return_label", {"case_id": case_id, "issued_on": _d27},
+            case_id=case_id, called_on=_d27,
+        )
+        return exc18.get_label_for_case(case_id)
+
+    # The lost journey (CASE-2001): tendered, one scan, silence.
+    _lbl = _issue18("CASE-2001")
+    _carrier18.set_script(carrier_ref=_lbl.carrier_ref, script="stalled_in_transit")
+    if exc18.detect_carrier_exceptions("CASE-2001", as_of=date(2026, 11, 5)):
+        counters["exception_raised_without_events"] += 1  # window not yet run out
+    _lost = exc18.detect_carrier_exceptions("CASE-2001", as_of=date(2026, 11, 6))
+    if (
+        len(_lost) != 1
+        or _lost[0].kind != "lost_in_transit"
+        or _lost[0].event_kinds != ["tendered", "in_transit"]
+        or exc18.verify_exception(_lost[0].exception_id)
+    ):
+        counters["exception_raised_without_events"] += 1
+    # Money does not move while the exception stands.
+    exc18.record_approval("CASE-2001", approver="d.okafor", role="returns_lead", as_of=_d27)
+    exc18.record_approval("CASE-2001", approver="m.reyes", role="returns_lead", as_of=_d27)
+    try:
+        exc18.execute_refund("CASE-2001", idempotency_key="eval-r18-2001", as_of=date(2026, 11, 6))
+        counters["exception_refund_executed_into_open"] += 1
+    except PaymentsError:
+        pass
+    # The claim: gated while open, exact at the pack's formula.
+    try:
+        exc18.file_carrier_claim(_lost[0].exception_id, filed_by="s.reyes", filed_on=date(2026, 11, 6))
+        counters["claim_assembly_mismatches"] += 1
+    except _CarrierExceptionError:
+        pass
+    exc18.record_exception_act(
+        _lost[0].exception_id, action="escalate", actor="s.reyes", acted_on=date(2026, 11, 6)
+    )
+    _claim = exc18.file_carrier_claim(
+        _lost[0].exception_id, filed_by="s.reyes", filed_on=date(2026, 11, 6)
+    )
+    if (
+        _claim.claimed_amount != Decimal("195.95")
+        or _claim.item_amount != Decimal("189.00")
+        or _claim.label_cost != Decimal("6.95")
+        or exc18.verify_carrier_claim(_claim.claim_id)
+    ):
+        counters["claim_assembly_mismatches"] += 1
+    # A forged claim fails re-assembly.
+    from returns_resolution.carrier_exceptions import CarrierClaim as _CarrierClaim
+
+    _forged_claim = _CarrierClaim(
+        **{
+            **_claim.model_dump(),
+            "claim_id": "CLM-forged000000000",
+            "claimed_amount": Decimal("999.99"),
+        }
+    )
+    exc18._store.put_carrier_claim(_forged_claim.model_dump(mode="json"))
+    if not exc18.verify_carrier_claim(_forged_claim.claim_id):
+        counters["claim_assembly_mismatches"] += 1
+    # Resolve, pay the customer, settle the claim — and grade
+    # that the settlement moved no customer figure.
+    exc18.record_exception_act(
+        _lost[0].exception_id, action="refund_as_received", actor="s.reyes",
+        acted_on=date(2026, 11, 7),
+    )
+    exc18.execute_refund("CASE-2001", idempotency_key="eval-r18-2001", as_of=date(2026, 11, 7))
+    _money_before = exc18.compute_report("money_summary", as_of=date(2026, 11, 10))
+    exc18.record_claim_act(
+        _claim.claim_id, action="acknowledged", actor="s.reyes", acted_on=date(2026, 11, 8)
+    )
+    exc18.record_claim_act(
+        _claim.claim_id, action="settled", actor="s.okafor",
+        acted_on=date(2026, 11, 12), settled_amount=_claim.claimed_amount,
+    )
+    _money_after = exc18.compute_report("money_summary", as_of=date(2026, 11, 15))
+    for _name in ("executed_refunds", "executed_top_ups", "recoveries_outstanding", "top_ups_outstanding"):
+        if _money_after.figures[_name] != _money_before.figures[_name]:
+            counters["claim_settlement_moved_customer_figures"] += 1
+    if (
+        _money_before.figures["carrier_claims_settled"] != "0.00"
+        or _money_after.figures["carrier_claims_settled"] != "195.95"
+        or _money_after.figures["executed_refunds"] != "189.00"
+        or exc18.verify_management_report(_money_after)
+    ):
+        counters["claim_settlement_moved_customer_figures"] += 1
+
+    # The never-tendered journey (CASE-2006), resolved
+    # customer-kept: the refund is refused for good.
+    _lbl6 = _issue18("CASE-2006")
+    _carrier18.set_script(carrier_ref=_lbl6.carrier_ref, script="never_tendered")
+    if exc18.detect_carrier_exceptions("CASE-2006", as_of=date(2026, 10, 31)):
+        counters["exception_raised_without_events"] += 1
+    _never = exc18.detect_carrier_exceptions("CASE-2006", as_of=date(2026, 11, 1))
+    if len(_never) != 1 or _never[0].kind != "label_never_tendered":
+        counters["exception_raised_without_events"] += 1
+    exc18.record_exception_act(
+        _never[0].exception_id, action="customer_kept", actor="s.reyes",
+        acted_on=date(2026, 11, 1),
+    )
+    exc18.record_approval("CASE-2006", approver="d.okafor", role="returns_lead", as_of=_d27)
+    try:
+        exc18.execute_refund("CASE-2006", idempotency_key="eval-r18-2006", as_of=date(2026, 11, 2))
+        counters["exception_refund_executed_into_open"] += 1
+    except PaymentsError:
+        pass
+
+    # The damaged journey (CASE-2003): the carrier's damage
+    # event + a materially worse grade attribute the damage to
+    # transit — no re-price, no adjustment, no re-score, and
+    # the fraud truth never counts it.
+    _lbl3 = _issue18("CASE-2003")
+    _carrier18.set_script(carrier_ref=_lbl3.carrier_ref, script="damaged_in_transit")
+    _score_before = exc18.get_fraud_score("CASE-2003")
+    exc18.record_warehouse_receipt(
+        "CASE-2003", received_by="w.chen", received_on=date(2026, 10, 30)
+    )
+    _report3 = exc18.record_grading(
+        "CASE-2003", grader="p.novak", graded_condition="damaged_by_customer",
+        graded_on=date(2026, 10, 31), wear_evidence=True,
+        damage_notes="crushed in transit, seams torn",
+    )
+    _score_after = exc18.get_fraud_score("CASE-2003")
+    if (
+        _report3.damage_attribution != "transit"
+        or _report3.new_computation_id is not None
+        or _report3.adjustment_id is not None
+        or _report3.fraud_rescore_triggered
+        or _score_after.score_id != _score_before.score_id
+        or exc18.get_disposition("CASE-2003").cell_id != "EX-TRANSIT-DAMAGE"
+        or exc18.verify_stored_disposition("CASE-2003")
+    ):
+        counters["transit_damage_scored_as_fraud"] += 1
+    _fraud18 = exc18.compute_report("fraud_outcomes", as_of=date(2026, 11, 5))
+    if _fraud18.population["known_outcome_cases"] != 0 or exc18.verify_management_report(_fraud18):
+        counters["transit_damage_scored_as_fraud"] += 1
+    # A premature raising, written straight to the store over
+    # this label, fails its re-performance: exceptions are
+    # raised from the events, on the window, or not at all.
+    _forged_exc = _build_exception(
+        case_id="CASE-2003", label_id=_lbl3.label_id, kind="lost_in_transit",
+        raised_on=date(2026, 10, 30), issued_on=_d27, window_days=10,
+        event_ids=["evt-a", "evt-b"], event_kinds=["tendered", "in_transit"],
+        pack=_pack18,
+    )
+    exc18._store.put_carrier_exception(_forged_exc.model_dump(mode="json"))
+    if not exc18.verify_exception(_forged_exc.exception_id):
+        counters["exception_raised_without_events"] += 1
+    _dmg = [
+        e
+        for e in exc18.detect_carrier_exceptions("CASE-2003", as_of=date(2026, 10, 31))
+        if e.kind == "damaged_in_transit"
+    ]
+    _claim3 = exc18.file_carrier_claim(
+        _dmg[0].exception_id, filed_by="s.reyes", filed_on=date(2026, 11, 1)
+    )
+    if _claim3.claimed_amount != Decimal("79.45") or exc18.verify_carrier_claim(_claim3.claim_id):
+        counters["claim_assembly_mismatches"] += 1
+
+    # Customer honesty: the notices verify, the status shape is
+    # narrowed, a stranger is hidden, and no blame term stands
+    # in any customer payload on these cases.
+    _notice = exc18.draft_message("CASE-2001", "carrier_exception_notice", as_of=date(2026, 11, 7))
+    if exc18.verify_message(_notice.message_id, as_of=date(2026, 11, 7)).status != "verified":
+        counters["blame_language_in_customer_payloads"] += 1
+    _grade_notice = exc18.draft_message(
+        "CASE-2003", "grading_outcome_notice", as_of=date(2026, 10, 31)
+    )
+    if exc18.verify_message(_grade_notice.message_id, as_of=date(2026, 10, 31)).status != "verified":
+        counters["blame_language_in_customer_payloads"] += 1
+    for _message in exc18.list_all_messages():
+        for _term in _pack18.blame_terms:
+            if _term in _message.text.lower():
+                counters["blame_language_in_customer_payloads"] += 1
+    _owner18 = _Principal(id=exc18.get_case("CASE-2001").customer_id, role="customer")
+    _status = exc18.get_exception_status_as(_owner18, "CASE-2001")
+    if (
+        not _status
+        or set(_status[0]) != {"exception_id", "kind", "state", "raised_on"}
+    ):
+        counters["exception_status_leaks"] += 1
+    _stranger18 = _Principal(id="cust-stranger", role="customer")
+    try:
+        exc18.get_exception_status_as(_stranger18, "CASE-2001")
+        counters["exception_status_leaks"] += 1
+    except _AccessDenied as exc:
+        if exc.reason != "case_not_visible":
+            counters["exception_status_leaks"] += 1
+    try:
+        exc18.list_claims_as(_owner18, "CASE-2001")
+        counters["exception_status_leaks"] += 1
+    except _AccessDenied as exc:
+        if exc.reason != "case_not_visible":
+            counters["exception_status_leaks"] += 1
+    # The auditor reads the exceptions surface and lands no act.
+    _auditor18 = _Principal(id="eval.auditor", role="auditor")
+    try:
+        exc18.record_exception_act_as(
+            _auditor18, _lost[0].exception_id, action="escalate",
+            acted_on=date(2026, 11, 7),
+        )
+        counters["access_auditor_acts_accepted"] += 1
+    except _AccessDenied as exc:
+        if exc.reason != "read_only_role":
+            counters["access_auditor_acts_accepted"] += 1
+
     # The cross-profile fingerprint (R10): the content-addressed
     # artefact ids the planted work minted on this profile's store.
     # Identical planted work must mint identical ids on every store.
@@ -3025,6 +3286,20 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
         ),
         "reports": sorted(
             row["report_id"] for row in service._store.list_management_reports()
+        ),
+        "exceptions": sorted(
+            row["exception_id"] for row in exc18._store.list_all_carrier_exceptions()
+        ),
+        "exception_acts": sorted(
+            act.act_id
+            for _exc in exc18.list_all_exceptions()
+            for act in exc18.list_exception_acts(_exc.exception_id)
+        ),
+        "claims": sorted(
+            row["claim_id"] for row in exc18._store.list_all_carrier_claims()
+        ),
+        "claim_acts": sorted(
+            row["act_id"] for row in exc18._store.list_all_carrier_claim_acts()
         ),
     }
     return counters, fingerprint
