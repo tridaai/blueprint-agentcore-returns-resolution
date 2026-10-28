@@ -420,6 +420,15 @@ def _render_carrier_exception(facts: MessageFacts, model_note: str | None) -> st
         "reissue_label",
     ):
         key = f"resolved_{facts.exception_path}"
+    elif facts.exception_state == "resolved" and facts.exception_path == (
+        "grading_cleared"
+    ):
+        # R19: grading examined the carrier's damage and found
+        # the item itself unharmed — its own pack wording (the
+        # attribution wording would promise a figure "computed
+        # on the condition you declared" even where grading
+        # re-priced the case).
+        key = "resolved_grading_cleared"
     elif facts.exception_state == "resolved":
         key = "damaged_in_transit"  # resolved by grading attribution
     elif facts.exception_state == "escalated":

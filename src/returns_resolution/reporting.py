@@ -66,6 +66,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from .carrier_exceptions import effective_settlement
 from .fraud import BAND_FRAUD_REVIEW
 from .grading import CONDITION_RANKS, WILDLY_WORSE_JUMP
 from .models import money
@@ -515,8 +516,9 @@ def money_totals(service, as_of: date | None = None) -> dict[str, Decimal]:
     adjustments name as their top-up settlements), outstanding
     recoveries and outstanding top-ups (the open adjustments, by
     kind) — and, on its own line, carrier claims settled (R18):
-    the settlement acts' amounts, the house's recovery from its
-    carrier, which moves no customer figure. The first four are
+    each settled claim's effective settlement amount (the one
+    act its state fold honours, R19), the house's recovery from
+    its carrier, which moves no customer figure. The first four are
     the console money view's arithmetic — the console sums these
     same artefacts in its payload rows, and the eval gate grades
     the report against those rows so the two surfaces cannot
@@ -528,6 +530,20 @@ def money_totals(service, as_of: date | None = None) -> dict[str, Decimal]:
         receipts = [r for r in receipts if r.executed_on <= as_of]
         adjustments = [a for a in adjustments if a.created_on <= as_of]
         claim_acts = [a for a in claim_acts if a.acted_on <= as_of]
+    # Carrier settlements count once per claim: the EFFECTIVE
+    # settlement — the one act the claim's state fold honours
+    # (R19, RT-01). Before R19 this summed every settled act,
+    # so an act the fold could not honour (a same-day act whose
+    # hash sorted it before the acknowledgement) was counted
+    # anyway, and a second settlement counted twice.
+    acts_by_claim: dict[str, list] = {}
+    for act in claim_acts:
+        acts_by_claim.setdefault(act.claim_id, []).append(act)
+    settlements = [
+        s
+        for s in (effective_settlement(acts) for acts in acts_by_claim.values())
+        if s is not None
+    ]
     top_up_receipt_ids = {a.top_up_receipt_id for a in adjustments if a.top_up_receipt_id}
     return {
         "executed_refunds": sum(
@@ -549,8 +565,8 @@ def money_totals(service, as_of: date | None = None) -> dict[str, Decimal]:
         "carrier_claims_settled": sum(
             (
                 a.settled_amount
-                for a in claim_acts
-                if a.action == "settled" and a.settled_amount is not None
+                for a in settlements
+                if a.settled_amount is not None
             ),
             Decimal("0.00"),
         ),
@@ -561,10 +577,17 @@ def _build_money_summary(service, window_start, window_end, as_of: date):
     totals = money_totals(service, as_of)
     receipts = [r for r in service.list_receipts() if r.executed_on <= as_of]
     adjustments = [a for a in service.list_all_adjustments() if a.created_on <= as_of]
+    # The settled claims of record at the as-of: per claim, the
+    # one settlement act its fold honours (R19, RT-01) — the
+    # population and the input fingerprint name those acts.
+    acts_by_claim: dict[str, list] = {}
+    for a in service.list_all_claim_acts():
+        if a.acted_on <= as_of:
+            acts_by_claim.setdefault(a.claim_id, []).append(a)
     settlements = [
-        a
-        for a in service.list_all_claim_acts()
-        if a.action == "settled" and a.acted_on <= as_of
+        s
+        for s in (effective_settlement(acts) for acts in acts_by_claim.values())
+        if s is not None
     ]
     top_up_receipt_ids = {a.top_up_receipt_id for a in adjustments if a.top_up_receipt_id}
     population = {
@@ -701,6 +724,37 @@ def build_report(
 # verifier says so — that drift is exactly why the recomputation
 # superseded it, and the successor is the report that verifies.
 # ---------------------------------------------------------------------------
+
+
+def _effective_settlements_raw(rows: list[dict]) -> list[dict]:
+    """Re-perform the claim fold over raw act rows (R19): per
+    claim, order the rows by (acted_on, the lifecycle rank —
+    acknowledgement before settlement/denial on one date —
+    act_id) and keep the one settle row that moves the claim
+    from acknowledged to settled. This is the verifier's own
+    statement of the rule the builders apply through
+    `effective_settlement`: a settle row the fold cannot
+    honour is not a settlement, however it is dated."""
+    rank = {"acknowledged": 0, "settled": 1, "denied": 1}
+    by_claim: dict[str, list[dict]] = {}
+    for row in rows:
+        by_claim.setdefault(row["claim_id"], []).append(row)
+    effective: list[dict] = []
+    for claim_rows in by_claim.values():
+        state = "filed"
+        ordered = sorted(
+            claim_rows,
+            key=lambda r: (r["acted_on"], rank.get(r["action"], 2), r["act_id"]),
+        )
+        for row in ordered:
+            if row["action"] == "acknowledged" and state == "filed":
+                state = "acknowledged"
+            elif row["action"] == "settled" and state == "acknowledged":
+                state = "settled"
+                effective.append(row)
+            elif row["action"] == "denied" and state == "acknowledged":
+                state = "denied"
+    return effective
 
 
 def _raw_rows(store, method: str) -> list[dict]:
@@ -879,11 +933,13 @@ def verify_report(service, report: ManagementReport) -> list[str]:
             a for a in all_adjustments if a["created_on"] <= as_of.isoformat()
         ]
         top_up_ids = {a.get("top_up_receipt_id") for a in adjustments if a.get("top_up_receipt_id")}
-        settlements = [
-            a
-            for a in _raw_rows(store, "list_all_carrier_claim_acts")
-            if a["action"] == "settled" and a["acted_on"] <= as_of.isoformat()
-        ]
+        settlements = _effective_settlements_raw(
+            [
+                a
+                for a in _raw_rows(store, "list_all_carrier_claim_acts")
+                if a["acted_on"] <= as_of.isoformat()
+            ]
+        )
         zero = Decimal("0.00")
         totals = {
             "executed_refunds": sum(

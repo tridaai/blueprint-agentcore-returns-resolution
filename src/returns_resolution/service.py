@@ -66,6 +66,7 @@ from .carrier_exceptions import (
     build_exception,
     claim_amount_for,
     claim_state,
+    effective_settlement,
     evidence_fingerprint,
     exception_state,
     load_exception_pack,
@@ -848,6 +849,41 @@ class CaseService:
         report = self.get_grading_report(case_id)
         return report is not None and report.damage_attribution == "transit"
 
+    def _grading_cleared(self, exception: CarrierException) -> bool:
+        """Whether grading has examined this exception's own
+        label and closed the damage question WITHOUT attributing
+        it to transit (R19): a finalised grading report stands
+        on the exception's label, and its finding is that the
+        item was not worsened. That finding resolves a damaged
+        exception (`grading_cleared`) — before R19 such an
+        exception could never resolve and the case sat in limbo
+        behind the carrier guard."""
+        if exception.kind != KIND_DAMAGED_IN_TRANSIT:
+            return False
+        report = self.get_grading_report(exception.case_id)
+        return (
+            report is not None
+            and report.label_id == exception.label_id
+            and report.damage_attribution != "transit"
+        )
+
+    def _exception_state(
+        self, exception: CarrierException, acts: list[CarrierExceptionAct]
+    ) -> tuple[str, str | None]:
+        """The exception's state with both grading-derived
+        facts resolved — the one fold every reader uses, so the
+        view, the act door, the claim gate and the carrier
+        guard can never disagree about how an exception closed."""
+        return exception_state(
+            exception,
+            acts,
+            transit_attributed=(
+                exception.kind == KIND_DAMAGED_IN_TRANSIT
+                and self._transit_attributed(exception.case_id)
+            ),
+            grading_cleared=self._grading_cleared(exception),
+        )
+
     def detect_carrier_exceptions(
         self, case_id: str, *, as_of: date
     ) -> list[CarrierException]:
@@ -943,14 +979,7 @@ class CaseService:
         it stands open — the consequence of every path the pack
         offers for its kind, stated on the view."""
         acts = self.list_exception_acts(exception.exception_id)
-        state, path = exception_state(
-            exception,
-            acts,
-            transit_attributed=(
-                exception.kind == KIND_DAMAGED_IN_TRANSIT
-                and self._transit_attributed(exception.case_id)
-            ),
-        )
+        state, path = self._exception_state(exception, acts)
         view = exception.model_dump(mode="json")
         view["state"] = state
         view["resolution_path"] = path
@@ -978,7 +1007,9 @@ class CaseService:
         Refusals, each naming its gap: an unnamed actor; a path
         the pack does not offer for the kind, with the offered
         paths named; an act on an already-resolved exception,
-        naming the act that resolved it; a second escalation."""
+        naming the act that resolved it; a second escalation;
+        an act dated before the raising or before the standing
+        acts (acts land in date order, R19)."""
         exception = self.get_exception(exception_id)
         if exception is None:
             raise LookupError(f"unknown carrier exception: {exception_id}")
@@ -993,14 +1024,7 @@ class CaseService:
                 f"offers: {', '.join(offered)}"
             )
         acts = self.list_exception_acts(exception_id)
-        state, path = exception_state(
-            exception,
-            acts,
-            transit_attributed=(
-                exception.kind == KIND_DAMAGED_IN_TRANSIT
-                and self._transit_attributed(exception.case_id)
-            ),
-        )
+        state, path = self._exception_state(exception, acts)
         if state == STATE_RESOLVED:
             raise CarrierExceptionError(
                 f"exception {exception_id} is already resolved "
@@ -1011,6 +1035,23 @@ class CaseService:
             raise CarrierExceptionError(
                 f"exception {exception_id} is already escalated; a second "
                 "escalation adds nothing to the record"
+            )
+        # Acts land in date order (R19, RT-01's rule): the state
+        # fold reads acts by their recorded dates, so an act
+        # dated before the exception was raised, or before the
+        # acts already standing, would rewrite the order the
+        # record states. It is refused at the door instead.
+        if acted_on < exception.raised_on:
+            raise CarrierExceptionError(
+                f"an act on exception {exception_id} cannot be dated "
+                f"{acted_on}, before the exception was raised on "
+                f"{exception.raised_on}"
+            )
+        if acts and acted_on < max(a.acted_on for a in acts):
+            raise CarrierExceptionError(
+                f"an act on exception {exception_id} cannot be dated "
+                f"{acted_on}: the standing acts already reach "
+                f"{max(a.acted_on for a in acts)} — acts land in date order"
             )
         blob = json.dumps(
             {
@@ -1162,7 +1203,7 @@ class CaseService:
         grading_report_id: str | None = None
         if exception.kind == KIND_LOST_IN_TRANSIT:
             acts = self.list_exception_acts(exception_id)
-            state, path = exception_state(exception, acts)
+            state, path = self._exception_state(exception, acts)
             if state == STATE_OPEN:
                 raise CarrierExceptionError(
                     f"exception {exception_id} still stands open: a claim is "
@@ -1268,14 +1309,18 @@ class CaseService:
         ]
 
     def claim_view(self, claim: CarrierClaim) -> dict:
-        """The claim with its state folded from its acts."""
+        """The claim with its state folded from its acts. The
+        settled amount shown is the EFFECTIVE settlement's —
+        the one act the fold honours (R19): a settled act the
+        fold cannot honour moves no money and is not reported
+        as the claim's settlement."""
         acts = self.list_claim_acts(claim.claim_id)
         view = claim.model_dump(mode="json")
         view["state"] = claim_state(claim, acts)
         view["acts"] = [a.model_dump(mode="json") for a in acts]
-        settled = [a for a in acts if a.action == CLAIM_ACT_SETTLED]
+        settlement = effective_settlement(acts)
         view["settled_amount"] = (
-            str(settled[-1].settled_amount) if settled else None
+            str(settlement.settled_amount) if settlement is not None else None
         )
         return view
 
@@ -1293,9 +1338,13 @@ class CaseService:
         """One lifecycle act on a claim: acknowledged, then
         settled or denied, by named actors — the order is the
         lifecycle, and an act out of order is refused naming the
-        standing state. A settlement names the amount the carrier
-        paid: an external fact, recorded, bounded above by the
-        claimed amount. A denial names its reason from the pack's
+        standing state. Acts also land in DATE order (R19): an
+        act dated before the filing or before the standing acts
+        is refused, because the fold reads dates and a
+        back-dated act would silently never take effect. A
+        settlement names the amount the carrier paid: an
+        external fact, recorded, bounded above by the claimed
+        amount. A denial names its reason from the pack's
         vocabulary."""
         claim = self.get_claim(claim_id)
         if claim is None:
@@ -1308,7 +1357,26 @@ class CaseService:
                 f"claim action {action!r} is not in the lifecycle vocabulary "
                 f"({', '.join(CLAIM_ACTIONS)})"
             )
-        state = claim_state(claim, self.list_claim_acts(claim_id))
+        standing_acts = self.list_claim_acts(claim_id)
+        state = claim_state(claim, standing_acts)
+        # Acts land in date order (R19, RT-01/RT-02): the state
+        # fold reads acts by their recorded dates, so an act
+        # dated before the claim was filed, or before the acts
+        # already standing, would silently reorder the lifecycle
+        # — a settlement could be recorded yet never take
+        # effect, and a denial could be stepped over. Both are
+        # refused at the door, naming the dates.
+        if acted_on < claim.filed_on:
+            raise CarrierExceptionError(
+                f"a claim act cannot be dated {acted_on}, before the claim "
+                f"was filed on {claim.filed_on}"
+            )
+        if standing_acts and acted_on < max(a.acted_on for a in standing_acts):
+            raise CarrierExceptionError(
+                f"a claim act cannot be dated {acted_on}: the standing acts "
+                f"already reach {max(a.acted_on for a in standing_acts)} — "
+                "acts land in date order"
+            )
         if action == CLAIM_ACT_ACKNOWLEDGED and state != "filed":
             raise CarrierExceptionError(
                 f"claim {claim_id} stands {state}; only a filed claim can be "
@@ -1441,13 +1509,19 @@ class CaseService:
                 )
         elif claim.grading_report_id is not None:
             problems.append("a lost-in-transit claim binds no grading report")
-        computation_ids = {
-            c.computation_id for c in self.list_computations_for_case(claim.case_id)
-        }
-        if claim.computation_id is not None and claim.computation_id not in computation_ids:
+        # The bound computation must be the case's CURRENT one
+        # (R19, RT-09): a claim assembles over the computation
+        # of record — the chain head — and a claim still
+        # pointing at a superseded computation asserts figures
+        # the record has replaced. Membership in the chain is
+        # not enough.
+        head = self.get_computation(claim.case_id)
+        head_id = head.computation_id if head is not None else None
+        if claim.computation_id != head_id:
             problems.append(
-                f"the claim's computation {claim.computation_id} is not among "
-                "the case's computations of record"
+                f"the claim binds computation {claim.computation_id}, but "
+                f"the case's computation of record is {head_id} — a claim "
+                "assembles over the current computation"
             )
         expected_amount = claim_amount_for(
             self._exception_pack,
@@ -1493,13 +1567,9 @@ class CaseService:
         permanently: the item stayed with the customer, so no
         refund is payable for the return, ever."""
         for exception in self.list_exceptions(case_id):
-            state, path = exception_state(
+            state, path = self._exception_state(
                 exception,
                 self.list_exception_acts(exception.exception_id),
-                transit_attributed=(
-                    exception.kind == KIND_DAMAGED_IN_TRANSIT
-                    and self._transit_attributed(case_id)
-                ),
             )
             if state == STATE_RESOLVED and path == PATH_CUSTOMER_KEPT:
                 return (
@@ -2099,6 +2169,24 @@ class CaseService:
         hold manage_case; customers and auditors do not."""
         self._access.require_act(
             principal, ACT_MANAGE_CASE, surface=SURFACE_CASE, target=case_id, on=on
+        )
+
+    def require_claim_filing(
+        self, principal: Principal, case_id: str, *, on: date | None = None
+    ) -> None:
+        """The act half of filing a carrier claim, judged on its
+        own (R19, RT-06): the API's filing endpoint runs this
+        BEFORE it looks the named exception up, so a caller who
+        may not file at all gets the one act refusal whatever
+        exception id they name — the lookup's 404 can no longer
+        confirm that an exception exists. `file_carrier_claim_as`
+        runs the same check again on its own path."""
+        self._access.require_act(
+            principal,
+            ACT_MANAGE_CASE,
+            surface=SURFACE_EXCEPTIONS,
+            target=case_id,
+            on=on,
         )
 
     def require_intake(
@@ -4633,9 +4721,11 @@ class CaseService:
         stored as `topup:<key>`, so it can never collide with (or
         replay) the original refund's execution. Preconditions, each
         refusal naming the gap: an open top_up_due adjustment of
-        record; the fraud path open (the R4 guard); the adjustment's
-        computation still the case's current one and final; and the
-        approval gate RE-CHECKED against that new computation —
+        record; the fraud path open (the R4 guard); the carrier
+        path clear (the R18 guard, applied here since R19); the
+        adjustment's computation still the case's current one and
+        final; and the approval gate RE-CHECKED against that new
+        computation —
         approvals pinned to the superseded computation do not count,
         because they approved a different amount. A provider failure
         records a failed execution and leaves the adjustment open.
@@ -4673,6 +4763,15 @@ class CaseService:
                 "grading adjustment of record, and there is none to settle"
             )
         self.assert_refund_path_open(case_id)
+        # The carrier guard (R19, RT-03): a top-up is refund
+        # execution, and money does not move while the parcel's
+        # journey stands unaccounted for — the same guard
+        # execute_refund has carried since R18. Before R19 this
+        # path never called it, so a top-up on a better-graded
+        # damaged case paid out under an open exception.
+        block = self.carrier_block(case_id)
+        if block is not None:
+            raise PaymentsError(f"top-up execution refused: {block}")
         computation = self.get_computation(case_id)
         if computation is None or computation.computation_id != adjustment.to_computation_id:
             raise PaymentsError(
@@ -4960,6 +5059,14 @@ class CaseService:
             forbidden_terms.extend(reasons)
         if score is not None:
             forbidden_terms.extend(s.signal_id for s in score.signals)
+        # The exception pack's blame vocabulary (R19, RT-05):
+        # no customer payload may carry it, and the ban is
+        # derived from the pack here — like the scoring pack's
+        # signal names above — so it can never drift from the
+        # pack that states it. Before R19 the verifier never
+        # loaded these terms, and most of them verified clean
+        # in a model note on the exception notice.
+        forbidden_terms.extend(self._exception_pack.blame_terms)
         forbidden_terms = list(dict.fromkeys(forbidden_terms))
 
         context = MessageContext(

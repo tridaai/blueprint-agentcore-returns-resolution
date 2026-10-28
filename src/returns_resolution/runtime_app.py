@@ -964,6 +964,15 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     if action == "record_exception_act":
         try:
             if principal is not None:
+                # A payload naming another actor is refused, on
+                # the record — the rule every sibling branch and
+                # the API apply (R19, RT-07).
+                if payload.get("actor") and payload["actor"] != principal.id:
+                    service.deny_principal_mismatch(
+                        principal, surface=SURFACE_EXCEPTIONS,
+                        target=payload["exception_id"],
+                        field="actor", claimed=payload["actor"],
+                    )
                 act = service.record_exception_act_as(
                     principal,
                     payload["exception_id"],
@@ -987,6 +996,12 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     if action == "file_carrier_claim":
         try:
             if principal is not None:
+                if payload.get("filed_by") and payload["filed_by"] != principal.id:
+                    service.deny_principal_mismatch(
+                        principal, surface=SURFACE_EXCEPTIONS,
+                        target=payload["exception_id"],
+                        field="filed_by", claimed=payload["filed_by"],
+                    )
                 claim = service.file_carrier_claim_as(
                     principal,
                     payload["exception_id"],
@@ -1022,6 +1037,12 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         )
         try:
             if principal is not None:
+                if payload.get("actor") and payload["actor"] != principal.id:
+                    service.deny_principal_mismatch(
+                        principal, surface=SURFACE_EXCEPTIONS,
+                        target=payload["claim_id"],
+                        field="actor", claimed=payload["actor"],
+                    )
                 act = service.record_claim_act_as(
                     principal,
                     payload["claim_id"],

@@ -406,11 +406,20 @@ class AccessControl:
             )
         principal_id = raw.get("id") if isinstance(raw, Mapping) else None
         role = raw.get("role") if isinstance(raw, Mapping) else None
+        # The pair is judged AS CARRIED (R19, RT-08): the role
+        # vocabulary is exact strings — the same discipline the
+        # gateway pack is graded on — and an id is the caller's
+        # own identifier, not a string to normalise. Before R19
+        # the pair was stripped first, so a padded role
+        # (" staff_supervisor ", "system ") authenticated as
+        # the role it merely resembled.
         if (
             not isinstance(principal_id, str)
             or not principal_id.strip()
+            or principal_id != principal_id.strip()
             or not isinstance(role, str)
             or not role.strip()
+            or role != role.strip()
         ):
             self.deny(
                 principal_id=str(principal_id or ""),
@@ -418,11 +427,12 @@ class AccessControl:
                 surface=surface,
                 target=target,
                 reason=REASON_MALFORMED_PRINCIPAL,
-                detail="a principal is an (id, role) pair with both parts named",
+                detail=(
+                    "a principal is an (id, role) pair with both parts named "
+                    "exactly — no surrounding whitespace"
+                ),
                 on=on,
             )
-        principal_id = principal_id.strip()
-        role = role.strip()
         if self.pack.grant(role) is None:
             self.deny(
                 principal_id=principal_id,

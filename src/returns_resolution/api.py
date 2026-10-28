@@ -570,8 +570,20 @@ def create_app(service: CaseService) -> FastAPI:
         """File the carrier claim for one of the case's exceptions
         (R18): assembled only from artefacts of record, at the
         pack's formula. One claim per exception — a second filing
-        returns the standing claim."""
+        returns the standing claim. With a principal, the filing
+        act is judged before the exception is looked up, so the
+        not-found answer never confirms an exception to a caller
+        who may not file (R19)."""
         principal = _principal(request, service, surface=SURFACE_EXCEPTIONS, target=case_id)
+        if principal is not None:
+            # The act is judged BEFORE the lookup (R19, RT-06):
+            # a caller who may not file at all gets the one act
+            # refusal whatever exception id they name, so the
+            # lookup's 404 cannot confirm an exception exists.
+            try:
+                service.require_claim_filing(principal, case_id)
+            except AccessDeniedError as exc:
+                _guard(exc)
         exception = service.get_exception(body.exception_id)
         if exception is None or exception.case_id != case_id:
             raise HTTPException(status_code=404, detail="exception not found")

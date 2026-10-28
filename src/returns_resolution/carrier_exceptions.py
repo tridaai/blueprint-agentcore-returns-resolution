@@ -85,6 +85,15 @@ PATH_CUSTOMER_KEPT = "customer_kept"
 PATH_REFUND_AS_RECEIVED = "refund_as_received"
 PATH_ESCALATE = "escalate"
 PATH_GRADING_ATTRIBUTION = "grading_attribution"
+# A second derived resolution (R19), on the attribution
+# precedent: grading examined the carrier's damage on the
+# exception's own label and found the item NOT worsened — the
+# exception closes on that finding. It is not an act either;
+# it appears in state views so the record says how the
+# exception closed. Without it, a damaged exception whose
+# item graded as declared (or better) could never resolve,
+# and the case sat in limbo behind the carrier guard.
+PATH_GRADING_CLEARED = "grading_cleared"
 RESOLUTION_PATHS = [PATH_REISSUE_LABEL, PATH_CUSTOMER_KEPT, PATH_REFUND_AS_RECEIVED]
 
 STATE_OPEN = "open"
@@ -226,6 +235,12 @@ EXCEPTION_PACK_V1 = ExceptionPack(
             "carrier recorded the damage while the parcel was in its care, so "
             "the damage is not attributed to you. Your refund stands at "
             "${total}, computed on the condition you declared."
+        ),
+        "resolved_grading_cleared": (
+            "The carrier recorded your return parcel (label {ref}) as damaged "
+            "in transit. When it reached us, our inspection found no damage "
+            "to the item itself, so your return proceeds as normal — the "
+            "damage was to the parcel, and it is not attributed to you."
         ),
         "resolved_refund_as_received": (
             "The carrier lost your return parcel (label {ref}) in transit. "
@@ -413,6 +428,7 @@ def exception_state(
     acts: list[CarrierExceptionAct],
     *,
     transit_attributed: bool = False,
+    grading_cleared: bool = False,
 ) -> tuple[str, str | None]:
     """The exception's state, folded from its acts in recorded
     order: (state, resolution path or None). Escalation keeps it
@@ -420,7 +436,12 @@ def exception_state(
     exception with no resolution act whose damage grading has
     attributed to transit is resolved by that attribution — a
     fact of record, stated here rather than written as an act
-    nobody performed."""
+    nobody performed. A damaged exception whose grading
+    finalised on its own label WITHOUT attributing the damage
+    (the item graded no worse than declared) is resolved by
+    that examination instead (`grading_cleared`, R19): without
+    it the exception could never close and the case sat in
+    limbo behind the carrier guard."""
     state = STATE_OPEN
     path: str | None = None
     for act in sorted(acts, key=lambda a: (a.acted_on, a.act_id)):
@@ -430,12 +451,11 @@ def exception_state(
         elif act.action in RESOLUTION_PATHS:
             state = STATE_RESOLVED
             path = act.action
-    if (
-        state != STATE_RESOLVED
-        and exception.kind == KIND_DAMAGED_IN_TRANSIT
-        and transit_attributed
-    ):
-        return STATE_RESOLVED, PATH_GRADING_ATTRIBUTION
+    if state != STATE_RESOLVED and exception.kind == KIND_DAMAGED_IN_TRANSIT:
+        if transit_attributed:
+            return STATE_RESOLVED, PATH_GRADING_ATTRIBUTION
+        if grading_cleared:
+            return STATE_RESOLVED, PATH_GRADING_CLEARED
     return state, path
 
 
@@ -453,16 +473,58 @@ def claim_amount_for(
     raise CarrierExceptionError(f"no carrier claim lies for exception kind {kind!r}")
 
 
-def claim_state(claim: CarrierClaim, acts: list[CarrierClaimAct]) -> str:
-    """The claim's state, folded from its acts in recorded order:
-    filed, then acknowledged, then settled or denied (terminal)."""
+# The lifecycle order within a single day (R19): acts fold by
+# their recorded date, and on one date by the order the
+# lifecycle itself states — an acknowledgement lands before a
+# settlement or denial recorded the same day. Before R19 the
+# tie-break was the acts' content-hash ids, so a same-day
+# acknowledgement and settlement could fold in either order:
+# the settlement was silently inert, the claim read merely
+# acknowledged, and a second settlement could be recorded —
+# while the money layer counted both (docs/red-team.md RT-01).
+_CLAIM_ACT_ORDER = {CLAIM_ACT_ACKNOWLEDGED: 0, CLAIM_ACT_SETTLED: 1, CLAIM_ACT_DENIED: 1}
+
+
+def _fold_claim_acts(
+    acts: list[CarrierClaimAct],
+) -> tuple[str, CarrierClaimAct | None]:
+    """Fold a claim's acts to (state, the effective settlement
+    act or None). The effective settlement is the ONE act the
+    fold honours — the settle act that moved the claim from
+    acknowledged to settled. Every money reader counts that
+    act and no other: an act the fold cannot honour (recorded
+    out of order before the R19 date guards, or a duplicate)
+    moves no money."""
     state = CLAIM_STATE_FILED
-    for act in sorted(acts, key=lambda a: (a.acted_on, a.act_id)):
+    settlement: CarrierClaimAct | None = None
+    ordered = sorted(
+        acts,
+        key=lambda a: (a.acted_on, _CLAIM_ACT_ORDER.get(a.action, 2), a.act_id),
+    )
+    for act in ordered:
         if act.action == CLAIM_ACT_ACKNOWLEDGED and state == CLAIM_STATE_FILED:
             state = CLAIM_STATE_ACKNOWLEDGED
-        elif act.action in (CLAIM_ACT_SETTLED, CLAIM_ACT_DENIED) and state == CLAIM_STATE_ACKNOWLEDGED:
-            state = act.action
-    return state
+        elif act.action == CLAIM_ACT_SETTLED and state == CLAIM_STATE_ACKNOWLEDGED:
+            state = CLAIM_STATE_SETTLED
+            settlement = act
+        elif act.action == CLAIM_ACT_DENIED and state == CLAIM_STATE_ACKNOWLEDGED:
+            state = CLAIM_STATE_DENIED
+    return state, settlement
+
+
+def claim_state(claim: CarrierClaim, acts: list[CarrierClaimAct]) -> str:
+    """The claim's state, folded from its acts in lifecycle
+    order: filed, then acknowledged, then settled or denied
+    (terminal)."""
+    return _fold_claim_acts(acts)[0]
+
+
+def effective_settlement(acts: list[CarrierClaimAct]) -> CarrierClaimAct | None:
+    """The settlement act of record for one claim — the act
+    its state fold honours — or None when the claim does not
+    stand settled. This, never a raw scan of settled acts, is
+    what the money summary counts (R19, RT-01)."""
+    return _fold_claim_acts(acts)[1]
 
 
 def evidence_fingerprint(payload: dict) -> str:
