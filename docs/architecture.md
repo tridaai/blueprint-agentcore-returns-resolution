@@ -901,7 +901,54 @@ vocabulary are data.
   Runtime carry the surface at parity with the reports
   pattern, hiding refusals included.
 
+## The red team (R19)
+
+No new component — a set of invariants the existing ones now
+carry, each bought by an attack in `docs/red-team.md`:
+
+- **One fold for exception and claim state.** Exception
+  state is derived in exactly one place
+  (`service._exception_state`), which composes the act fold
+  with the label's grading facts: transit attribution, and
+  since R19 `grading_cleared` — a finalised report on the
+  exception's own label that did not attribute the damage
+  resolves a damaged exception the attribution path cannot
+  reach. Every reader (views, the carrier guard, the claim
+  gate, messaging facts) folds through it, so no surface can
+  disagree with another about whether an exception stands.
+- **Acts land in date order.** Both act doors refuse an act
+  dated before the artefact's birth (filing / raising) or
+  before the standing acts, and the claim fold orders
+  same-day acts by lifecycle rank before the content hash.
+  State is a function of the record as it could actually
+  have been written.
+- **Money counts effective settlements only.** There is one
+  definition — the settle act a claim's fold honours —
+  shared by `money_totals`, the money summary builder, its
+  independently written verifier (`_effective_settlements_raw`
+  re-performs the fold over raw rows), and the claim view.
+- **Every execution path carries every guard.** The top-up
+  now composes the fraud guard, the carrier guard and the
+  approval gate exactly as the refund does; a guard that
+  binds one money path binds them all.
+- **Bans derive from their packs.** The verified message
+  universe takes its forbidden terms from the disclosure
+  pack, the scoring pack and — since R19 — the exception
+  pack's blame vocabulary, in one place (`_message_universe`),
+  so a pack's stated ban is the verifier's ban by
+  construction.
+- **Judgement before existence, everywhere.** The filing
+  endpoint joins the verify endpoints and the Runtime in
+  judging the caller's act before any lookup that could
+  confirm an artefact exists; a principal pair is judged
+  exactly as carried; a payload naming an actor other than
+  the calling principal is refused on the record on every
+  Runtime branch, the R18 three included.
+- **Claims bind the chain head.** Claim verification
+  compares the bound computation to the case's current
+  computation of record, not to the chain's membership.
+
 ## What is deliberately not here yet
 
-Red team, deploy artefacts. The README's honest status is the
+Deploy artefacts. The README's honest status is the
 authoritative per-round account.

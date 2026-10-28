@@ -131,6 +131,24 @@ the pack prescribes. Regression: T-M5/T-P4.
 | T-R4 | A report's inputs move after it is computed (a further case's outcome becomes known), then the report is recomputed | The recomputation mints a **new** artefact whose `supersedes` names the old one; the old report still stands, unedited, and now **fails** re-performance — the drift the verifier names is the reason it was superseded; recomputing over unmoved inputs returns the standing artefact unchanged | Reports are insert-only artefacts: supersession by recomputation, never edits |
 | T-R5 | A fraud report where no outcome is known at all, and a return rate over a window with no orders | Precision, recall and the rate all state **`not_computable`** — never 0, never 1 | A ratio over an empty population is undefined, and the report says so |
 
+## The red team (R19)
+
+R19 ran this suite's method across the rounds built since —
+quarantine, access, reporting, carrier exceptions, and their
+seams with money and messaging — and kept its own record in
+`docs/red-team.md`, with regressions in `tests/test_r19.py`
+and zero-tolerance `redteam_*` counters in the eval gate.
+Nine defects were found and fixed there (the claim fold's
+double settlement, the top-up's missing carrier guard, the
+damaged-exception limbo, the verifier's missing blame ban,
+and five smaller seams). The three gaps named in this
+document were re-examined: the 94.99 construction gap
+(T-F2) is still closed by construction; the split-household
+link (T-F3) is still open and still a data decision; and
+opener/reviewer separation is still absent from the scoring
+pack — while the separation the grading pack does state is
+re-graded as T-RT10.
+
 ## What the suite deliberately does not trap
 
 - **A 94.99 fraud score** — unreachable by construction (T-F2);
