@@ -61,6 +61,16 @@ is a recorded artefact.
   recorded target is the requested id string — which the
   requester supplied — and no field of the denial says whether
   the case exists.
+
+R18 extends the same pack, it does not fork it: the `exceptions`
+surface (staff-readable operational record) and one new act —
+`settle_carrier_claim`, supervisor tier — because settling a
+carrier claim above the exception pack's threshold commits the
+house's recovery position the way an approval commits a refund.
+Exception handling itself (raise, choose a path, file and work a
+claim) is `manage_case` work; a customer reads their own case's
+exception STATUS through the case surface, in the narrowed shape,
+under the same existence-hiding rule as the case itself.
 """
 
 from __future__ import annotations
@@ -102,6 +112,7 @@ SURFACE_CONSOLE = "console"
 SURFACE_DENIAL_LOG = "denial_log"
 SURFACE_PACKS = "packs"
 SURFACE_REPORTS = "reports"
+SURFACE_EXCEPTIONS = "exceptions"
 SURFACES = [
     SURFACE_CASE,
     SURFACE_ORDER,
@@ -115,6 +126,7 @@ SURFACES = [
     SURFACE_DENIAL_LOG,
     SURFACE_PACKS,
     SURFACE_REPORTS,
+    SURFACE_EXCEPTIONS,
 ]
 
 # Acts — the named operations the pack gates. These are the
@@ -127,6 +139,7 @@ ACT_APPROVE_REFUND = "approve_refund"
 ACT_CONFIRM_FRAUD_REVIEW = "confirm_fraud_review"
 ACT_RELEASE_QUARANTINE = "release_quarantine"
 ACT_COMPUTE_REPORT = "compute_report"
+ACT_SETTLE_CARRIER_CLAIM = "settle_carrier_claim"
 ACTS = [
     ACT_INTAKE_RETURN,
     ACT_MANAGE_CASE,
@@ -135,6 +148,7 @@ ACTS = [
     ACT_CONFIRM_FRAUD_REVIEW,
     ACT_RELEASE_QUARANTINE,
     ACT_COMPUTE_REPORT,
+    ACT_SETTLE_CARRIER_CLAIM,
 ]
 
 # Denial reasons — the closed vocabulary of the denial log.
@@ -233,6 +247,10 @@ _STAFF_READS = [
     SURFACE_MEMORY,
     SURFACE_CONSOLE,
     SURFACE_PACKS,
+    # Carrier exceptions (R18) are operational record: staff read
+    # them to work them. Claims ride the same surface; the
+    # settlement act above the pack threshold is its own act.
+    SURFACE_EXCEPTIONS,
 ]
 
 ACCESS_PACK_V1 = AccessPack(
@@ -315,6 +333,7 @@ ACCESS_PACK_V1 = AccessPack(
         ],
         ACT_RELEASE_QUARANTINE: [ROLE_STAFF_SUPERVISOR, ROLE_SYSTEM],
         ACT_COMPUTE_REPORT: [ROLE_STAFF_SUPERVISOR, ROLE_SYSTEM],
+        ACT_SETTLE_CARRIER_CLAIM: [ROLE_STAFF_SUPERVISOR, ROLE_SYSTEM],
     },
 )
 

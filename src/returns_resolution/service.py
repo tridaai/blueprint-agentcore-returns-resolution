@@ -22,6 +22,7 @@ from .access import (
     ACT_INTAKE_RETURN,
     ACT_MANAGE_CASE,
     ACT_RELEASE_QUARANTINE,
+    ACT_SETTLE_CARRIER_CLAIM,
     REASON_ACTOR_MISMATCH,
     REASON_CASE_NOT_VISIBLE,
     REASON_CUSTOMER_SCOPE,
@@ -29,6 +30,7 @@ from .access import (
     SURFACE_CASE,
     SURFACE_COST_LEDGER,
     SURFACE_DENIAL_LOG,
+    SURFACE_EXCEPTIONS,
     SURFACE_FRAUD,
     SURFACE_MEMORY,
     SURFACE_MONEY,
@@ -42,6 +44,34 @@ from .access import (
     load_access_pack,
 )
 from .carrier import CarrierPort, CarrierProviderError, LocalCarrierDouble
+from .carrier_exceptions import (
+    CLAIM_ACT_ACKNOWLEDGED,
+    CLAIM_ACT_DENIED,
+    CLAIM_ACT_SETTLED,
+    CLAIM_ACTIONS,
+    KIND_DAMAGED_IN_TRANSIT,
+    KIND_LABEL_NEVER_TENDERED,
+    KIND_LOST_IN_TRANSIT,
+    PATH_CUSTOMER_KEPT,
+    PATH_ESCALATE,
+    RESOLUTION_PATHS,
+    STATE_OPEN,
+    STATE_RESOLVED,
+    CarrierClaim,
+    CarrierClaimAct,
+    CarrierException,
+    CarrierExceptionAct,
+    CarrierExceptionError,
+    ExceptionPack,
+    build_exception,
+    claim_amount_for,
+    claim_state,
+    evidence_fingerprint,
+    exception_state,
+    load_exception_pack,
+    transit_successor_decision,
+    verify_transit_decision,
+)
 from .disposition import (
     BASIS_GRADED,
     HOLD_FOR_INSPECTION,
@@ -284,6 +314,7 @@ class CaseService:
         memory_port: MemoryPort | None = None,
         screening_pack: ScreeningPack | None = None,
         access_pack: AccessPack | None = None,
+        exception_pack: ExceptionPack | None = None,
     ):
         self._store = store
         # The model gateway (R12): the ONE path every model-shaped
@@ -353,6 +384,10 @@ class CaseService:
         # are the principal-carrying face of the service; the
         # guard's denial log lives in the store (migration 0012).
         self._access = AccessControl(store, access_pack or load_access_pack())
+        # The carrier exception pack (R18): the detection windows,
+        # the handling paths and their consequences, the claim
+        # formula — versioned data, evaluated by the methods below.
+        self._exception_pack = exception_pack or load_exception_pack()
         # The tool gateway (R6, generalized R11): the ONLY path
         # tool-shaped actions take — carrier tools, refund execution
         # and the grading callback alike. Handlers are the _tool_*
@@ -797,6 +832,866 @@ class CaseService:
             )
         self._access.require_read(principal, SURFACE_REPORTS, target="reports", on=on)
         return self.list_reports(kind=kind)
+
+    # -- carrier exceptions and claims (R18) ---------------------------
+    # The unguarded methods are the trusted-local face (what the
+    # surfaces gate); the *_as methods are the principal-carrying
+    # face under the access pack's exceptions surface.
+
+    def get_exception_pack(self) -> ExceptionPack:
+        return self._exception_pack
+
+    def _transit_attributed(self, case_id: str) -> bool:
+        """Whether grading has attributed this case's damage to
+        transit (the R18 grading cascade's finding, on the report
+        of record)."""
+        report = self.get_grading_report(case_id)
+        return report is not None and report.damage_attribution == "transit"
+
+    def detect_carrier_exceptions(
+        self, case_id: str, *, as_of: date
+    ) -> list[CarrierException]:
+        """Raise the exceptions the carrier event record states,
+        in code, per label of the case — and return the case's
+        exceptions of record afterwards.
+
+        The rules are the pack's: over each label that is not
+        voided, a `damaged` event raises damaged_in_transit (the
+        bound events end at the damage — the record as it stood
+        when the damage was recorded); with no warehouse receipt
+        of record, a label whose events never show a tender past
+        the tender window raises label_never_tendered, and one
+        tendered but never received past the transit window
+        raises lost_in_transit. A received journey raises nothing.
+        Raising is idempotent: an exception already of record for
+        (label, kind) stands, and the artefact is content-addressed
+        over its facts besides."""
+        case = self.get_case(case_id)
+        if case is None:
+            raise LookupError(f"unknown case: {case_id}")
+        pack = self._exception_pack
+        standing = self.list_exceptions(case_id)
+        for label in self.list_labels(case_id):
+            if label.status == "voided":
+                continue
+            events = self._carrier_events_for(label, as_of)
+            kinds = [e.kind for e in events]
+
+            def _raise(kind: str, window_days: int, bound: list) -> None:
+                if any(
+                    e.label_id == label.label_id and e.kind == kind for e in standing
+                ):
+                    return
+                artefact = build_exception(
+                    case_id=case_id,
+                    label_id=label.label_id,
+                    kind=kind,
+                    raised_on=as_of,
+                    issued_on=label.issued_on,
+                    window_days=window_days,
+                    event_ids=[e.event_id for e in bound],
+                    event_kinds=[e.kind for e in bound],
+                    pack=pack,
+                )
+                self._store.put_carrier_exception(artefact.model_dump(mode="json"))
+                standing.append(artefact)
+
+            if "damaged" in kinds:
+                cut = kinds.index("damaged") + 1
+                _raise(KIND_DAMAGED_IN_TRANSIT, 0, events[:cut])
+                continue
+            receipt = self._store.get_warehouse_receipt_for_label(label.label_id)
+            if receipt is not None or "received" in kinds:
+                continue
+            if "tendered" not in kinds:
+                if as_of >= label.issued_on + timedelta(days=pack.never_tendered_days):
+                    _raise(
+                        KIND_LABEL_NEVER_TENDERED, pack.never_tendered_days, events
+                    )
+            elif as_of >= label.issued_on + timedelta(days=pack.lost_in_transit_days):
+                _raise(KIND_LOST_IN_TRANSIT, pack.lost_in_transit_days, events)
+        return self.list_exceptions(case_id)
+
+    def list_exceptions(self, case_id: str) -> list[CarrierException]:
+        exceptions = [
+            CarrierException.model_validate(p)
+            for p in self._store.list_carrier_exceptions(case_id)
+        ]
+        return sorted(exceptions, key=lambda e: (e.raised_on, e.exception_id))
+
+    def list_all_exceptions(self) -> list[CarrierException]:
+        return [
+            CarrierException.model_validate(p)
+            for p in self._store.list_all_carrier_exceptions()
+        ]
+
+    def get_exception(self, exception_id: str) -> CarrierException | None:
+        payload = self._store.get_carrier_exception(exception_id)
+        return CarrierException.model_validate(payload) if payload else None
+
+    def list_exception_acts(self, exception_id: str) -> list[CarrierExceptionAct]:
+        acts = [
+            CarrierExceptionAct.model_validate(p)
+            for p in self._store.list_carrier_exception_acts(exception_id)
+        ]
+        return sorted(acts, key=lambda a: (a.acted_on, a.act_id))
+
+    def exception_view(self, exception: CarrierException) -> dict:
+        """The exception with its derived standing: state and
+        resolution path folded from its acts (plus grading's
+        transit attribution for a damaged exception), and — while
+        it stands open — the consequence of every path the pack
+        offers for its kind, stated on the view."""
+        acts = self.list_exception_acts(exception.exception_id)
+        state, path = exception_state(
+            exception,
+            acts,
+            transit_attributed=(
+                exception.kind == KIND_DAMAGED_IN_TRANSIT
+                and self._transit_attributed(exception.case_id)
+            ),
+        )
+        view = exception.model_dump(mode="json")
+        view["state"] = state
+        view["resolution_path"] = path
+        view["acts"] = [a.model_dump(mode="json") for a in acts]
+        if state != STATE_RESOLVED:
+            view["path_consequences"] = {
+                p: self._exception_pack.consequence(exception.kind, p)
+                for p in self._exception_pack.paths_for(exception.kind)
+            }
+        else:
+            view["path_consequences"] = {}
+        return view
+
+    def record_exception_act(
+        self,
+        exception_id: str,
+        *,
+        action: str,
+        actor: str,
+        acted_on: date,
+        note: str = "",
+    ) -> CarrierExceptionAct:
+        """The handling act: a named actor chooses one of the
+        pack's paths for this exception's kind (or escalates).
+        Refusals, each naming its gap: an unnamed actor; a path
+        the pack does not offer for the kind, with the offered
+        paths named; an act on an already-resolved exception,
+        naming the act that resolved it; a second escalation."""
+        exception = self.get_exception(exception_id)
+        if exception is None:
+            raise LookupError(f"unknown carrier exception: {exception_id}")
+        actor = (actor or "").strip()
+        if not actor:
+            raise CarrierExceptionError("a carrier exception act requires a named actor")
+        offered = self._exception_pack.paths_for(exception.kind)
+        if action not in offered:
+            raise CarrierExceptionError(
+                f"path {action!r} is not offered for a {exception.kind} exception "
+                f"under exception pack {self._exception_pack.version} — the pack "
+                f"offers: {', '.join(offered)}"
+            )
+        acts = self.list_exception_acts(exception_id)
+        state, path = exception_state(
+            exception,
+            acts,
+            transit_attributed=(
+                exception.kind == KIND_DAMAGED_IN_TRANSIT
+                and self._transit_attributed(exception.case_id)
+            ),
+        )
+        if state == STATE_RESOLVED:
+            raise CarrierExceptionError(
+                f"exception {exception_id} is already resolved "
+                f"(path: {path}); a resolved exception takes no further acts — "
+                "a new journey problem is a new exception on its own record"
+            )
+        if action == PATH_ESCALATE and state != STATE_OPEN:
+            raise CarrierExceptionError(
+                f"exception {exception_id} is already escalated; a second "
+                "escalation adds nothing to the record"
+            )
+        blob = json.dumps(
+            {
+                "exception_id": exception_id,
+                "action": action,
+                "actor": actor,
+                "acted_on": acted_on.isoformat(),
+                "note": note,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        act = CarrierExceptionAct(
+            act_id="CEA-" + hashlib.sha256(blob.encode()).hexdigest()[:16],
+            exception_id=exception_id,
+            case_id=exception.case_id,
+            action=action,
+            actor=actor,
+            acted_on=acted_on,
+            note=note,
+        )
+        self._store.put_carrier_exception_act(act.model_dump(mode="json"))
+        return act
+
+    def verify_exception(self, exception_id: str) -> list[str]:
+        """Re-perform one exception's raising from the carrier
+        record; [] = the artefact is exactly what the record
+        states. The events are re-read as of the raising date,
+        the pack window re-checked, and the artefact rebuilt and
+        compared whole."""
+        exception = self.get_exception(exception_id)
+        if exception is None:
+            return [f"unknown carrier exception: {exception_id}"]
+        label = self.get_label(exception.label_id)
+        if label is None:
+            return [f"label {exception.label_id} is missing from the record"]
+        pack = self._exception_pack
+        problems: list[str] = []
+        if exception.pack_version != pack.version:
+            problems.append(
+                f"exception names pack {exception.pack_version}; the loaded pack "
+                f"is {pack.version}"
+            )
+        events = self._carrier_events_for(label, exception.raised_on)
+        kinds = [e.kind for e in events]
+        if exception.kind == KIND_DAMAGED_IN_TRANSIT:
+            if "damaged" not in kinds:
+                problems.append(
+                    "the carrier record as of the raising date shows no damaged "
+                    "event for this label"
+                )
+                bound = events
+            else:
+                bound = events[: kinds.index("damaged") + 1]
+            window = 0
+        elif exception.kind == KIND_LABEL_NEVER_TENDERED:
+            window = pack.never_tendered_days
+            bound = events
+            if "tendered" in kinds:
+                problems.append(
+                    "the carrier record shows a tender for this label; a "
+                    "never-tendered exception cannot rest on it"
+                )
+            if exception.raised_on < label.issued_on + timedelta(days=window):
+                problems.append(
+                    f"raised on {exception.raised_on}, before the pack's "
+                    f"{window}-day tender window from {label.issued_on} ran out"
+                )
+        elif exception.kind == KIND_LOST_IN_TRANSIT:
+            window = pack.lost_in_transit_days
+            bound = events
+            if "tendered" not in kinds:
+                problems.append(
+                    "the carrier record shows no tender for this label; a "
+                    "lost-in-transit exception needs a journey that began"
+                )
+            if "received" in kinds:
+                problems.append(
+                    "the carrier record shows receipt of this label; the parcel "
+                    "was not lost in transit"
+                )
+            if exception.raised_on < label.issued_on + timedelta(days=window):
+                problems.append(
+                    f"raised on {exception.raised_on}, before the pack's "
+                    f"{window}-day transit window from {label.issued_on} ran out"
+                )
+        else:
+            return [f"unknown exception kind: {exception.kind!r}"]
+        rebuilt = build_exception(
+            case_id=exception.case_id,
+            label_id=exception.label_id,
+            kind=exception.kind,
+            raised_on=exception.raised_on,
+            issued_on=label.issued_on,
+            window_days=window,
+            event_ids=[e.event_id for e in bound],
+            event_kinds=[e.kind for e in bound],
+            pack=pack,
+        )
+        if rebuilt.exception_id != exception.exception_id:
+            problems.append(
+                f"exception_id {exception.exception_id} != recomputed "
+                f"{rebuilt.exception_id} (facts changed since this artefact was written)"
+            )
+        elif rebuilt.model_dump(mode="json") != exception.model_dump(mode="json"):
+            problems.append(
+                "stored exception differs from a fresh raising over the same record"
+            )
+        return problems
+
+    def file_carrier_claim(
+        self, exception_id: str, *, filed_by: str, filed_on: date
+    ) -> CarrierClaim:
+        """Assemble and file the carrier claim for an exception —
+        only from artefacts of record, at the pack's formula.
+        Refusals, each naming its gap: a kind no claim lies for;
+        a lost exception nobody has yet escalated or resolved
+        (the parcel is not yet established lost); a lost claim
+        after a customer-kept resolution (the item stayed with
+        the customer — nothing is owed by the carrier); a damaged
+        claim before grading has attributed the damage to
+        transit. One claim per exception: a second filing returns
+        the standing claim."""
+        exception = self.get_exception(exception_id)
+        if exception is None:
+            raise LookupError(f"unknown carrier exception: {exception_id}")
+        filed_by = (filed_by or "").strip()
+        if not filed_by:
+            raise CarrierExceptionError("filing a carrier claim requires a named actor")
+        for claim in self.list_claims(exception.case_id):
+            if claim.exception_id == exception_id:
+                return claim
+        if exception.kind not in (KIND_LOST_IN_TRANSIT, KIND_DAMAGED_IN_TRANSIT):
+            raise CarrierExceptionError(
+                f"no carrier claim lies for a {exception.kind} exception — claims "
+                "lie for parcels the carrier lost or damaged in transit"
+            )
+        case = self.get_case(exception.case_id)
+        if case is None or case.decision is None:
+            raise CarrierExceptionError(
+                f"case {exception.case_id} has no decision of record; there are "
+                "no figures for a claim to bind"
+            )
+        label = self.get_label(exception.label_id)
+        if label is None:
+            raise CarrierExceptionError(
+                f"label {exception.label_id} is missing from the record"
+            )
+        grading_report_id: str | None = None
+        if exception.kind == KIND_LOST_IN_TRANSIT:
+            acts = self.list_exception_acts(exception_id)
+            state, path = exception_state(exception, acts)
+            if state == STATE_OPEN:
+                raise CarrierExceptionError(
+                    f"exception {exception_id} still stands open: a claim is "
+                    "filed once a named act has escalated it or resolved it as "
+                    "refund-as-received — the parcel must be established lost "
+                    "before the house claims for it"
+                )
+            if path == PATH_CUSTOMER_KEPT:
+                raise CarrierExceptionError(
+                    "this return was resolved as customer-kept: the item "
+                    "remains with the customer, so no carrier claim lies"
+                )
+        else:  # damaged in transit
+            report = self.get_grading_report(exception.case_id)
+            if (
+                report is None
+                or report.damage_attribution != "transit"
+                or report.label_id != exception.label_id
+            ):
+                raise CarrierExceptionError(
+                    "a damaged-in-transit claim is filed on the grading "
+                    "report that attributed the damage to transit; no such "
+                    f"report stands for case {exception.case_id}"
+                )
+            grading_report_id = report.report_id
+        events = self._carrier_events_for(label, filed_on)
+        receipt = self._store.get_warehouse_receipt_for_label(label.label_id)
+        computation = self.get_computation(exception.case_id)
+        item_amount = case.decision.item_amount
+        claimed = claim_amount_for(
+            self._exception_pack,
+            exception.kind,
+            item_amount=item_amount,
+            label_cost=label.cost,
+        )
+        fingerprint = evidence_fingerprint(
+            {
+                "exception_id": exception_id,
+                "label_id": label.label_id,
+                "event_ids": [e.event_id for e in events],
+                "warehouse_receipt_id": receipt["warehouse_receipt_id"] if receipt else None,
+                "grading_report_id": grading_report_id,
+                "computation_id": computation.computation_id if computation else None,
+                "item_amount": str(item_amount),
+                "label_cost": str(label.cost),
+                "claimed_amount": str(claimed),
+            }
+        )
+        blob = json.dumps(
+            {"exception_id": exception_id, "filed_on": filed_on.isoformat(), "fingerprint": fingerprint},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        claim = CarrierClaim(
+            claim_id="CLM-" + hashlib.sha256(blob.encode()).hexdigest()[:16],
+            case_id=exception.case_id,
+            exception_id=exception_id,
+            kind=exception.kind,
+            filed_by=filed_by,
+            filed_on=filed_on,
+            claimed_amount=claimed,
+            item_amount=item_amount,
+            label_cost=label.cost,
+            label_id=label.label_id,
+            event_ids=[e.event_id for e in events],
+            warehouse_receipt_id=receipt["warehouse_receipt_id"] if receipt else None,
+            grading_report_id=grading_report_id,
+            computation_id=computation.computation_id if computation else None,
+            evidence_fingerprint=fingerprint,
+            pack_version=self._exception_pack.version,
+        )
+        self._store.put_carrier_claim(claim.model_dump(mode="json"))
+        return claim
+
+    def list_claims(self, case_id: str) -> list[CarrierClaim]:
+        claims = [
+            CarrierClaim.model_validate(p)
+            for p in self._store.list_carrier_claims(case_id)
+        ]
+        return sorted(claims, key=lambda c: (c.filed_on, c.claim_id))
+
+    def list_all_claims(self) -> list[CarrierClaim]:
+        return [
+            CarrierClaim.model_validate(p)
+            for p in self._store.list_all_carrier_claims()
+        ]
+
+    def get_claim(self, claim_id: str) -> CarrierClaim | None:
+        payload = self._store.get_carrier_claim(claim_id)
+        return CarrierClaim.model_validate(payload) if payload else None
+
+    def list_claim_acts(self, claim_id: str) -> list[CarrierClaimAct]:
+        acts = [
+            CarrierClaimAct.model_validate(p)
+            for p in self._store.list_carrier_claim_acts(claim_id)
+        ]
+        return sorted(acts, key=lambda a: (a.acted_on, a.act_id))
+
+    def list_all_claim_acts(self) -> list[CarrierClaimAct]:
+        return [
+            CarrierClaimAct.model_validate(p)
+            for p in self._store.list_all_carrier_claim_acts()
+        ]
+
+    def claim_view(self, claim: CarrierClaim) -> dict:
+        """The claim with its state folded from its acts."""
+        acts = self.list_claim_acts(claim.claim_id)
+        view = claim.model_dump(mode="json")
+        view["state"] = claim_state(claim, acts)
+        view["acts"] = [a.model_dump(mode="json") for a in acts]
+        settled = [a for a in acts if a.action == CLAIM_ACT_SETTLED]
+        view["settled_amount"] = (
+            str(settled[-1].settled_amount) if settled else None
+        )
+        return view
+
+    def record_claim_act(
+        self,
+        claim_id: str,
+        *,
+        action: str,
+        actor: str,
+        acted_on: date,
+        settled_amount: Decimal | None = None,
+        reason_code: str | None = None,
+        note: str = "",
+    ) -> CarrierClaimAct:
+        """One lifecycle act on a claim: acknowledged, then
+        settled or denied, by named actors — the order is the
+        lifecycle, and an act out of order is refused naming the
+        standing state. A settlement names the amount the carrier
+        paid: an external fact, recorded, bounded above by the
+        claimed amount. A denial names its reason from the pack's
+        vocabulary."""
+        claim = self.get_claim(claim_id)
+        if claim is None:
+            raise LookupError(f"unknown carrier claim: {claim_id}")
+        actor = (actor or "").strip()
+        if not actor:
+            raise CarrierExceptionError("a carrier claim act requires a named actor")
+        if action not in CLAIM_ACTIONS:
+            raise CarrierExceptionError(
+                f"claim action {action!r} is not in the lifecycle vocabulary "
+                f"({', '.join(CLAIM_ACTIONS)})"
+            )
+        state = claim_state(claim, self.list_claim_acts(claim_id))
+        if action == CLAIM_ACT_ACKNOWLEDGED and state != "filed":
+            raise CarrierExceptionError(
+                f"claim {claim_id} stands {state}; only a filed claim can be "
+                "acknowledged"
+            )
+        if action in (CLAIM_ACT_SETTLED, CLAIM_ACT_DENIED) and state != "acknowledged":
+            raise CarrierExceptionError(
+                f"claim {claim_id} stands {state}; a claim is settled or denied "
+                "only from acknowledged — the carrier must first acknowledge it"
+            )
+        if action == CLAIM_ACT_SETTLED:
+            if settled_amount is None:
+                raise CarrierExceptionError(
+                    "a settlement act must name the amount the carrier paid"
+                )
+            settled_amount = money(settled_amount)
+            if settled_amount <= 0:
+                raise CarrierExceptionError("a settlement amount must be positive")
+            if settled_amount > claim.claimed_amount:
+                raise CarrierExceptionError(
+                    f"settled amount ${settled_amount} exceeds the claimed "
+                    f"${claim.claimed_amount}: a settlement cannot pay more "
+                    "than the claim of record asserts"
+                )
+            if reason_code is not None:
+                raise CarrierExceptionError(
+                    "a settlement act carries no reason code — reasons belong "
+                    "to denials"
+                )
+        elif action == CLAIM_ACT_DENIED:
+            if reason_code is None or reason_code not in self._exception_pack.claim_deny_reasons:
+                raise CarrierExceptionError(
+                    "a denial must name its reason from the exception pack's "
+                    f"vocabulary ({', '.join(self._exception_pack.claim_deny_reasons)})"
+                )
+            if settled_amount is not None:
+                raise CarrierExceptionError(
+                    "a denial act carries no settled amount"
+                )
+        elif settled_amount is not None or reason_code is not None:
+            raise CarrierExceptionError(
+                "an acknowledgement carries neither an amount nor a reason code"
+            )
+        blob = json.dumps(
+            {
+                "claim_id": claim_id,
+                "action": action,
+                "actor": actor,
+                "acted_on": acted_on.isoformat(),
+                "settled_amount": str(settled_amount) if settled_amount is not None else None,
+                "reason_code": reason_code,
+                "note": note,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        act = CarrierClaimAct(
+            act_id="CLA-" + hashlib.sha256(blob.encode()).hexdigest()[:16],
+            claim_id=claim_id,
+            case_id=claim.case_id,
+            action=action,
+            actor=actor,
+            acted_on=acted_on,
+            settled_amount=settled_amount,
+            reason_code=reason_code,
+            note=note,
+        )
+        self._store.put_carrier_claim_act(act.model_dump(mode="json"))
+        return act
+
+    def verify_carrier_claim(self, claim_id: str) -> list[str]:
+        """Re-assemble one claim from the record and compare every
+        bound field; [] = the claim asserts exactly what the
+        record holds. The events are re-read as of the filing
+        date, the amount re-performed from the pack's formula
+        over the bound figures, and the evidence fingerprint and
+        claim id recomputed."""
+        claim = self.get_claim(claim_id)
+        if claim is None:
+            return [f"unknown carrier claim: {claim_id}"]
+        problems: list[str] = []
+        exception = self.get_exception(claim.exception_id)
+        if exception is None:
+            problems.append(f"exception {claim.exception_id} is missing from the record")
+            return problems
+        if exception.case_id != claim.case_id or exception.kind != claim.kind:
+            problems.append("the claim's case/kind do not match its exception of record")
+        case = self.get_case(claim.case_id)
+        if case is None or case.decision is None:
+            problems.append(f"case {claim.case_id} has no decision of record")
+            return problems
+        if claim.item_amount != case.decision.item_amount:
+            problems.append(
+                f"item_amount ${claim.item_amount} != the decision's "
+                f"${case.decision.item_amount}"
+            )
+        label = self.get_label(claim.label_id)
+        if label is None:
+            problems.append(f"label {claim.label_id} is missing from the record")
+            return problems
+        if claim.label_cost != label.cost:
+            problems.append(
+                f"label_cost ${claim.label_cost} != the label's ${label.cost}"
+            )
+        events = self._carrier_events_for(label, claim.filed_on)
+        if [e.event_id for e in events] != claim.event_ids:
+            problems.append(
+                "the claim's bound carrier events differ from the record as of "
+                "its filing date"
+            )
+        receipt = self._store.get_warehouse_receipt_for_label(label.label_id)
+        receipt_id = receipt["warehouse_receipt_id"] if receipt else None
+        if claim.warehouse_receipt_id != receipt_id:
+            problems.append(
+                "the claim's warehouse receipt binding differs from the record"
+            )
+        if claim.kind == KIND_DAMAGED_IN_TRANSIT:
+            report = self.get_grading_report(claim.case_id)
+            expected_report = (
+                report.report_id
+                if report is not None
+                and report.damage_attribution == "transit"
+                and report.label_id == claim.label_id
+                else None
+            )
+            if claim.grading_report_id != expected_report:
+                problems.append(
+                    "the claim's grading binding differs from the transit-"
+                    "attributed report of record"
+                )
+        elif claim.grading_report_id is not None:
+            problems.append("a lost-in-transit claim binds no grading report")
+        computation_ids = {
+            c.computation_id for c in self.list_computations_for_case(claim.case_id)
+        }
+        if claim.computation_id is not None and claim.computation_id not in computation_ids:
+            problems.append(
+                f"the claim's computation {claim.computation_id} is not among "
+                "the case's computations of record"
+            )
+        expected_amount = claim_amount_for(
+            self._exception_pack,
+            claim.kind,
+            item_amount=case.decision.item_amount,
+            label_cost=label.cost,
+        )
+        if claim.claimed_amount != expected_amount:
+            problems.append(
+                f"claimed_amount ${claim.claimed_amount} != the pack formula's "
+                f"${expected_amount} over the bound figures"
+            )
+        fingerprint = evidence_fingerprint(
+            {
+                "exception_id": claim.exception_id,
+                "label_id": claim.label_id,
+                "event_ids": [e.event_id for e in events],
+                "warehouse_receipt_id": receipt_id,
+                "grading_report_id": claim.grading_report_id,
+                "computation_id": claim.computation_id,
+                "item_amount": str(case.decision.item_amount),
+                "label_cost": str(label.cost),
+                "claimed_amount": str(expected_amount),
+            }
+        )
+        if fingerprint != claim.evidence_fingerprint:
+            problems.append("the evidence fingerprint does not recompute from the record")
+        blob = json.dumps(
+            {"exception_id": claim.exception_id, "filed_on": claim.filed_on.isoformat(), "fingerprint": fingerprint},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if "CLM-" + hashlib.sha256(blob.encode()).hexdigest()[:16] != claim.claim_id:
+            problems.append("the claim id does not recompute from its evidence")
+        return problems
+
+    def carrier_block(self, case_id: str) -> str | None:
+        """Why a carrier exception currently bars refund execution
+        on this case, or None. An exception that stands open or
+        escalated bars it — the parcel is unaccounted for, and
+        money does not move on an unaccounted journey until a
+        named act resolves it. A customer-kept resolution bars it
+        permanently: the item stayed with the customer, so no
+        refund is payable for the return, ever."""
+        for exception in self.list_exceptions(case_id):
+            state, path = exception_state(
+                exception,
+                self.list_exception_acts(exception.exception_id),
+                transit_attributed=(
+                    exception.kind == KIND_DAMAGED_IN_TRANSIT
+                    and self._transit_attributed(case_id)
+                ),
+            )
+            if state == STATE_RESOLVED and path == PATH_CUSTOMER_KEPT:
+                return (
+                    f"exception {exception.exception_id} was resolved as "
+                    "customer-kept: the item remains with the customer and no "
+                    "refund is payable for this return"
+                )
+            if state != STATE_RESOLVED:
+                return (
+                    f"carrier exception {exception.exception_id} "
+                    f"({exception.kind}) stands {state}: refund execution is "
+                    "refused until a named resolution act lands — the paths "
+                    f"the pack offers are: "
+                    f"{', '.join(self._exception_pack.paths_for(exception.kind))}"
+                )
+        return None
+
+    # -- carrier exceptions under access control (R18) -----------------
+
+    def detect_exceptions_as(
+        self, principal: Principal, case_id: str, *, as_of: date, on: date | None = None
+    ) -> list[CarrierException]:
+        """Detection as a principal: working an exception is
+        manage_case work (staff tier); the case must be visible
+        to the principal besides."""
+        self._access.require_act(
+            principal, ACT_MANAGE_CASE, surface=SURFACE_EXCEPTIONS, target=case_id, on=on
+        )
+        self._visible_case(principal, case_id, surface=SURFACE_EXCEPTIONS, on=on)
+        return self.detect_carrier_exceptions(case_id, as_of=as_of)
+
+    def list_exceptions_as(
+        self, principal: Principal, case_id: str, *, on: date | None = None
+    ) -> list[dict]:
+        """The case's exceptions as a principal — the staff view,
+        states and acts included. Not a customer surface: claims
+        and exception handling are operational record."""
+        self._access.require_read(
+            principal, SURFACE_EXCEPTIONS, target=case_id, on=on
+        )
+        self._visible_case(principal, case_id, surface=SURFACE_EXCEPTIONS, on=on)
+        return [self.exception_view(e) for e in self.list_exceptions(case_id)]
+
+    def get_exception_status_as(
+        self, principal: Principal, case_id: str, *, on: date | None = None
+    ) -> list[dict] | None:
+        """The exception STATUS of one case, as a principal. A
+        customer reads their own case's status in the narrowed
+        shape (kind, state, when raised — no acts, no actors, no
+        claim figures); another customer's case is hidden behind
+        the ordinary not-found, exactly like the case itself.
+        Staff read the full view on the exceptions surface."""
+        if principal.role == ROLE_CUSTOMER:
+            case = self._visible_case(principal, case_id, surface=SURFACE_CASE, on=on)
+            if case is None:
+                return None
+            return [
+                {
+                    "exception_id": e.exception_id,
+                    "kind": e.kind,
+                    "state": self.exception_view(e)["state"],
+                    "raised_on": e.raised_on.isoformat(),
+                }
+                for e in self.list_exceptions(case_id)
+            ]
+        self._access.require_read(
+            principal, SURFACE_EXCEPTIONS, target=case_id, on=on
+        )
+        if self._visible_case(principal, case_id, surface=SURFACE_EXCEPTIONS, on=on) is None:
+            return None
+        return [self.exception_view(e) for e in self.list_exceptions(case_id)]
+
+    def record_exception_act_as(
+        self,
+        principal: Principal,
+        exception_id: str,
+        *,
+        action: str,
+        acted_on: date,
+        note: str = "",
+        on: date | None = None,
+    ) -> CarrierExceptionAct:
+        """The handling act as a principal: manage_case tier, and
+        the act's actor is the principal — the act of record and
+        the authenticated caller are the same person."""
+        self._access.require_act(
+            principal,
+            ACT_MANAGE_CASE,
+            surface=SURFACE_EXCEPTIONS,
+            target=exception_id,
+            on=on,
+        )
+        return self.record_exception_act(
+            exception_id,
+            action=action,
+            actor=principal.id,
+            acted_on=acted_on,
+            note=note,
+        )
+
+    def file_carrier_claim_as(
+        self,
+        principal: Principal,
+        exception_id: str,
+        *,
+        filed_on: date,
+        on: date | None = None,
+    ) -> CarrierClaim:
+        """Filing as a principal: manage_case tier, the filer is
+        the principal."""
+        self._access.require_act(
+            principal,
+            ACT_MANAGE_CASE,
+            surface=SURFACE_EXCEPTIONS,
+            target=exception_id,
+            on=on,
+        )
+        return self.file_carrier_claim(
+            exception_id, filed_by=principal.id, filed_on=filed_on
+        )
+
+    def record_claim_act_as(
+        self,
+        principal: Principal,
+        claim_id: str,
+        *,
+        action: str,
+        acted_on: date,
+        settled_amount: Decimal | None = None,
+        reason_code: str | None = None,
+        note: str = "",
+        on: date | None = None,
+    ) -> CarrierClaimAct:
+        """A claim act as a principal. The pack tiers it: working
+        a claim is manage_case, but a settlement ABOVE the
+        exception pack's supervisor threshold is the
+        settle_carrier_claim act — supervisor tier — because it
+        commits the house's recovery position. The actor is the
+        principal."""
+        if (
+            action == CLAIM_ACT_SETTLED
+            and settled_amount is not None
+            and money(settled_amount)
+            > self._exception_pack.claim_settlement_supervisor_threshold
+        ):
+            self._access.require_act(
+                principal,
+                ACT_SETTLE_CARRIER_CLAIM,
+                surface=SURFACE_EXCEPTIONS,
+                target=claim_id,
+                on=on,
+            )
+        else:
+            self._access.require_act(
+                principal,
+                ACT_MANAGE_CASE,
+                surface=SURFACE_EXCEPTIONS,
+                target=claim_id,
+                on=on,
+            )
+        return self.record_claim_act(
+            claim_id,
+            action=action,
+            actor=principal.id,
+            acted_on=acted_on,
+            settled_amount=settled_amount,
+            reason_code=reason_code,
+            note=note,
+        )
+
+    def list_claims_as(
+        self, principal: Principal, case_id: str, *, on: date | None = None
+    ) -> list[dict]:
+        """The case's claims as a principal. Claims are the
+        house's recovery record against its carrier — never a
+        customer surface: a customer principal is refused with
+        the existence-hiding denial, like reports."""
+        if principal.role == ROLE_CUSTOMER:
+            self._access.deny(
+                principal_id=principal.id,
+                role=principal.role,
+                surface=SURFACE_EXCEPTIONS,
+                target=case_id,
+                reason=REASON_CASE_NOT_VISIBLE,
+                detail="carrier claims are not visible to customer principals",
+                on=on,
+            )
+        self._access.require_read(
+            principal, SURFACE_EXCEPTIONS, target=case_id, on=on
+        )
+        self._visible_case(principal, case_id, surface=SURFACE_EXCEPTIONS, on=on)
+        return [self.claim_view(c) for c in self.list_claims(case_id)]
 
     def _hide_case(self, principal: Principal, case_id: str, *, surface: str, on) -> None:
         """Record a case-visibility denial and raise it. The
@@ -1356,7 +2251,10 @@ class CaseService:
         Declared-basis decisions re-run the matrix walk; graded-basis
         decisions (R7) re-run it over the graded facts; an
         inspection-resolution decision (a GR-* cell) is re-performed
-        from the grading report it rests on.
+        from the grading report it rests on; a transit decision
+        (the exception pack's EX-* cell, R18) is re-performed from
+        the transit-attributed grading report and the carrier's
+        damage event it names.
         """
         disposition = self.get_disposition(case_id)
         case = self.get_case(case_id)
@@ -1365,6 +2263,16 @@ class CaseService:
         order = self.get_order(case.order_id)
         if order is None:
             return ["order missing for this case"]
+        if (
+            disposition.cell_id is not None
+            and disposition.cell_id == self._exception_pack.transit_rule_id
+        ):
+            report = self.get_grading_report(case_id)
+            if report is None:
+                return ["no grading report for this transit disposition"]
+            return verify_transit_decision(
+                disposition, report=report, pack=self._exception_pack
+            )
         if disposition.cell_id is not None and disposition.cell_id.startswith("GR-"):
             report = self.get_grading_report(case_id)
             if report is None:
@@ -2202,6 +3110,13 @@ class CaseService:
         if computation is None:
             raise PaymentsError(f"case {case_id} has no refund computation to execute")
         self.assert_refund_path_open(case_id)
+        # The carrier guard (R18): money does not move while the
+        # parcel's journey stands unaccounted for — an open or
+        # escalated exception bars execution, and a customer-kept
+        # resolution bars it permanently.
+        block = self.carrier_block(case_id)
+        if block is not None:
+            raise PaymentsError(f"refund execution refused: {block}")
         if not computation.eligible:
             raise PaymentsError(
                 "no refund is due on this case (eligibility denied); nothing to execute"
@@ -3363,10 +4278,39 @@ class CaseService:
         current_disposition = self.get_disposition(case_id)
         current_computation = self.get_computation(case_id)
 
+        # -- transit attribution (R18) ---------------------------------
+        # The carrier's own record governs whose damage this is: a
+        # `damaged` event for this label, with the graded condition
+        # worse than the declaration, attributes the worsening to
+        # transit. An attributed cascade never re-prices the refund
+        # against the customer (step 2 is skipped — the refund
+        # stands on the declared condition), never opens an
+        # adjustment, never fires the fraud re-score, and resolves
+        # the disposition through the exception pack's transit row
+        # instead of the matrix. Without both facts the cascade is
+        # R7's, unchanged.
+        transit_event: CarrierEvent | None = None
+        grading_label = self.get_label(receipt.label_id)
+        if grading_label is not None:
+            for event in self._carrier_events_for(grading_label, graded_on):
+                if event.kind == "damaged":
+                    transit_event = event
+                    break
+        transit_attributed = bool(
+            transit_event is not None
+            and CONDITION_RANKS[graded_condition] > CONDITION_RANKS.get(declared, 0)
+        )
+
         # -- step 2 (computed early, in memory): the refund re-run ----
+        # Skipped when the damage is transit-attributed: the refund
+        # stands exactly as computed on the declared condition.
         new_computation: RefundComputation | None = None
         refund_delta: Decimal | None = None
-        if graded_condition != declared and current_computation is not None:
+        if (
+            graded_condition != declared
+            and current_computation is not None
+            and not transit_attributed
+        ):
             new_computation = compute_refund(
                 self._pack,
                 order,
@@ -3451,6 +4395,28 @@ class CaseService:
                 )
             else:
                 new_disposition = walk
+            if transit_attributed:
+                # The transit row (R18) replaces the matrix outcome:
+                # the damage is the carrier's, the item goes back to
+                # the vendor, and the decision's cell names the
+                # exception pack's rule and the carrier's event.
+                band = self._matrix.band_for(age_days) if age_days is not None else None
+                new_disposition = transit_successor_decision(
+                    case_id=case_id,
+                    computation_id=pinned_computation,
+                    matrix_version=self._matrix.version,
+                    channel_table_version=self._channels.version,
+                    category=category,
+                    condition_declared=declared,
+                    graded_condition=graded_condition,
+                    age_days=age_days,
+                    age_band=band.band_id if band else None,
+                    damage_event_id=transit_event.event_id,
+                    supersedes=(
+                        current_disposition.disposition_id if current_disposition else ""
+                    ),
+                    pack=self._exception_pack,
+                )
 
         report_blob = json.dumps(
             {
@@ -3548,8 +4514,13 @@ class CaseService:
                 raise FigureVerificationError(violations)
 
         # -- the fraud trigger (step 5's decision, on the record) -------
+        # Transit-attributed damage never fires it: the trigger reads
+        # misrepresentation, and the carrier's damage is not the
+        # customer's misrepresentation (R18).
         rank_jump = CONDITION_RANKS[graded_condition] - CONDITION_RANKS.get(declared, 0)
-        rescore_triggered = bool(rank_jump >= WILDLY_WORSE_JUMP and wear_evidence)
+        rescore_triggered = bool(
+            rank_jump >= WILDLY_WORSE_JUMP and wear_evidence and not transit_attributed
+        )
 
         report = GradingReport(
             report_id=report_id,
@@ -3565,6 +4536,8 @@ class CaseService:
             damage_notes=damage_notes_read,
             received_weight_grams=received_weight_grams,
             wear_evidence=wear_evidence,
+            damage_attribution="transit" if transit_attributed else None,
+            damage_event_id=transit_event.event_id if transit_attributed else None,
             photo_metadata=photo_metadata_read,
             gaps=grading_gaps,
             quarantine_refs=quarantine_refs,

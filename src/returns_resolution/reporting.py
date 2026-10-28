@@ -41,11 +41,14 @@ can be made to prove again, not a figure someone typed.
   R7 — is an actual positive. The prediction graded against that
   truth is the case's CURRENT fraud score band: FRAUD_REVIEW is
   the flag.
-- **The money summary forks nothing.** Its four totals are sums
-  over the same receipt and adjustment artefacts the operations
-  console sums (R13) — computed here from the artefacts of record
-  and graded equal to the console payload's rows, so the board
-  and the report can never quietly disagree.
+- **The money summary forks nothing.** Its four customer-money
+  totals are sums over the same receipt and adjustment artefacts
+  the operations console sums (R13) — computed here from the
+  artefacts of record and graded equal to the console payload's
+  rows, so the board and the report can never quietly disagree.
+  Carrier claims settled (R18) stand as a fifth line of their
+  own — the house's recovery, beside the customer money and
+  never inside it.
 - **The cost summary is cumulative, and says why.** Cost ledger
   entries carry no timestamps (R12), so a per-period cost report
   cannot be honestly cut; the report covers every entry of record
@@ -204,7 +207,11 @@ REPORT_PACK_V1 = ReportPack(
                 "of record establishes misrepresentation on its "
                 "own: graded condition at least the grading pack's "
                 "wildly-worse rank jump below the declared "
-                "condition, with wear evidence. Every other scored "
+                "condition, with wear evidence. A grading report "
+                "whose damage is attributed to transit (R18) "
+                "establishes nothing against the customer and is "
+                "skipped — the carrier's damage is not the "
+                "customer's misrepresentation. Every other scored "
                 "case is EXCLUDED and counted as excluded — never "
                 "treated as a negative. The prediction is the "
                 "current score's band: FRAUD_REVIEW is flagged."
@@ -235,17 +242,23 @@ REPORT_PACK_V1 = ReportPack(
                 "split, over the same artefacts, that the "
                 "operations console's money view sums (R13). "
                 "Outstanding positions are the open adjustments, "
-                "by kind."
+                "by kind. Carrier claims settled (R18) are their "
+                "own line: the settlement acts' amounts, the "
+                "house's recovery from its carrier — recorded "
+                "beside the customer money, never inside it: a "
+                "settlement moves no customer figure."
             ),
             window_rule=(
                 "Cumulative through the as-of: receipts by "
-                "executed_on, adjustments by created_on."
+                "executed_on, adjustments by created_on, claim "
+                "settlements by their act date."
             ),
             measures=[
                 "executed_refunds",
                 "executed_top_ups",
                 "recoveries_outstanding",
                 "top_ups_outstanding",
+                "carrier_claims_settled",
             ],
         ),
         ReportDefinition(
@@ -426,6 +439,10 @@ def _fraud_truth(service, case_id: str) -> tuple[str, str] | None:
             return ("positive", "review_decision")
         return ("negative", "review_decision")
     for report in service.list_grading_reports(case_id):
+        if report.damage_attribution == "transit":
+            # R18: the carrier's damage, attributed on the report —
+            # it establishes nothing against the customer.
+            continue
         declared = CONDITION_RANKS.get(report.declared_condition)
         graded = CONDITION_RANKS.get(report.graded_condition)
         if declared is None or graded is None:
@@ -493,19 +510,24 @@ def _build_fraud_outcomes(service, window_start, window_end, as_of: date):
 
 
 def money_totals(service, as_of: date | None = None) -> dict[str, Decimal]:
-    """The money view's four totals, from the artefacts of
-    record: executed refunds, executed top-ups (the receipts the
+    """The money view's totals, from the artefacts of record:
+    executed refunds, executed top-ups (the receipts the
     adjustments name as their top-up settlements), outstanding
     recoveries and outstanding top-ups (the open adjustments, by
-    kind). This is the console money view's arithmetic — the
-    console sums these same artefacts in its payload rows, and
-    the eval gate grades the report against those rows so the two
-    surfaces cannot fork."""
+    kind) — and, on its own line, carrier claims settled (R18):
+    the settlement acts' amounts, the house's recovery from its
+    carrier, which moves no customer figure. The first four are
+    the console money view's arithmetic — the console sums these
+    same artefacts in its payload rows, and the eval gate grades
+    the report against those rows so the two surfaces cannot
+    fork."""
     receipts = service.list_receipts()
     adjustments = service.list_all_adjustments()
+    claim_acts = service.list_all_claim_acts()
     if as_of is not None:
         receipts = [r for r in receipts if r.executed_on <= as_of]
         adjustments = [a for a in adjustments if a.created_on <= as_of]
+        claim_acts = [a for a in claim_acts if a.acted_on <= as_of]
     top_up_receipt_ids = {a.top_up_receipt_id for a in adjustments if a.top_up_receipt_id}
     return {
         "executed_refunds": sum(
@@ -524,6 +546,14 @@ def money_totals(service, as_of: date | None = None) -> dict[str, Decimal]:
             (a.amount for a in adjustments if a.kind == "top_up_due" and a.status == "open"),
             Decimal("0.00"),
         ),
+        "carrier_claims_settled": sum(
+            (
+                a.settled_amount
+                for a in claim_acts
+                if a.action == "settled" and a.settled_amount is not None
+            ),
+            Decimal("0.00"),
+        ),
     }
 
 
@@ -531,6 +561,11 @@ def _build_money_summary(service, window_start, window_end, as_of: date):
     totals = money_totals(service, as_of)
     receipts = [r for r in service.list_receipts() if r.executed_on <= as_of]
     adjustments = [a for a in service.list_all_adjustments() if a.created_on <= as_of]
+    settlements = [
+        a
+        for a in service.list_all_claim_acts()
+        if a.action == "settled" and a.acted_on <= as_of
+    ]
     top_up_receipt_ids = {a.top_up_receipt_id for a in adjustments if a.top_up_receipt_id}
     population = {
         "receipts": len(receipts),
@@ -545,9 +580,14 @@ def _build_money_summary(service, window_start, window_end, as_of: date):
         "open_top_ups": len(
             [a for a in adjustments if a.kind == "top_up_due" and a.status == "open"]
         ),
+        "settled_claims": len(settlements),
     }
     figures = {name: _money_str(value) for name, value in totals.items()}
-    inputs = sorted([r.receipt_id for r in receipts] + [a.adjustment_id for a in adjustments])
+    inputs = sorted(
+        [r.receipt_id for r in receipts]
+        + [a.adjustment_id for a in adjustments]
+        + [a.act_id for a in settlements]
+    )
     return population, figures, [], inputs
 
 
@@ -839,6 +879,11 @@ def verify_report(service, report: ManagementReport) -> list[str]:
             a for a in all_adjustments if a["created_on"] <= as_of.isoformat()
         ]
         top_up_ids = {a.get("top_up_receipt_id") for a in adjustments if a.get("top_up_receipt_id")}
+        settlements = [
+            a
+            for a in _raw_rows(store, "list_all_carrier_claim_acts")
+            if a["action"] == "settled" and a["acted_on"] <= as_of.isoformat()
+        ]
         zero = Decimal("0.00")
         totals = {
             "executed_refunds": sum(
@@ -863,6 +908,9 @@ def verify_report(service, report: ManagementReport) -> list[str]:
                 ),
                 zero,
             ),
+            "carrier_claims_settled": sum(
+                (Decimal(a["settled_amount"]) for a in settlements), zero
+            ),
         }
         expected_figures = {name: _money_str(value) for name, value in totals.items()}
         expected_population = {
@@ -876,9 +924,14 @@ def verify_report(service, report: ManagementReport) -> list[str]:
             "open_top_ups": len(
                 [a for a in adjustments if a["kind"] == "top_up_due" and a["status"] == "open"]
             ),
+            "settled_claims": len(settlements),
         }
         expected_breakdown = []
-        input_ids = sorted([r["receipt_id"] for r in receipts] + [a["adjustment_id"] for a in adjustments])
+        input_ids = sorted(
+            [r["receipt_id"] for r in receipts]
+            + [a["adjustment_id"] for a in adjustments]
+            + [a["act_id"] for a in settlements]
+        )
 
     elif report.kind == KIND_COST_SUMMARY:
         entries = _raw_rows(store, "list_all_cost_entries")
@@ -945,6 +998,8 @@ def _truth_from_rows(store, case_id: str) -> tuple[str, str] | None:
             return ("positive", "review_decision")
         return ("negative", "review_decision")
     for report in store.list_grading_reports(case_id):
+        if report.get("damage_attribution") == "transit":
+            continue  # R18: transit damage is not misrepresentation
         declared = CONDITION_RANKS.get(report["declared_condition"])
         graded = CONDITION_RANKS.get(report["graded_condition"])
         if declared is None or graded is None:
