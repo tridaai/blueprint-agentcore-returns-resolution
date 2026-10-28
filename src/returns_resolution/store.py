@@ -105,11 +105,41 @@ CREATE TABLE IF NOT EXISTS fraud_reviews (
 );
 """
 
+# Migration 0005 — refund approvals, executions and receipts (R5).
+# Approvals are acts (many per case, pinned to a computation), so no
+# case uniqueness there; executions and receipts are unique per
+# idempotency key AND receipts unique per computation — the two
+# constraints that make a double refund structurally impossible.
+_MIGRATION_0005_SQLITE = """
+CREATE TABLE IF NOT EXISTS refund_approvals (
+    approval_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    computation_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS refund_executions (
+    execution_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    computation_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS refund_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    computation_id TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("0001", _MIGRATION_0001_SQLITE, _MIGRATION_0001_PG),
     ("0002", _MIGRATION_0002_SQLITE, _MIGRATION_0002_SQLITE),
     ("0003", _MIGRATION_0003_SQLITE, _MIGRATION_0003_SQLITE),
     ("0004", _MIGRATION_0004_SQLITE, _MIGRATION_0004_SQLITE),
+    ("0005", _MIGRATION_0005_SQLITE, _MIGRATION_0005_SQLITE),
 ]
 
 
@@ -141,6 +171,18 @@ class Store(Protocol):
     def put_fraud_review(self, payload: dict[str, Any]) -> None: ...
     def get_fraud_review(self, score_id: str) -> dict[str, Any] | None: ...
     def list_fraud_reviews(self, case_id: str) -> list[dict[str, Any]]: ...
+    def put_approval(self, payload: dict[str, Any]) -> None: ...
+    def list_approvals(self, case_id: str) -> list[dict[str, Any]]: ...
+    def put_execution(self, payload: dict[str, Any]) -> None: ...
+    def get_execution(self, execution_id: str) -> dict[str, Any] | None: ...
+    def get_execution_by_key(self, idempotency_key: str) -> dict[str, Any] | None: ...
+    def list_executions(self, case_id: str) -> list[dict[str, Any]]: ...
+    def put_receipt(self, payload: dict[str, Any]) -> None: ...
+    def get_receipt(self, receipt_id: str) -> dict[str, Any] | None: ...
+    def get_receipt_by_key(self, idempotency_key: str) -> dict[str, Any] | None: ...
+    def get_receipt_by_computation(self, computation_id: str) -> dict[str, Any] | None: ...
+    def get_receipt_for_case(self, case_id: str) -> dict[str, Any] | None: ...
+    def list_receipts(self) -> list[dict[str, Any]]: ...
 
 
 class SqlStore:
@@ -437,6 +479,120 @@ class SqlStore:
         )
         return [json.loads(r["payload"]) for r in rows]
 
+    # -- approvals, executions, receipts (R5) ------------------------------
+    def put_approval(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO refund_approvals (approval_id, case_id, computation_id, payload) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (approval_id) DO UPDATE SET payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO refund_approvals (approval_id, case_id, computation_id, payload) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (approval_id) DO UPDATE SET payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["approval_id"],
+                payload["case_id"],
+                payload["computation_id"],
+                json.dumps(payload),
+            ),
+        )
+
+    def list_approvals(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM refund_approvals WHERE case_id = ? ORDER BY approval_id",
+            (case_id,),
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
+    def put_execution(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO refund_executions (execution_id, case_id, computation_id, idempotency_key, status, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (execution_id) DO UPDATE SET "
+            "status = excluded.status, payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO refund_executions (execution_id, case_id, computation_id, idempotency_key, status, payload) "
+            "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (execution_id) DO UPDATE SET "
+            "status = EXCLUDED.status, payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["execution_id"],
+                payload["case_id"],
+                payload["computation_id"],
+                payload["idempotency_key"],
+                payload["status"],
+                json.dumps(payload),
+            ),
+        )
+
+    def get_execution(self, execution_id: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT payload FROM refund_executions WHERE execution_id = ?", (execution_id,)
+        )
+        return json.loads(row["payload"]) if row else None
+
+    def get_execution_by_key(self, idempotency_key: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT payload FROM refund_executions WHERE idempotency_key = ?", (idempotency_key,)
+        )
+        return json.loads(row["payload"]) if row else None
+
+    def list_executions(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM refund_executions WHERE case_id = ? ORDER BY execution_id",
+            (case_id,),
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
+    def put_receipt(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO refund_receipts (receipt_id, case_id, computation_id, idempotency_key, payload) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (receipt_id) DO UPDATE SET payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO refund_receipts (receipt_id, case_id, computation_id, idempotency_key, payload) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (receipt_id) DO UPDATE SET payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["receipt_id"],
+                payload["case_id"],
+                payload["computation_id"],
+                payload["idempotency_key"],
+                json.dumps(payload),
+            ),
+        )
+
+    def get_receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT payload FROM refund_receipts WHERE receipt_id = ?", (receipt_id,)
+        )
+        return json.loads(row["payload"]) if row else None
+
+    def get_receipt_by_key(self, idempotency_key: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT payload FROM refund_receipts WHERE idempotency_key = ?", (idempotency_key,)
+        )
+        return json.loads(row["payload"]) if row else None
+
+    def get_receipt_by_computation(self, computation_id: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT payload FROM refund_receipts WHERE computation_id = ?", (computation_id,)
+        )
+        return json.loads(row["payload"]) if row else None
+
+    def get_receipt_for_case(self, case_id: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT payload FROM refund_receipts WHERE case_id = ?", (case_id,)
+        )
+        return json.loads(row["payload"]) if row else None
+
+    def list_receipts(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT payload FROM refund_receipts ORDER BY case_id, receipt_id")
+        return [json.loads(r["payload"]) for r in rows]
+
 
 class InMemoryStore:
     """Test double implementing the same port with dicts."""
@@ -451,9 +607,12 @@ class InMemoryStore:
         self._dispositions: dict[str, dict] = {}
         self._fraud_scores: dict[str, dict] = {}
         self._fraud_reviews: dict[str, dict] = {}
+        self._approvals: dict[str, dict] = {}
+        self._executions: dict[str, dict] = {}
+        self._receipts: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
-        return ["0001", "0002", "0003", "0004"]
+        return ["0001", "0002", "0003", "0004", "0005"]
 
     def put_order(self, payload: dict[str, Any]) -> None:
         self._orders[payload["order_id"]] = payload
@@ -546,3 +705,59 @@ class InMemoryStore:
             for k in sorted(self._fraud_reviews)
             if self._fraud_reviews[k]["case_id"] == case_id
         ]
+
+    def put_approval(self, payload: dict[str, Any]) -> None:
+        self._approvals[payload["approval_id"]] = payload
+
+    def list_approvals(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._approvals[k]
+            for k in sorted(self._approvals)
+            if self._approvals[k]["case_id"] == case_id
+        ]
+
+    def put_execution(self, payload: dict[str, Any]) -> None:
+        self._executions[payload["execution_id"]] = payload
+
+    def get_execution(self, execution_id: str) -> dict[str, Any] | None:
+        return self._executions.get(execution_id)
+
+    def get_execution_by_key(self, idempotency_key: str) -> dict[str, Any] | None:
+        for execution in self._executions.values():
+            if execution["idempotency_key"] == idempotency_key:
+                return execution
+        return None
+
+    def list_executions(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._executions[k]
+            for k in sorted(self._executions)
+            if self._executions[k]["case_id"] == case_id
+        ]
+
+    def put_receipt(self, payload: dict[str, Any]) -> None:
+        self._receipts[payload["receipt_id"]] = payload
+
+    def get_receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        return self._receipts.get(receipt_id)
+
+    def get_receipt_by_key(self, idempotency_key: str) -> dict[str, Any] | None:
+        for receipt in self._receipts.values():
+            if receipt["idempotency_key"] == idempotency_key:
+                return receipt
+        return None
+
+    def get_receipt_by_computation(self, computation_id: str) -> dict[str, Any] | None:
+        for receipt in self._receipts.values():
+            if receipt["computation_id"] == computation_id:
+                return receipt
+        return None
+
+    def get_receipt_for_case(self, case_id: str) -> dict[str, Any] | None:
+        for receipt in self._receipts.values():
+            if receipt["case_id"] == case_id:
+                return receipt
+        return None
+
+    def list_receipts(self) -> list[dict[str, Any]]:
+        return [self._receipts[k] for k in sorted(self._receipts)]
