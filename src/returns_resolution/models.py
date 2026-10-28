@@ -352,6 +352,14 @@ class FraudScore(BaseModel):
     band: str  # CLEAR | MONITOR | FRAUD_REVIEW
     as_of: date
     supersedes: str | None = None
+    # The provenance of the history the score was computed over
+    # (R9): "store" for the artefacts of record, "memory" when the
+    # engine's fact set was reconstructed from memory-port records.
+    # A tag, not an input: it is excluded from the inputs
+    # fingerprint and the score id, so a memory-sourced score over
+    # the same facts is the SAME artefact — which is what makes the
+    # store/memory parity check a comparison of equals.
+    history_source: str = "store"
 
     @field_validator("total_score", mode="before")
     @classmethod

@@ -236,6 +236,31 @@ CREATE TABLE IF NOT EXISTS customer_messages (
 );
 """
 
+# Migration 0009 — customer memory (R9): the memory port's records
+# and its access log. Records are append-only (the insert is
+# conflict-ignore: a record id already standing is never
+# overwritten); the access log is append-only too. There is no
+# delete path for either table anywhere in the store — retention
+# expiry is a read-side window over `occurred_on`, computed by the
+# port, not an erasure.
+_MIGRATION_0009_SQLITE = """
+CREATE TABLE IF NOT EXISTS memory_records (
+    record_id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    occurred_on TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_access_log (
+    entry_id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("0001", _MIGRATION_0001_SQLITE, _MIGRATION_0001_PG),
     ("0002", _MIGRATION_0002_SQLITE, _MIGRATION_0002_SQLITE),
@@ -245,6 +270,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("0006", _MIGRATION_0006_SQLITE, _MIGRATION_0006_SQLITE),
     ("0007", _MIGRATION_0007_SQLITE, _MIGRATION_0007_SQLITE),
     ("0008", _MIGRATION_0008_SQLITE, _MIGRATION_0008_SQLITE),
+    ("0009", _MIGRATION_0009_SQLITE, _MIGRATION_0009_SQLITE),
 ]
 
 
@@ -329,6 +355,13 @@ class Store(Protocol):
     def list_messages(self, case_id: str) -> list[dict[str, Any]]: ...
     def list_all_messages(self) -> list[dict[str, Any]]: ...
     def count_messages(self, case_id: str) -> int: ...
+    def put_memory_record(self, payload: dict[str, Any]) -> None: ...
+    def get_memory_record(self, record_id: str) -> dict[str, Any] | None: ...
+    def list_memory_records(self, customer_id: str) -> list[dict[str, Any]]: ...
+    def list_memory_record_index(self) -> list[dict[str, Any]]: ...
+    def put_memory_access(self, payload: dict[str, Any]) -> None: ...
+    def list_memory_access(self, customer_id: str | None = None) -> list[dict[str, Any]]: ...
+    def count_memory_access(self) -> int: ...
 
 
 class SqlStore:
@@ -1011,6 +1044,78 @@ class SqlStore:
         )
         return int(rows[0]["n"]) if rows else 0
 
+    # -- customer memory (R9) ----------------------------------------------
+    def put_memory_record(self, payload: dict[str, Any]) -> None:
+        # Append-only: a record id already standing is never
+        # overwritten — memory records are immutable once written.
+        self._execute(
+            "INSERT INTO memory_records "
+            "(record_id, customer_id, case_id, event_type, source_ref, occurred_on, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (record_id) DO NOTHING",
+            (
+                payload["record_id"],
+                payload["customer_id"],
+                payload["case_id"],
+                payload["event_type"],
+                payload["source_ref"],
+                payload["occurred_on"],
+                json.dumps(payload),
+            ),
+        )
+
+    def get_memory_record(self, record_id: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT payload FROM memory_records WHERE record_id = ?", (record_id,)
+        )
+        return json.loads(row["payload"]) if row else None
+
+    def list_memory_records(self, customer_id: str) -> list[dict[str, Any]]:
+        # The customer predicate is IN THE QUERY: this is the only
+        # per-customer record read, and it cannot return another
+        # customer's rows.
+        rows = self._query(
+            "SELECT payload FROM memory_records WHERE customer_id = ? "
+            "ORDER BY occurred_on, record_id",
+            (customer_id,),
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
+    def list_memory_record_index(self) -> list[dict[str, Any]]:
+        # Write-side index only: ids and keys, no facts — sync
+        # reconciles against this, it is not a retrieval surface.
+        rows = self._query(
+            "SELECT record_id, customer_id, case_id, event_type, source_ref "
+            "FROM memory_records ORDER BY record_id"
+        )
+        return [dict(r) for r in rows]
+
+    def put_memory_access(self, payload: dict[str, Any]) -> None:
+        self._execute(
+            "INSERT INTO memory_access_log (entry_id, customer_id, purpose, payload) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (entry_id) DO NOTHING",
+            (
+                payload["entry_id"],
+                payload["customer_id"],
+                payload["purpose"],
+                json.dumps(payload),
+            ),
+        )
+
+    def list_memory_access(self, customer_id: str | None = None) -> list[dict[str, Any]]:
+        if customer_id is None:
+            rows = self._query("SELECT payload FROM memory_access_log")
+        else:
+            rows = self._query(
+                "SELECT payload FROM memory_access_log WHERE customer_id = ?",
+                (customer_id,),
+            )
+        entries = [json.loads(r["payload"]) for r in rows]
+        return sorted(entries, key=lambda e: (e["seq"], e["entry_id"]))
+
+    def count_memory_access(self) -> int:
+        rows = self._query("SELECT COUNT(*) AS n FROM memory_access_log")
+        return int(rows[0]["n"]) if rows else 0
+
 
 class InMemoryStore:
     """Test double implementing the same port with dicts."""
@@ -1036,9 +1141,11 @@ class InMemoryStore:
         self._grading_reports: dict[str, dict] = {}
         self._adjustments: dict[str, dict] = {}
         self._messages: dict[str, dict] = {}
+        self._memory_records: dict[str, dict] = {}
+        self._memory_access: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
-        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008"]
+        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009"]
 
     def put_order(self, payload: dict[str, Any]) -> None:
         self._orders[payload["order_id"]] = payload
@@ -1323,3 +1430,43 @@ class InMemoryStore:
 
     def count_messages(self, case_id: str) -> int:
         return sum(1 for m in self._messages.values() if m["case_id"] == case_id)
+
+    def put_memory_record(self, payload: dict[str, Any]) -> None:
+        # Append-only, like the SQL store's conflict-ignore insert:
+        # a record id already standing is never overwritten.
+        self._memory_records.setdefault(payload["record_id"], payload)
+
+    def get_memory_record(self, record_id: str) -> dict[str, Any] | None:
+        return self._memory_records.get(record_id)
+
+    def list_memory_records(self, customer_id: str) -> list[dict[str, Any]]:
+        rows = [
+            r for r in self._memory_records.values() if r["customer_id"] == customer_id
+        ]
+        return sorted(rows, key=lambda r: (r["occurred_on"], r["record_id"]))
+
+    def list_memory_record_index(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "record_id": r["record_id"],
+                "customer_id": r["customer_id"],
+                "case_id": r["case_id"],
+                "event_type": r["event_type"],
+                "source_ref": r["source_ref"],
+            }
+            for r in (self._memory_records[k] for k in sorted(self._memory_records))
+        ]
+
+    def put_memory_access(self, payload: dict[str, Any]) -> None:
+        self._memory_access.setdefault(payload["entry_id"], payload)
+
+    def list_memory_access(self, customer_id: str | None = None) -> list[dict[str, Any]]:
+        entries = [
+            e
+            for e in self._memory_access.values()
+            if customer_id is None or e["customer_id"] == customer_id
+        ]
+        return sorted(entries, key=lambda e: (e["seq"], e["entry_id"]))
+
+    def count_memory_access(self) -> int:
+        return len(self._memory_access)
