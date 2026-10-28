@@ -31,6 +31,7 @@ from .service import (
     FigureVerificationError,
     FraudHoldError,
     FraudReviewError,
+    GradingError,
     PaymentsError,
 )
 from .store import SqlStore
@@ -83,7 +84,14 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     get_carrier_events {case_id, label_id, as_of} |
     book_pickup {case_id, scheduled_on, label_id?} |
     get_label {case_id} | list_labels {case_id} | list_pickups {case_id} |
-    list_tool_calls {case_id} | get_timeline {case_id, as_of}.
+    list_tool_calls {case_id} | get_timeline {case_id, as_of} |
+    record_warehouse_receipt {case_id, received_by, received_on} |
+    list_warehouse_receipts {case_id} |
+    record_grading {case_id, grader, graded_condition, graded_on,
+    functional_test_result?, data_wipe_status?, damage_notes?,
+    received_weight_grams?, wear_evidence?} |
+    list_grading_reports {case_id} | list_adjustments {case_id} |
+    execute_top_up {case_id, idempotency_key, as_of}.
     """
     action = payload.get("action", "intake_feed")
     if action == "seed":
@@ -299,6 +307,62 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
             view = service.get_timeline(payload["case_id"], date.fromisoformat(payload["as_of"]))
             return {"timeline": view.model_dump(mode="json")}
         except LookupError as exc:
+            return {"error": str(exc)}
+    if action == "record_warehouse_receipt":
+        try:
+            receipt = service.record_warehouse_receipt(
+                payload["case_id"],
+                received_by=payload.get("received_by", ""),
+                received_on=date.fromisoformat(payload["received_on"]),
+            )
+            return {"warehouse_receipt": receipt.model_dump(mode="json")}
+        except (LookupError, GradingError) as exc:
+            return {"error": str(exc)}
+    if action == "list_warehouse_receipts":
+        return {
+            "warehouse_receipts": [
+                r.model_dump(mode="json")
+                for r in service.list_warehouse_receipts(payload["case_id"])
+            ]
+        }
+    if action == "record_grading":
+        try:
+            report = service.record_grading(
+                payload["case_id"],
+                grader=payload.get("grader", ""),
+                graded_condition=payload.get("graded_condition", ""),
+                graded_on=date.fromisoformat(payload["graded_on"]),
+                functional_test_result=payload.get("functional_test_result"),
+                data_wipe_status=payload.get("data_wipe_status"),
+                damage_notes=payload.get("damage_notes", ""),
+                received_weight_grams=payload.get("received_weight_grams"),
+                wear_evidence=bool(payload.get("wear_evidence", False)),
+            )
+            return {"grading_report": report.model_dump(mode="json")}
+        except (LookupError, GradingError, FigureVerificationError) as exc:
+            return {"error": str(exc)}
+    if action == "list_grading_reports":
+        return {
+            "grading_reports": [
+                r.model_dump(mode="json")
+                for r in service.list_grading_reports(payload["case_id"])
+            ]
+        }
+    if action == "list_adjustments":
+        return {
+            "adjustments": [
+                a.model_dump(mode="json") for a in service.list_adjustments(payload["case_id"])
+            ]
+        }
+    if action == "execute_top_up":
+        try:
+            receipt = service.execute_top_up(
+                payload["case_id"],
+                idempotency_key=payload.get("idempotency_key", ""),
+                as_of=date.fromisoformat(payload["as_of"]),
+            )
+            return {"receipt": receipt.model_dump(mode="json")}
+        except (LookupError, ApprovalError, FraudHoldError, PaymentsError) as exc:
             return {"error": str(exc)}
     if action == "list_cases":
         return {"cases": [c.model_dump(mode="json") for c in service.list_cases()]}

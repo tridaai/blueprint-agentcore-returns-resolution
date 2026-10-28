@@ -23,6 +23,7 @@ from .service import (
     FigureVerificationError,
     FraudHoldError,
     FraudReviewError,
+    GradingError,
     PaymentsError,
 )
 
@@ -86,6 +87,36 @@ class LabelVoidRequest(BaseModel):
 class PickupRequest(BaseModel):
     scheduled_on: date
     label_id: str | None = None
+
+
+class WarehouseReceiptRequest(BaseModel):
+    received_by: str
+    received_on: date
+
+    @field_validator("received_by")
+    @classmethod
+    def _named(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("a warehouse receipt requires a named receiver")
+        return v.strip()
+
+
+class GradingRequest(BaseModel):
+    grader: str
+    graded_condition: str
+    graded_on: date
+    functional_test_result: str | None = None
+    data_wipe_status: str | None = None
+    damage_notes: str = ""
+    received_weight_grams: int | None = None
+    wear_evidence: bool = False
+
+    @field_validator("grader")
+    @classmethod
+    def _named(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("a grading report requires a named grader")
+        return v.strip()
 
 
 def _order_view(order) -> dict:
@@ -440,6 +471,73 @@ def create_app(service: CaseService) -> FastAPI:
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return view.model_dump(mode="json")
+
+    # -- warehouse receipt + grading (R7) --------------------------------
+    @app.post("/cases/{case_id}/warehouse-receipts", status_code=201)
+    def record_warehouse_receipt(case_id: str, body: WarehouseReceiptRequest) -> dict:
+        try:
+            receipt = service.record_warehouse_receipt(
+                case_id, received_by=body.received_by, received_on=body.received_on
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except GradingError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return receipt.model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/warehouse-receipts")
+    def warehouse_receipts(case_id: str) -> list[dict]:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return [r.model_dump(mode="json") for r in service.list_warehouse_receipts(case_id)]
+
+    @app.post("/cases/{case_id}/grading-reports", status_code=201)
+    def record_grading(case_id: str, body: GradingRequest) -> dict:
+        try:
+            report = service.record_grading(
+                case_id,
+                grader=body.grader,
+                graded_condition=body.graded_condition,
+                graded_on=body.graded_on,
+                functional_test_result=body.functional_test_result,
+                data_wipe_status=body.data_wipe_status,
+                damage_notes=body.damage_notes,
+                received_weight_grams=body.received_weight_grams,
+                wear_evidence=body.wear_evidence,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except GradingError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except FigureVerificationError as exc:
+            raise HTTPException(status_code=422, detail={"violations": exc.violations}) from exc
+        return report.model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/grading-reports")
+    def grading_reports(case_id: str) -> list[dict]:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return [r.model_dump(mode="json") for r in service.list_grading_reports(case_id)]
+
+    @app.get("/cases/{case_id}/adjustments")
+    def adjustments(case_id: str) -> list[dict]:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return [a.model_dump(mode="json") for a in service.list_adjustments(case_id)]
+
+    @app.post("/cases/{case_id}/top-up-executions", status_code=201)
+    def execute_top_up(case_id: str, body: ExecutionRequest) -> dict:
+        try:
+            receipt = service.execute_top_up(
+                case_id, idempotency_key=body.idempotency_key, as_of=body.as_of
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ApprovalError, DuplicateRefundError, FraudHoldError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PaymentsError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return receipt.model_dump(mode="json")
 
     @app.post("/cases/{case_id}/evidence")
     async def evidence(case_id: str, request: Request, kind: str = "photo", filename: str = "evidence.bin") -> dict:
