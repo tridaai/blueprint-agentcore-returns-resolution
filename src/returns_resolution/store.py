@@ -304,6 +304,22 @@ CREATE TABLE IF NOT EXISTS quarantine_release_acts (
 );
 """
 
+# Migration 0012 — the access denial log (R16): one row per
+# recorded refusal of the access layer. Insert-only like the
+# memory and quarantine tables (conflict-ignore on the id): a
+# denial is history, never state to rewrite, and there is no
+# delete path. The payload is the whole AccessDenial; the columns
+# are the read paths (per principal, per surface).
+_MIGRATION_0012_SQLITE = """
+CREATE TABLE IF NOT EXISTS access_denials (
+    denial_id TEXT PRIMARY KEY,
+    principal_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    surface TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("0001", _MIGRATION_0001_SQLITE, _MIGRATION_0001_PG),
     ("0002", _MIGRATION_0002_SQLITE, _MIGRATION_0002_SQLITE),
@@ -316,6 +332,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("0009", _MIGRATION_0009_SQLITE, _MIGRATION_0009_SQLITE),
     ("0010", _MIGRATION_0010_SQLITE, _MIGRATION_0010_SQLITE),
     ("0011", _MIGRATION_0011_SQLITE, _MIGRATION_0011_SQLITE),
+    ("0012", _MIGRATION_0012_SQLITE, _MIGRATION_0012_SQLITE),
 ]
 
 
@@ -424,6 +441,10 @@ class Store(Protocol):
     def put_quarantine_act(self, payload: dict[str, Any]) -> None: ...
     def list_quarantine_acts(self, case_id: str) -> list[dict[str, Any]]: ...
     def list_all_quarantine_acts(self) -> list[dict[str, Any]]: ...
+    # Access denials (R16): the access layer's insert-only log.
+    def put_access_denial(self, payload: dict[str, Any]) -> None: ...
+    def list_access_denials(self) -> list[dict[str, Any]]: ...
+    def count_access_denials(self) -> int: ...
 
 
 class SqlStore:
@@ -1313,6 +1334,29 @@ class SqlStore:
         acts = [json.loads(r["payload"]) for r in rows]
         return sorted(acts, key=lambda a: (a["case_id"], a["act_id"]))
 
+    # -- access denials (R16): insert-only, like the memory tables ----
+    def put_access_denial(self, payload: dict[str, Any]) -> None:
+        self._execute(
+            "INSERT INTO access_denials (denial_id, principal_id, role, surface, payload) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (denial_id) DO NOTHING",
+            (
+                payload["denial_id"],
+                payload["principal_id"],
+                payload["role"],
+                payload["surface"],
+                json.dumps(payload),
+            ),
+        )
+
+    def list_access_denials(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT payload FROM access_denials")
+        entries = [json.loads(r["payload"]) for r in rows]
+        return sorted(entries, key=lambda e: (e["seq"], e["denial_id"]))
+
+    def count_access_denials(self) -> int:
+        rows = self._query("SELECT COUNT(*) AS n FROM access_denials")
+        return int(rows[0]["n"]) if rows else 0
+
 
 class InMemoryStore:
     """Test double implementing the same port with dicts."""
@@ -1344,9 +1388,10 @@ class InMemoryStore:
         self._quarantine_items: dict[str, dict] = {}
         self._quarantine_views: dict[str, dict] = {}
         self._quarantine_acts: dict[str, dict] = {}
+        self._access_denials: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
-        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011"]
+        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012"]
 
     def put_order(self, payload: dict[str, Any]) -> None:
         self._orders[payload["order_id"]] = payload
@@ -1726,3 +1771,14 @@ class InMemoryStore:
 
     def list_all_quarantine_acts(self) -> list[dict[str, Any]]:
         return [self._quarantine_acts[k] for k in sorted(self._quarantine_acts)]
+
+    # -- access denials (R16): insert-only, like the SQL store --------
+    def put_access_denial(self, payload: dict[str, Any]) -> None:
+        self._access_denials.setdefault(payload["denial_id"], payload)
+
+    def list_access_denials(self) -> list[dict[str, Any]]:
+        entries = list(self._access_denials.values())
+        return sorted(entries, key=lambda e: (e["seq"], e["denial_id"]))
+
+    def count_access_denials(self) -> int:
+        return len(self._access_denials)
