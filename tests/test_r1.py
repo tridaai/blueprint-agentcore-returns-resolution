@@ -184,9 +184,20 @@ def test_sqlite_store_migrates_once_and_persists(tmp_path):
     reason="Postgres leg runs when RETURNS_TEST_DATABASE_URL is set (Postgres profile, R10)",
 )
 def test_postgres_store_dialect(tmp_path):
-    store = SqlStore(
-        database_url=os.environ.get("RETURNS_TEST_DATABASE_URL") or os.environ["DATABASE_URL"]
-    )
+    # Scoped to a private, run-unique schema (R11 hermeticity): the
+    # bare URL would write into the shared public schema, where one
+    # run's rows collide with the next run's against a persistent
+    # cluster.
+    import uuid
+
+    import psycopg
+
+    base = os.environ.get("RETURNS_TEST_DATABASE_URL") or os.environ["DATABASE_URL"]
+    schema = f"t_r1dialect_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(base, autocommit=True) as conn:
+        conn.execute(f'CREATE SCHEMA "{schema}"')
+    sep = "&" if "?" in base else "?"
+    store = SqlStore(database_url=f"{base}{sep}options=-csearch_path%3D{schema}")
     store.migrate()
     service = CaseService(store, OfflineComposer())
     service.seed_orders()

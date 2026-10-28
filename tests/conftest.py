@@ -1,4 +1,4 @@
-"""Postgres profile for the suite (R10).
+"""Postgres profile for the suite (R10; hermetic since R11).
 
 With no environment set, the suite runs exactly as it always has:
 InMemoryStore doubles plus SqlStore on per-test SQLite files.
@@ -11,14 +11,26 @@ test keeps the isolation its tmp path gave it on SQLite, and a
 "reopened" store on the same path lands on the same schema, exactly
 like reopening the same file. Stores built with an explicit
 database_url (the R1 dialect test) are left alone.
+
+Hermeticity (R11): the schema name also carries a RUN TOKEN —
+unique per suite run (RETURNS_RUN_ID if set, else generated here).
+Pytest reuses tmp-path names across runs, so a path-only name made
+a second run against a persistent cluster land on the first run's
+already-populated schemas: migration-ledger collisions and memory
+records leaking across runs. With the token, every run starts on
+fresh schemas and two consecutive runs against one cluster are
+independent. The token is constant within a run, so the "reopened
+store" legs keep their same-schema semantics.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import uuid
 
 _PG_URL = os.environ.get("RETURNS_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+RUN_TOKEN = os.environ.get("RETURNS_RUN_ID") or uuid.uuid4().hex[:12]
 
 if _PG_URL:
     import psycopg
@@ -29,7 +41,7 @@ if _PG_URL:
 
     def _schema_for(sqlite_path: object) -> str:
         digest = hashlib.sha256(str(sqlite_path).encode()).hexdigest()[:20]
-        return f"t_{digest}"
+        return f"t_{digest}_{RUN_TOKEN}"
 
     def _ensure_schema(schema: str) -> None:
         with psycopg.connect(_PG_URL, autocommit=True) as conn:

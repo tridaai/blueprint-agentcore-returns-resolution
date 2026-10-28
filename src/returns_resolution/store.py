@@ -429,8 +429,15 @@ class SqlStore:
             if version in applied:
                 continue
             self._exec_script(pg_sql if self._dialect == "postgres" else sqlite_sql)
+            # The ledger write is conflict-tolerant (R11): if the
+            # version already stands recorded — another store on
+            # this schema applied it first — recording it again is
+            # a no-op, never a unique violation. Calling migrate()
+            # on an already-migrated schema applies nothing and
+            # raises nothing, in both dialects.
             self._execute(
-                "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?) "
+                "ON CONFLICT (version) DO NOTHING",
                 (version, "applied"),
             )
             done.append(version)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import uuid
 from datetime import date
 
 import pytest
@@ -36,10 +37,17 @@ pg_only = pytest.mark.skipif(
 DAY = date(2026, 10, 27)
 
 
+# Run-scoped (R11 hermeticity): pytest reuses tmp-path names
+# across runs, so the schema suffix carries a per-run token — a
+# second run against a persistent cluster never lands on the
+# first run's schemas.
+_RUN_TOKEN = os.environ.get("RETURNS_RUN_ID") or uuid.uuid4().hex[:12]
+
+
 def _pg_store(tmp_path) -> SqlStore:
     import psycopg
 
-    schema = "t_" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:20]
+    schema = "t_" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:20] + "_" + _RUN_TOKEN
     with psycopg.connect(PG_URL, autocommit=True) as conn:
         conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
     sep = "&" if "?" in PG_URL else "?"

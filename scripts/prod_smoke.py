@@ -11,9 +11,10 @@ memory parity — asserting every step over HTTP:
   receipt read and from-memory score read are exercised over HTTP;
 - the operations API (FastAPI) is driven through its ASGI transport;
 - BOTH surfaces sit on ONE store: the Postgres profile when
-  DATABASE_URL (or RETURNS_DATABASE_URL) is set — a private
-  `prod_smoke` schema on that database — otherwise a throwaway
-  SQLite file, and the profile used is printed in the ledger.
+  DATABASE_URL (or RETURNS_DATABASE_URL) is set — a private,
+  run-scoped `prod_smoke_<token>` schema on that database —
+  otherwise a throwaway SQLite file, and the profile used is
+  printed in the ledger.
 
 Every step prints a ledger line; any failed assertion is recorded,
 the walk continues where it safely can, and the script exits
@@ -82,14 +83,18 @@ def _profile(tmp: Path) -> tuple[str, str]:
     """(profile label, store DSN/path description) + env for the runtime."""
     pg_url = os.environ.get("DATABASE_URL") or os.environ.get("RETURNS_DATABASE_URL")
     if pg_url:
+        import uuid
+
         import psycopg
 
+        # Run-scoped schema (R11 hermeticity): unique per smoke run,
+        # so a persistent cluster never hands this run a previous
+        # run's rows — and no schema is ever dropped to get there.
+        schema = f"prod_smoke_{os.environ.get('RETURNS_RUN_ID') or uuid.uuid4().hex[:12]}"
         with psycopg.connect(pg_url, autocommit=True) as conn:
-            conn.execute('CREATE SCHEMA IF NOT EXISTS "prod_smoke"')
-            conn.execute('DROP SCHEMA IF EXISTS "prod_smoke" CASCADE')
-            conn.execute('CREATE SCHEMA "prod_smoke"')
+            conn.execute(f'CREATE SCHEMA "{schema}"')
         sep = "&" if "?" in pg_url else "?"
-        dsn = f"{pg_url}{sep}options=-csearch_path%3Dprod_smoke"
+        dsn = f"{pg_url}{sep}options=-csearch_path%3D{schema}"
         return "postgres", dsn
     return "sqlite", str(tmp / "smoke.db")
 

@@ -1450,13 +1450,20 @@ def _sqlite_factory(tmp_root: Path):
 
 def _postgres_factory(base_url: str):
     import itertools
+    import uuid
 
     import psycopg
 
     counter = itertools.count()
+    # Run-scoped schema prefix (R11 hermeticity): a bare counter
+    # restarts at eval_0 on every run, so a second run against a
+    # persistent cluster re-entered the first run's schemas and its
+    # memory records leaked across runs. The token makes each run's
+    # schemas its own.
+    run_token = os.environ.get("RETURNS_RUN_ID") or uuid.uuid4().hex[:12]
 
     def make():
-        schema = f"eval_{next(counter)}"
+        schema = f"eval_{run_token}_{next(counter)}"
         with psycopg.connect(base_url, autocommit=True) as conn:
             conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
         sep = "&" if "?" in base_url else "?"
