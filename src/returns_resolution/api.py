@@ -169,7 +169,7 @@ def create_app(service: CaseService) -> FastAPI:
     def console() -> FileResponse:
         """The single-file operations console (R13)."""
         return FileResponse(
-            Path(__file__).with_name("console.html"), media_type="text/html"
+            Path(__file__).parent / "static" / "console.html", media_type="text/html"
         )
 
     @app.get("/console/data")

@@ -133,7 +133,7 @@ AWS's own retail demos stop at the shopping cart. Post-purchase — returns, ref
 
 ## What R13 adds — the operations console
 
-- **One static file, no build step** — `src/returns_resolution/console.html` is served by the API at `GET /console`: inline CSS and vanilla JavaScript, a light theme, and the Trida footer. It reads a stated operator name and role in the page — the same stated-actor convention the API already uses — and builds no login or identity system (that is R16).
+- **One static file, no build step** — `src/returns_resolution/static/console.html` is served by the API at `GET /console`: inline CSS and vanilla JavaScript, a light theme, and the Trida footer. It reads a stated operator name and role in the page — the same stated-actor convention the API already uses — and builds no login or identity system (that is R16).
 - **Case board and detail** — cases are grouped by their furthest recorded lifecycle stage (intake, decided, computed, dispositioned, approved, executed, labelled, graded, closed), with counts and artefact figures only. A case detail walks the chain in workflow order: request, order and decision; refund computation lines; disposition chain; approvals, executions and receipts; labels, grading and adjustments; messages with verifier status; memory records; the case cost ledger; and the derived timeline with its named gaps.
 - **Queues an operator can act on** — the review-hold queue carries the review act (named reviewer, coded outcome and reason) through the existing endpoint; the approvals queue shows computed amounts still missing a named approver and records approvals through the existing act; the recovery list shows open `recovery_due` positions. There is no other mutation surface in the console.
 - **Money without new arithmetic** — executed refunds, executed top-ups and outstanding recoveries are sums over the receipt and adjustment artefacts the API returns, each total traceable to the rows listed beneath it. The footer states the rule on the page: the console sums artefact figures; it does not decide a case, price a refund or create a money artefact.
@@ -224,7 +224,7 @@ src/returns_resolution/
   verifier.py      the figure verifier, generalised to the messaging verifier (R8)
   service.py       the one workflow every surface shares
   console.py       the console-safe read model: board, queues, money, gateway, case detail (R13)
-  console.html     the single-file operations console (R13)
+  static/console.html  the single-file operations console (R13)
   runtime_app.py   AgentCore Runtime entrypoint (+ contract fallback)
   api.py           FastAPI surface
 scripts/           demo.py, local_harness.py, prod_smoke.py, check_console.py
