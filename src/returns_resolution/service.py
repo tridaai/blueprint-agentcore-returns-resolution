@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 from .carrier import CarrierPort, CarrierProviderError, LocalCarrierDouble
@@ -41,13 +41,27 @@ from .evidence import EvidenceStore
 from .fraud import (
     BLOCKED_STATES,
     CaseFact,
+    HistoryFacts,
     ScoringPack,
     derive_fraud_state,
     load_scoring_pack,
-    score_case,
+    score_from_history,
     verify_fraud_score,
 )
 from .gateway import ToolCallRecord, ToolDefinition, ToolError, ToolGateway
+from .memory import (
+    EVENT_CASE_DECIDED,
+    EVENT_CASE_GRADED,
+    EVENT_FRAUD_REVIEW_CLOSED,
+    EVENT_REFUND_EXECUTED,
+    LocalMemoryDouble,
+    MemoryAccessEntry,
+    MemoryPack,
+    MemoryPort,
+    MemoryRecord,
+    assign_record_id,
+    load_memory_pack,
+)
 from .messaging import (
     MESSAGING_PACK_VERSION,
     STATE_DRAFT,
@@ -191,6 +205,8 @@ class CaseService:
         carrier_port: CarrierPort | None = None,
         messaging_port: MessagingPort | None = None,
         disclosure_pack: DisclosurePack | None = None,
+        memory_pack: MemoryPack | None = None,
+        memory_port: MemoryPort | None = None,
     ):
         self._store = store
         self._model = model_port
@@ -215,6 +231,22 @@ class CaseService:
         # data the messaging verifier enforces alongside it.
         self._messaging = messaging_port or LocalMessagingDouble()
         self._disclosure = disclosure_pack or load_disclosure_pack()
+        # The memory port (R9) defaults to the LOCAL DOUBLE
+        # (labelled on every record it writes): no real memory
+        # service is consulted until a deployment binds AgentCore
+        # Memory to this port. The double's persistence is the
+        # store's memory tables (migration 0009); the port owns
+        # the semantics — customer scoping, retention, access log.
+        self._memory_pack = memory_pack or load_memory_pack()
+        self._memory = memory_port or LocalMemoryDouble(
+            pack=self._memory_pack,
+            put_record=store.put_memory_record,
+            get_record=store.get_memory_record,
+            list_records=store.list_memory_records,
+            record_index=store.list_memory_record_index,
+            put_access=store.put_memory_access,
+            count_access=store.count_memory_access,
+        )
         # The tool gateway (R6): the ONLY path carrier/label actions
         # take. Handlers are the _tool_* methods below; every call —
         # success or refusal — is recorded into the store.
@@ -240,6 +272,10 @@ class CaseService:
     @property
     def messaging_port(self) -> MessagingPort:
         return self._messaging
+
+    @property
+    def memory_port(self) -> MemoryPort:
+        return self._memory
 
     # -- seeding ---------------------------------------------------------
     def seed_orders(self) -> int:
@@ -328,6 +364,16 @@ class CaseService:
         # case-level gate above is unchanged (R1 semantics); the
         # message record is the lifecycle the summary now lives in.
         self._record_summary_message(case, summary_text, violations, as_of=request.requested_on)
+        # Memory milestone (R9): the case was decided — the record
+        # is written whether or not the summary verified, because
+        # the decision happened either way.
+        self._memory_case_decided(
+            case,
+            fact=scored_fact,
+            score=score,
+            computation=computation,
+            disposition=disposition,
+        )
         if violations:
             raise FigureVerificationError(violations)
         return case
@@ -538,7 +584,11 @@ class CaseService:
             fact.returned_weight_grams = reports[-1].received_weight_grams
         return fact
 
-    def _score_over(self, scored: CaseFact, supersedes: str | None = None) -> FraudScore:
+    def _history_from_store(self, scored: CaseFact) -> HistoryFacts:
+        """The engine's input bundle from the artefacts of record:
+        the scored case's fact plus the derived fact of every other
+        stored case of the same customer, and the customer's order
+        book. Tagged `source: store` (R9)."""
         facts = [scored]
         for payload in self._store.list_cases():
             other = ReturnCase.model_validate(payload)
@@ -552,11 +602,13 @@ class CaseService:
             for p in self._store.list_orders()
             if p["customer_id"] == scored.customer_id
         ]
-        return score_case(
+        return HistoryFacts(source="store", facts=facts, orders=orders)
+
+    def _score_over(self, scored: CaseFact, supersedes: str | None = None) -> FraudScore:
+        return score_from_history(
             self._scoring,
             scored=scored,
-            facts=facts,
-            orders=orders,
+            history=self._history_from_store(scored),
             weights_grams=PRODUCT_WEIGHTS_GRAMS,
             supersedes=supersedes,
         )
@@ -664,6 +716,303 @@ class CaseService:
     def get_scoring_pack(self) -> ScoringPack:
         return self._scoring
 
+    # -- customer memory (R9) -------------------------------------------------
+    def get_memory_pack(self) -> MemoryPack:
+        return self._memory_pack
+
+    def _draft_memory_record(
+        self,
+        case: ReturnCase,
+        event_type: str,
+        *,
+        occurred_on: date,
+        source_ref: str,
+        **facts,
+    ) -> MemoryRecord:
+        """Assemble one milestone record: the pack's retention
+        window applied, the writing port's label stamped, the
+        content address assigned. Deterministic — the same
+        milestone derived from the same artefacts is the same
+        record, which is what makes the write idempotent."""
+        record = MemoryRecord(
+            record_id="",
+            customer_id=case.customer_id,
+            case_id=case.case_id,
+            event_type=event_type,
+            occurred_on=occurred_on,
+            recorded_on=occurred_on,
+            expires_on=occurred_on + timedelta(days=self._memory_pack.retention_days),
+            memory_pack_version=self._memory_pack.version,
+            provider=self._memory.provider_name,
+            source_ref=source_ref,
+            **facts,
+        )
+        return assign_record_id(record)
+
+    def _record_memory(self, record: MemoryRecord) -> bool:
+        """Write a milestone record through the memory port. One
+        record per (case, event, source artefact): a milestone
+        that already stands is left standing — memory is
+        append-only, and a re-fired milestone neither duplicates
+        nor edits. Returns True when a new record was written."""
+        if (
+            record.case_id,
+            record.event_type,
+            record.source_ref,
+        ) in self._memory.existing_keys():
+            return False
+        self._memory.write(record)
+        return True
+
+    def _memory_case_decided(
+        self,
+        case: ReturnCase,
+        *,
+        fact: CaseFact,
+        score: FraudScore,
+        computation: RefundComputation,
+        disposition: DispositionDecision | None,
+    ) -> None:
+        """Milestone: the case was decided. The record embeds the
+        scoring fact exactly as scored, so the fraud engine's
+        history can later be reconstructed from memory alone."""
+        self._record_memory(
+            self._draft_memory_record(
+                case,
+                EVENT_CASE_DECIDED,
+                occurred_on=case.request.requested_on,
+                source_ref=computation.computation_id,
+                eligible=case.decision.eligible if case.decision else None,
+                refund_total=computation.refund_total,
+                disposition=(
+                    disposition.disposition
+                    if disposition is not None and disposition.status == "decided"
+                    else None
+                ),
+                fraud_band=score.band,
+                fact=fact,
+            )
+        )
+
+    def _memory_refund_executed(self, case: ReturnCase, receipt: RefundReceipt) -> None:
+        """Milestone: money moved. One record per receipt — a
+        top-up execution is a second record on the same case, its
+        source the top-up receipt."""
+        self._record_memory(
+            self._draft_memory_record(
+                case,
+                EVENT_REFUND_EXECUTED,
+                occurred_on=receipt.executed_on,
+                source_ref=receipt.receipt_id,
+                refund_amount=receipt.amount,
+            )
+        )
+
+    def _disposition_by_id(self, case_id: str, disposition_id: str | None):
+        if disposition_id is None:
+            return None
+        for disp in self.list_dispositions_for_case(case_id):
+            if disp.disposition_id == disposition_id:
+                return disp
+        return None
+
+    def sync_memory(self) -> int:
+        """Backfill memory from the artefacts of record — the
+        milestones of cases that predate the port (the planted
+        history above all) derived and written through the same
+        builders the live hooks use. Idempotent: a milestone that
+        already stands is not rewritten. Returns the number of
+        records newly written."""
+        written = 0
+        for case in self.list_cases():
+            decision = case.decision
+            computation = self.get_computation(case.case_id)
+            disposition = self.get_disposition(case.case_id)
+            score = self._current_score(case.case_id)
+            fact = self._fact_of_case(case)
+            if fact is not None:
+                written += self._record_memory(
+                    self._draft_memory_record(
+                        case,
+                        EVENT_CASE_DECIDED,
+                        occurred_on=case.request.requested_on,
+                        source_ref=(
+                            computation.computation_id
+                            if computation is not None
+                            else f"decision:{case.case_id}"
+                        ),
+                        eligible=decision.eligible if decision is not None else None,
+                        refund_total=(
+                            computation.refund_total if computation is not None else None
+                        ),
+                        disposition=(
+                            disposition.disposition
+                            if disposition is not None
+                            and disposition.status == "decided"
+                            else None
+                        ),
+                        fraud_band=score.band if score is not None else None,
+                        fact=fact,
+                    )
+                )
+            for receipt in self._case_receipts(case.case_id):
+                written += self._record_memory(
+                    self._draft_memory_record(
+                        case,
+                        EVENT_REFUND_EXECUTED,
+                        occurred_on=receipt.executed_on,
+                        source_ref=receipt.receipt_id,
+                        refund_amount=receipt.amount,
+                    )
+                )
+            for report in self.list_grading_reports(case.case_id):
+                new_disp = self._disposition_by_id(case.case_id, report.new_disposition_id)
+                current_disp = new_disp or self.get_disposition(case.case_id)
+                written += self._record_memory(
+                    self._draft_memory_record(
+                        case,
+                        EVENT_CASE_GRADED,
+                        occurred_on=report.graded_on,
+                        source_ref=report.report_id,
+                        graded_condition=report.graded_condition,
+                        received_weight_grams=report.received_weight_grams,
+                        refund_delta=report.refund_delta,
+                        disposition=(
+                            current_disp.disposition
+                            if current_disp is not None
+                            and current_disp.status == "decided"
+                            else None
+                        ),
+                    )
+                )
+            for review in self._reviews_for(case.case_id):
+                decided_payload = self._store.get_fraud_score(review.score_id)
+                decided_score = (
+                    FraudScore.model_validate(decided_payload) if decided_payload else None
+                )
+                written += self._record_memory(
+                    self._draft_memory_record(
+                        case,
+                        EVENT_FRAUD_REVIEW_CLOSED,
+                        occurred_on=(
+                            decided_score.as_of
+                            if decided_score is not None
+                            else case.request.requested_on
+                        ),
+                        source_ref=review.review_id,
+                        fraud_band=decided_score.band if decided_score else None,
+                        review_outcome=review.outcome,
+                    )
+                )
+        return written
+
+    def retrieve_memory(
+        self,
+        customer_id: str,
+        *,
+        as_of: date | None = None,
+        purpose: str = "staff_read",
+        actor: str = "operations",
+    ) -> list[MemoryRecord]:
+        """The customer's live memory records — through the port,
+        so the read is customer-scoped, retention-filtered and on
+        the access log. There is no unlogged read path."""
+        return self._memory.retrieve(customer_id, purpose=purpose, actor=actor, as_of=as_of)
+
+    def memory_retention_status(
+        self, customer_id: str, *, as_of: date | None = None, actor: str = "operations"
+    ) -> dict:
+        """The tombstone read: live vs retention-expired counts
+        for one customer. Expired records are counted, never
+        deleted."""
+        return self._memory.retention_status(customer_id, actor=actor, as_of=as_of)
+
+    def list_memory_access_log(
+        self, customer_id: str | None = None
+    ) -> list[MemoryAccessEntry]:
+        """The access log — every retrieval the port has served,
+        in append order, optionally for one customer."""
+        return [
+            MemoryAccessEntry.model_validate(p)
+            for p in self._store.list_memory_access(customer_id)
+        ]
+
+    def has_customer(self, customer_id: str) -> bool:
+        """Whether any order or case names this customer — the
+        existence check the memory reads hang their 404 on."""
+        return any(c.customer_id == customer_id for c in self.list_cases()) or any(
+            o.customer_id == customer_id for o in self.list_orders()
+        )
+
+    def score_case_from_memory(self, case_id: str) -> FraudScore | None:
+        """Score a case with its history read from MEMORY (R9) —
+        the fraud engine's second input path.
+
+        The fact set is reconstructed from the customer's memory
+        records alone: each case's decision record embeds the fact
+        as scored, and a later grading record's warehouse weigh-in
+        supersedes the intake weight, exactly as the store path
+        derives it. The order book is read as usual (memory holds
+        case history, not orders). The returned artefact is tagged
+        `history_source: memory` and is NOT stored — the store path
+        remains the scoring path of record; this path exists so
+        parity is provable, and so a deployment can flip the input
+        source without the engine changing. Returns None when
+        memory holds no decision record for the case (sync first).
+        """
+        case = self.get_case(case_id)
+        if case is None:
+            return None
+        # Read as of the customer's latest recorded event — the
+        # current state of record, exactly what the store path
+        # derives from. The engine itself time-filters the facts
+        # it consumes, so later records cannot leak backwards.
+        records = self._memory.retrieve(
+            case.customer_id,
+            purpose="fraud_scoring",
+            actor="fraud engine (memory input)",
+            as_of=None,
+        )
+        decided: dict[str, MemoryRecord] = {}
+        graded: dict[str, MemoryRecord] = {}
+        for record in records:
+            if record.event_type == EVENT_CASE_DECIDED:
+                decided[record.case_id] = record
+            elif record.event_type == EVENT_CASE_GRADED:
+                graded[record.case_id] = record
+
+        def _fact_from_records(cid: str) -> CaseFact | None:
+            base = decided.get(cid)
+            if base is None or base.fact is None:
+                return None
+            fact = base.fact.model_copy()
+            weigh_in = graded.get(cid)
+            if weigh_in is not None and weigh_in.received_weight_grams is not None:
+                fact.returned_weight_grams = weigh_in.received_weight_grams
+            return fact
+
+        facts_by_case: dict[str, CaseFact] = {}
+        for cid in decided:
+            fact = _fact_from_records(cid)
+            if fact is not None:
+                facts_by_case[cid] = fact
+        scored = facts_by_case.get(case_id)
+        if scored is None:
+            return None
+        orders = [
+            Order.model_validate(p)
+            for p in self._store.list_orders()
+            if p["customer_id"] == case.customer_id
+        ]
+        return score_from_history(
+            self._scoring,
+            scored=scored,
+            history=HistoryFacts(
+                source="memory", facts=list(facts_by_case.values()), orders=orders
+            ),
+            weights_grams=PRODUCT_WEIGHTS_GRAMS,
+        )
+
     # -- the fraud block + the review act -------------------------------------
     def refund_path_blocked(self, case_id: str) -> bool:
         case = self.get_case(case_id)
@@ -731,6 +1080,19 @@ class CaseService:
             pack_version=self._scoring.version,
         )
         self._store.put_fraud_review(decision.model_dump(mode="json"))
+        # Memory milestone (R9): the fraud review closed. The
+        # record carries the outcome and the decided score's BAND
+        # — never the score's internals.
+        self._record_memory(
+            self._draft_memory_record(
+                case,
+                EVENT_FRAUD_REVIEW_CLOSED,
+                occurred_on=score.as_of,
+                source_ref=decision.review_id,
+                fraud_band=score.band,
+                review_outcome=decision.outcome,
+            )
+        )
         self._refresh_case_fraud(case)
         return decision
 
@@ -1064,6 +1426,10 @@ class CaseService:
             )
         )
         self._store.put_execution(execution.model_dump(mode="json"))
+        # Memory milestone (R9): the refund executed — written
+        # once, on the fresh execution only (an idempotent replay
+        # returns above and never reaches here).
+        self._memory_refund_executed(case, receipt)
         return receipt
 
     def get_receipt(self, case_id: str) -> RefundReceipt | None:
@@ -1935,6 +2301,26 @@ class CaseService:
         if adjustment is not None:
             self._store.put_adjustment(adjustment.model_dump(mode="json"))
         self._store.put_grading_report(report.model_dump(mode="json"))
+        # Memory milestone (R9): the case was graded — the record
+        # carries the graded condition, the weigh-in (the weight of
+        # record for later scores) and the refund delta.
+        graded_disp = new_disposition or current_disposition
+        self._record_memory(
+            self._draft_memory_record(
+                case,
+                EVENT_CASE_GRADED,
+                occurred_on=report.graded_on,
+                source_ref=report.report_id,
+                graded_condition=report.graded_condition,
+                received_weight_grams=report.received_weight_grams,
+                refund_delta=report.refund_delta,
+                disposition=(
+                    graded_disp.disposition
+                    if graded_disp is not None and graded_disp.status == "decided"
+                    else None
+                ),
+            )
+        )
 
         # -- step 5: the fraud re-score, through the R4 machinery ------
         if rescore_triggered:
@@ -2158,6 +2544,12 @@ class CaseService:
         adjustment.top_up_receipt_id = receipt.receipt_id
         adjustment.idempotency_key = namespaced
         self._store.put_adjustment(adjustment.model_dump(mode="json"))
+        # Memory milestone (R9): the top-up is a refund execution
+        # too — a second executed record on the case, sourced by
+        # the top-up receipt.
+        top_up_case = self.get_case(case_id)
+        if top_up_case is not None:
+            self._memory_refund_executed(top_up_case, receipt)
         return receipt
 
     # -- customer messaging (R8) ---------------------------------------------
@@ -2169,7 +2561,11 @@ class CaseService:
         return sorted(receipts, key=lambda r: (r.executed_on, r.receipt_id))
 
     def _message_universe(
-        self, case: ReturnCase, message_type: str, label_override: ReturnLabel | None = None
+        self,
+        case: ReturnCase,
+        message_type: str,
+        label_override: ReturnLabel | None = None,
+        as_of: date | None = None,
     ) -> tuple[MessageContext, dict[str, str], str]:
         """The verified universe for one message of this case, plus
         the artefact pin: (context, refs, fingerprint).
@@ -2179,10 +2575,16 @@ class CaseService:
         states, the case's own public references, and the disclosure
         rules resolved (pack terms + the scoring pack's signal names
         and review reason codes, derived here so the ban can never
-        drift from the pack). The pin is per message TYPE: the refs
-        name the artefacts that type renders against, and the
-        fingerprint hashes their payloads — recomputed at send
-        time, it is how a stale message is recognised.
+        drift from the pack). From R9 the universe also carries the
+        case's OWN CUSTOMER's memory figures (prior refunds, prior
+        totals, grading deltas from the memory port) — the only
+        channel through which a message may reference a prior case,
+        and only ever this customer's: the retrieval is scoped to
+        `case.customer_id`, retention-filtered, and logged. The pin
+        is per message TYPE: the refs name the artefacts that type
+        renders against, and the fingerprint hashes their payloads
+        — recomputed at send time, it is how a stale message is
+        recognised.
         """
         decision = case.decision
         if decision is None:
@@ -2246,6 +2648,26 @@ class CaseService:
             rate = self._pack.restocking_fee_rates.get(condition or "")
             if rate is not None:
                 percents.add(Decimal(rate) * 100)
+
+        # Memory (R9): the customer's own prior-case figures join
+        # the sayable set — a returning customer's earlier refund
+        # may be referenced in a new message ONLY as memory records
+        # it, and only this customer's: the port's retrieval is
+        # predicated on the case's customer id, excludes expired
+        # records, and is written to the access log.
+        memory_as_of = as_of or max(dates | {case.request.requested_on})
+        for record in self._memory.retrieve(
+            case.customer_id,
+            purpose="message_verification",
+            actor="messaging verifier",
+            as_of=memory_as_of,
+        ):
+            if record.refund_total is not None:
+                amounts.add(record.refund_total)
+            if record.refund_amount is not None:
+                amounts.add(record.refund_amount)
+            if record.refund_delta is not None:
+                amounts.add(abs(record.refund_delta))
 
         forbidden_terms = list(self._disclosure.forbidden_terms)
         for reasons in self._scoring.review_outcomes.values():
@@ -2560,7 +2982,7 @@ class CaseService:
         returned unchanged. A figure-clean text is then checked by
         the full messaging verifier; a figure-failing text is
         recorded refused with the figure violations as they stand."""
-        _ctx, refs, fingerprint = self._message_universe(case, "return_summary")
+        _ctx, refs, fingerprint = self._message_universe(case, "return_summary", as_of=as_of)
         for existing in self.list_messages(case.case_id):
             if (
                 existing.message_type == "return_summary"
@@ -2614,7 +3036,7 @@ class CaseService:
             )
         facts = self._message_facts(case, message_type)
         text = TEMPLATES[message_type](facts, model_note)
-        _ctx, refs, fingerprint = self._message_universe(case, message_type)
+        _ctx, refs, fingerprint = self._message_universe(case, message_type, as_of=as_of)
         return self._create_message(
             case, message_type, text, as_of=as_of, refs=refs, fingerprint=fingerprint
         )
@@ -2635,7 +3057,9 @@ class CaseService:
         case = self.get_case(message.case_id)
         if case is None:
             raise LookupError(f"unknown case: {message.case_id}")
-        context, _refs, _fingerprint = self._message_universe(case, message.message_type)
+        context, _refs, _fingerprint = self._message_universe(
+            case, message.message_type, as_of=as_of
+        )
         violations = verify_message_text(message.text, context)
         message.violations = violations
         if violations:
@@ -2713,7 +3137,9 @@ class CaseService:
         if case is None:
             raise LookupError(f"unknown case: {message.case_id}")
         try:
-            _ctx, _refs, fingerprint = self._message_universe(case, message.message_type)
+            _ctx, _refs, fingerprint = self._message_universe(
+                case, message.message_type, as_of=as_of
+            )
         except MessagingError:
             fingerprint = None
         if fingerprint != message.artefact_fingerprint:
