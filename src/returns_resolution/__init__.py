@@ -7,4 +7,4 @@ drafts the customer-facing summary, and a figure verifier checks every
 amount and date the model states against the computed decision.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"

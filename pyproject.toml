@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "returns-resolution-agentcore"
-version = "0.1.0"
+version = "1.0.0"
 description = "Returns Resolution & Disposition Agent on AWS Bedrock AgentCore — a governed post-purchase returns blueprint (Trida AI Blueprint #18)."
 readme = "README.md"
 license = "Apache-2.0"
