@@ -108,6 +108,17 @@ class ReturnRequest(BaseModel):
     condition_declared: str
     requested_on: date
     channel: str = "web"
+    # The customer's free-text note (R15) — their own words about
+    # the return. Customer-controlled text is UNTRUSTED input: at
+    # ingest it lands in the injection quarantine FIRST and is
+    # stripped from the request of record (the stored request
+    # carries "" here), so no engine ever reads it. What downstream
+    # surfaces may see is the quarantine item's RELEASED VIEW,
+    # linked from the case via `note_quarantine_id`.
+    customer_note: str = ""
+    # The quarantine item the note landed as (R15), set by ingest on
+    # the request of record; None when the request carried no note.
+    note_quarantine_id: str | None = None
     # The carrier drop-off scan weight in grams, when the return was
     # scanned at intake (R4). Absent means nobody weighed the parcel —
     # the fraud engine then reports its weight signal as not
@@ -524,6 +535,19 @@ class GradingReport(BaseModel):
     damage_notes: str = ""
     received_weight_grams: int | None = None
     wear_evidence: bool = False
+    # Photo-evidence metadata (R15): the free-text fields that rode
+    # along with the grading photos (device notes, EXIF-style
+    # descriptions), as RELEASED VIEWS — key → the view's rendered
+    # text. The raw metadata text lives only in quarantine; a field
+    # whose text is held there is absent here and named in `gaps`.
+    photo_metadata: dict[str, str] = {}
+    # Named gaps (R15): inputs the grading act could not read —
+    # free-text fields held in quarantine, by field and item id.
+    # A gap is stated, never a silent drop and never a silent use.
+    gaps: list[str] = []
+    # The quarantine items this report's text fields passed through
+    # (R15): damage notes first, then photo metadata by field.
+    quarantine_refs: list[str] = []
     grading_pack_version: str
     # The cascade, by artefact id (None where a step did not fire).
     superseded_disposition_id: str | None = None

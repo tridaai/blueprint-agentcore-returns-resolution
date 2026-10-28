@@ -276,6 +276,34 @@ CREATE TABLE IF NOT EXISTS model_calls (
 );
 """
 
+# Migration 0011 — the injection quarantine (R15): the raw items,
+# their released views and the release acts. All three tables are
+# insert-only (conflict-ignore on the id, like the memory and cost
+# tables): a landed text, a minted view and a recorded act are
+# history, never state to rewrite. The items table holds the ONLY
+# copy of the raw customer text; its accessors are the
+# `quarantine_raw_*` methods quarantine.py alone calls.
+_MIGRATION_0011_SQLITE = """
+CREATE TABLE IF NOT EXISTS quarantine_items (
+    quarantine_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    source_surface TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quarantine_views (
+    view_id TEXT PRIMARY KEY,
+    quarantine_id TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quarantine_release_acts (
+    act_id TEXT PRIMARY KEY,
+    quarantine_id TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("0001", _MIGRATION_0001_SQLITE, _MIGRATION_0001_PG),
     ("0002", _MIGRATION_0002_SQLITE, _MIGRATION_0002_SQLITE),
@@ -287,6 +315,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("0008", _MIGRATION_0008_SQLITE, _MIGRATION_0008_SQLITE),
     ("0009", _MIGRATION_0009_SQLITE, _MIGRATION_0009_SQLITE),
     ("0010", _MIGRATION_0010_SQLITE, _MIGRATION_0010_SQLITE),
+    ("0011", _MIGRATION_0011_SQLITE, _MIGRATION_0011_SQLITE),
 ]
 
 
@@ -381,6 +410,20 @@ class Store(Protocol):
     def put_cost_entry(self, payload: dict[str, Any]) -> None: ...
     def list_cost_entries(self, case_id: str) -> list[dict[str, Any]]: ...
     def list_all_cost_entries(self) -> list[dict[str, Any]]: ...
+    # Quarantine (R15). The `quarantine_raw_*` accessors carry the
+    # raw customer text and are called ONLY by quarantine.py — the
+    # structural gate scans every other module for these names.
+    def quarantine_raw_put_item(self, payload: dict[str, Any]) -> None: ...
+    def quarantine_raw_get_item(self, quarantine_id: str) -> dict[str, Any] | None: ...
+    def quarantine_raw_list_items(self, case_id: str) -> list[dict[str, Any]]: ...
+    def quarantine_raw_list_all_items(self) -> list[dict[str, Any]]: ...
+    def put_quarantine_view(self, payload: dict[str, Any]) -> None: ...
+    def list_quarantine_views(self, quarantine_id: str) -> list[dict[str, Any]]: ...
+    def list_quarantine_views_for_case(self, case_id: str) -> list[dict[str, Any]]: ...
+    def list_all_quarantine_views(self) -> list[dict[str, Any]]: ...
+    def put_quarantine_act(self, payload: dict[str, Any]) -> None: ...
+    def list_quarantine_acts(self, case_id: str) -> list[dict[str, Any]]: ...
+    def list_all_quarantine_acts(self) -> list[dict[str, Any]]: ...
 
 
 class SqlStore:
@@ -1179,6 +1222,97 @@ class SqlStore:
         entries = [json.loads(r["payload"]) for r in rows]
         return sorted(entries, key=lambda e: (e["case_id"], e["seq"], e["entry_id"]))
 
+    # -- injection quarantine (R15) -------------------------------------
+    # Insert-only, like the memory and cost tables: an id already
+    # standing is never overwritten. The raw accessors below are
+    # quarantine.py's alone (see the class comment in that module).
+    def quarantine_raw_put_item(self, payload: dict[str, Any]) -> None:
+        self._execute(
+            "INSERT INTO quarantine_items (quarantine_id, case_id, source_surface, payload) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (quarantine_id) DO NOTHING",
+            (
+                payload["quarantine_id"],
+                payload["case_id"],
+                payload["source_surface"],
+                json.dumps(payload),
+            ),
+        )
+
+    def quarantine_raw_get_item(self, quarantine_id: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT payload FROM quarantine_items WHERE quarantine_id = ?",
+            (quarantine_id,),
+        )
+        return json.loads(row["payload"]) if row else None
+
+    def quarantine_raw_list_items(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM quarantine_items WHERE case_id = ?", (case_id,)
+        )
+        items = [json.loads(r["payload"]) for r in rows]
+        return sorted(items, key=lambda i: i["quarantine_id"])
+
+    def quarantine_raw_list_all_items(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT payload FROM quarantine_items")
+        items = [json.loads(r["payload"]) for r in rows]
+        return sorted(items, key=lambda i: (i["case_id"], i["quarantine_id"]))
+
+    def put_quarantine_view(self, payload: dict[str, Any]) -> None:
+        self._execute(
+            "INSERT INTO quarantine_views (view_id, quarantine_id, case_id, payload) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (view_id) DO NOTHING",
+            (
+                payload["view_id"],
+                payload["quarantine_id"],
+                payload["case_id"],
+                json.dumps(payload),
+            ),
+        )
+
+    def list_quarantine_views(self, quarantine_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM quarantine_views WHERE quarantine_id = ?",
+            (quarantine_id,),
+        )
+        views = [json.loads(r["payload"]) for r in rows]
+        return sorted(views, key=lambda v: v["view_id"])
+
+    def list_quarantine_views_for_case(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM quarantine_views WHERE case_id = ?", (case_id,)
+        )
+        views = [json.loads(r["payload"]) for r in rows]
+        return sorted(views, key=lambda v: v["view_id"])
+
+    def list_all_quarantine_views(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT payload FROM quarantine_views")
+        views = [json.loads(r["payload"]) for r in rows]
+        return sorted(views, key=lambda v: (v["case_id"], v["view_id"]))
+
+    def put_quarantine_act(self, payload: dict[str, Any]) -> None:
+        self._execute(
+            "INSERT INTO quarantine_release_acts (act_id, quarantine_id, case_id, payload) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (act_id) DO NOTHING",
+            (
+                payload["act_id"],
+                payload["quarantine_id"],
+                payload["case_id"],
+                json.dumps(payload),
+            ),
+        )
+
+    def list_quarantine_acts(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM quarantine_release_acts WHERE case_id = ?", (case_id,)
+        )
+        acts = [json.loads(r["payload"]) for r in rows]
+        return sorted(acts, key=lambda a: a["act_id"])
+
+    def list_all_quarantine_acts(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT payload FROM quarantine_release_acts")
+        acts = [json.loads(r["payload"]) for r in rows]
+        return sorted(acts, key=lambda a: (a["case_id"], a["act_id"]))
+
 
 class InMemoryStore:
     """Test double implementing the same port with dicts."""
@@ -1207,9 +1341,12 @@ class InMemoryStore:
         self._memory_records: dict[str, dict] = {}
         self._memory_access: dict[str, dict] = {}
         self._cost_entries: dict[str, dict] = {}
+        self._quarantine_items: dict[str, dict] = {}
+        self._quarantine_views: dict[str, dict] = {}
+        self._quarantine_acts: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
-        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010"]
+        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011"]
 
     def put_order(self, payload: dict[str, Any]) -> None:
         self._orders[payload["order_id"]] = payload
@@ -1545,3 +1682,47 @@ class InMemoryStore:
     def list_all_cost_entries(self) -> list[dict[str, Any]]:
         entries = list(self._cost_entries.values())
         return sorted(entries, key=lambda e: (e["case_id"], e["seq"], e["entry_id"]))
+
+    # -- injection quarantine (R15): insert-only, like the SQL store --
+    def quarantine_raw_put_item(self, payload: dict[str, Any]) -> None:
+        self._quarantine_items.setdefault(payload["quarantine_id"], payload)
+
+    def quarantine_raw_get_item(self, quarantine_id: str) -> dict[str, Any] | None:
+        return self._quarantine_items.get(quarantine_id)
+
+    def quarantine_raw_list_items(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._quarantine_items[k]
+            for k in sorted(self._quarantine_items)
+            if self._quarantine_items[k]["case_id"] == case_id
+        ]
+
+    def quarantine_raw_list_all_items(self) -> list[dict[str, Any]]:
+        return [self._quarantine_items[k] for k in sorted(self._quarantine_items)]
+
+    def put_quarantine_view(self, payload: dict[str, Any]) -> None:
+        self._quarantine_views.setdefault(payload["view_id"], payload)
+
+    def list_quarantine_views(self, quarantine_id: str) -> list[dict[str, Any]]:
+        views = [
+            v for v in self._quarantine_views.values()
+            if v["quarantine_id"] == quarantine_id
+        ]
+        return sorted(views, key=lambda v: v["view_id"])
+
+    def list_quarantine_views_for_case(self, case_id: str) -> list[dict[str, Any]]:
+        views = [v for v in self._quarantine_views.values() if v["case_id"] == case_id]
+        return sorted(views, key=lambda v: v["view_id"])
+
+    def list_all_quarantine_views(self) -> list[dict[str, Any]]:
+        return [self._quarantine_views[k] for k in sorted(self._quarantine_views)]
+
+    def put_quarantine_act(self, payload: dict[str, Any]) -> None:
+        self._quarantine_acts.setdefault(payload["act_id"], payload)
+
+    def list_quarantine_acts(self, case_id: str) -> list[dict[str, Any]]:
+        acts = [a for a in self._quarantine_acts.values() if a["case_id"] == case_id]
+        return sorted(acts, key=lambda a: a["act_id"])
+
+    def list_all_quarantine_acts(self) -> list[dict[str, Any]]:
+        return [self._quarantine_acts[k] for k in sorted(self._quarantine_acts)]
