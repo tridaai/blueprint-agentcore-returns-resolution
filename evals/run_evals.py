@@ -1,4 +1,4 @@
-"""Eval gate for Blueprint #18 (R1–R15).
+"""Eval gate for Blueprint #18 (R1–R16).
 
 Profiles (R10): the full scenario body runs once per store profile
 — in-memory and SQLite always, PostgreSQL when DATABASE_URL (or
@@ -217,6 +217,21 @@ Zero-tolerance counters against planted truth:
   or its released quote missing from the message entirely.
 - quarantine_console_raw_text_leaks (R15): the planted probe text
   (or its marker) standing anywhere in the console read model.
+- access_cross_customer_reads_served (R16): a customer principal
+  served a read of another customer's case or memory through a
+  guarded method — scoping is the access pack's first promise.
+- access_existence_distinguishable (R16): a hidden case's
+  Runtime response differing in any byte from a missing case's —
+  existence hiding means the two are the same response.
+- access_supervisor_acts_by_agent_accepted (R16): a staff_agent
+  principal landing a supervisor act (approval, quarantine
+  release) — the pack reserves those acts to the supervisor tier.
+- access_auditor_acts_accepted (R16): an auditor principal
+  landing any act at all — the auditor is read-only, and every
+  attempt must be refused and recorded.
+- access_denials_unrecorded (R16): a graded refusal missing from
+  the denial log, or recorded under a foreign pack version — a
+  refusal that is not recorded did not happen, auditably.
 
 Prints the counters and GATE: PASS/FAIL; exit code follows.
 """
@@ -365,6 +380,11 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
         "quarantine_raw_store_external_reads": 0,
         "quarantine_hostile_figures_in_messages": 0,
         "quarantine_console_raw_text_leaks": 0,
+        "access_cross_customer_reads_served": 0,
+        "access_existence_distinguishable": 0,
+        "access_supervisor_acts_by_agent_accepted": 0,
+        "access_auditor_acts_accepted": 0,
+        "access_denials_unrecorded": 0,
     }
 
     service = CaseService(make_store(), OfflineComposer())
@@ -2697,6 +2717,98 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
     ):
         counters["quarantine_raw_store_external_reads"] += 1
 
+    # --- R16: access control --------------------------------------------
+    # Principals, roles and existence hiding. A customer principal
+    # probes another customer's case on the service face and through
+    # the Runtime dispatch; a staff agent attempts supervisor acts;
+    # an auditor attempts acts of its own. Every refusal must be
+    # recorded in the denial log under the pack that refused it.
+    from returns_resolution.access import AccessDeniedError as _AccessDenied
+    from returns_resolution.access import Principal as _Principal
+    from returns_resolution.runtime_app import handle_payload as _dispatch
+
+    _eval_day = date(2026, 10, 27)
+    _owner = _Principal(
+        id=service.get_case("CASE-2001").customer_id, role="customer"
+    )
+    _agent16 = _Principal(id="eval.agent", role="staff_agent")
+    _auditor16 = _Principal(id="eval.auditor", role="auditor")
+    _denials_before = len(service.list_access_denials())
+    _expected_denials = 0
+
+    # A cross-customer read must never be served.
+    try:
+        service.get_case_as(_owner, "CASE-2003", on=_eval_day)
+        counters["access_cross_customer_reads_served"] += 1
+    except _AccessDenied as exc:
+        _expected_denials += 1
+        if exc.reason != "case_not_visible":
+            counters["access_cross_customer_reads_served"] += 1
+    try:
+        service.retrieve_memory_as(_owner, "CUST-CID", on=_eval_day)
+        counters["access_cross_customer_reads_served"] += 1
+    except _AccessDenied:
+        _expected_denials += 1
+
+    # Existence hiding through the Runtime dispatch: the hidden
+    # case's response is the missing case's response, byte for byte.
+    _me = {"id": _owner.id, "role": "customer"}
+    _hidden = _dispatch(
+        service, {"action": "get_case", "case_id": "CASE-2003", "principal": _me}
+    )
+    _missing = _dispatch(
+        service, {"action": "get_case", "case_id": "CASE-9999", "principal": _me}
+    )
+    _expected_denials += 1  # the hidden probe records; the missing one must not
+    if _hidden != _missing or _hidden != {"case": None}:
+        counters["access_existence_distinguishable"] += 1
+
+    # A staff agent's supervisor acts must be refused.
+    for _act in (
+        lambda: service.record_approval_as(_agent16, "CASE-2003", as_of=_eval_day),
+        lambda: service.release_quarantined_text_as(
+            _agent16,
+            _qitem.quarantine_id,
+            reason="eval probe",
+            released_on=_eval_day,
+            case_id=_qcase.case_id,
+        ),
+    ):
+        try:
+            _act()
+            counters["access_supervisor_acts_by_agent_accepted"] += 1
+        except _AccessDenied:
+            _expected_denials += 1
+
+    # An auditor's acts must be refused: the role is read-only.
+    for _act in (
+        lambda: service.execute_refund_as(
+            _auditor16, "CASE-2003", idempotency_key="eval-aud", as_of=_eval_day
+        ),
+        lambda: service.record_fraud_review_as(
+            _auditor16,
+            "CASE-3008",
+            outcome="cleared_with_reason",
+            reason_code="legitimate_pattern_explained",
+            on=_eval_day,
+        ),
+    ):
+        try:
+            _act()
+            counters["access_auditor_acts_accepted"] += 1
+        except _AccessDenied:
+            _expected_denials += 1
+
+    # Every graded refusal stands in the denial log, recorded
+    # under the pack version that refused it.
+    _new_denials = service.list_access_denials()[_denials_before:]
+    if len(_new_denials) != _expected_denials:
+        counters["access_denials_unrecorded"] += abs(
+            len(_new_denials) - _expected_denials
+        )
+    if any(d.pack_version != "2026.10.1" for d in _new_denials):
+        counters["access_denials_unrecorded"] += 1
+
     # The cross-profile fingerprint (R10): the content-addressed
     # artefact ids the planted work minted on this profile's store.
     # Identical planted work must mint identical ids on every store.
@@ -2733,6 +2845,9 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
         ),
         "quarantine_views": sorted(
             row["view_id"] for row in service._store.list_all_quarantine_views()
+        ),
+        "access_denials": sorted(
+            row["denial_id"] for row in service._store.list_access_denials()
         ),
     }
     return counters, fingerprint
