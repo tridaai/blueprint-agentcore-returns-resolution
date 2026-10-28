@@ -364,11 +364,71 @@ never an edit. The timeline grows receipt, grading and adjustment
 stages and names the `warehouse_grading` gap for a parcel received
 but not yet graded.
 
+## Customer messaging: templates, the verifier, the lifecycle (R8)
+
+R1's figure verifier guarded exactly one text: the summary the
+composer drafted. R8 generalises it into the messaging verifier
+and puts every customer-facing word the system can produce behind
+it. The unit of control is the **message type**: six typed
+templates (`messaging.py`) — return summary, label instructions,
+grading-outcome notice, fraud-review outcome notice,
+refund-executed notice, adjustment notice — each rendered by a
+pure function from a `MessageFacts` assembly the service builds
+out of the case's artefacts of record. A type whose artefacts do
+not exist refuses to draft, naming the missing one (no label, no
+label instructions; no review decision, no fraud notice). The one
+free-form surface is a stated note slot appended to a template's
+text: model prose may live there and nowhere else, and it passes
+through the same verifier as the template's own words, so the slot
+is not a bypass.
+
+`verify_message_text` runs three checks against a `MessageContext`
+— the verified universe for that case. **Figures**: the R1 checks
+(amounts, dates) plus percentages, each required to equal a value
+some artefact computed. **Facts**: dispositions and conditions are
+recognised only in statement constructions (the templates' own
+phrasings and their close variants — a bare "used" is ordinary
+English, and "restocking fee" is fee vocabulary, not a disposition
+claim; both traps are handled explicitly in the pattern table) and
+must belong to the record's fact sets, which include superseded
+artefacts: history may be described, the present may not be
+misstated. **Forbidden content**: a versioned disclosure pack
+states banned terms and patterns, and the service extends the term
+list at context-build time with the scoring pack's signal ids and
+review reason codes — derived, so the ban cannot drift from the
+pack it protects. Internal artefact ids are recognised by shape
+and admitted only when they are the case's own public references
+(its case and order ids, its carrier and provider references);
+another customer's ids never are. A failed verification is not an
+error swallowed or a text quietly repaired: the message is stored
+`refused`, violations listed on the artefact.
+
+The lifecycle is a state machine of recorded acts — draft,
+verified, queued, sent, with refused and withdrawn as terminal
+side-states — each transition appended with date and actor, and
+sending delegated to a messaging port whose local double is
+idempotent by message id. Staleness is handled by **pin +
+fingerprint**: at creation, a message pins the artefacts its type
+renders against (the summary pins the decision, the computation
+chain, the disposition chain and the label — grading moves the
+record under a summary even when no figure changes, because the
+disposition chain is part of what its facts were checked against).
+Issuing a successor message of the same type withdraws any unsent
+predecessor; anything else that moves the pin is caught at send
+time, where the fingerprint is recomputed and a mismatch withdraws
+the message, drafts and verifies a replacement, and refuses the
+send naming it. The R1–R7 summary path is migrated, not replaced:
+ingest, label issuance and the grading cascade record their
+summary as a message through the same service path, and the
+summary text itself is byte-identical to what R1–R7 produced —
+the eval gate asserts every feed case's standing summary verified
+clean against the generalised verifier.
+
 ## What is deliberately not here yet
 
-Messaging verifier depth (R8), Memory port (R9), injection quarantine
-(R10), Gateway + Policy ports (R11), model cost ledger (R12), console
-(R13), Postgres parity + production smoke (R15), access control (R16),
-reporting (R17), carrier exceptions (R18), red team (R19), deploy
-artefacts (R20). The README's honest status is the authoritative
-per-round account.
+Memory port (R9), injection quarantine (R10), Gateway + Policy
+ports (R11), model cost ledger (R12), console (R13), Postgres
+parity + production smoke (R15), access control (R16), reporting
+(R17), carrier exceptions (R18), red team (R19), deploy artefacts
+(R20). The README's honest status is the authoritative per-round
+account.
