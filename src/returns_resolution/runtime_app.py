@@ -18,6 +18,15 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+from .access import (
+    GATEWAY_ACTOR_FOR_ROLE,
+    HIDING_REASONS,
+    SURFACE_FRAUD,
+    SURFACE_GATEWAY,
+    SURFACE_MONEY,
+    SURFACE_QUARANTINE,
+    AccessDeniedError,
+)
 from .config import Config
 from .evidence import LocalEvidenceStore
 from .intake import ReferenceFeed
@@ -117,9 +126,42 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     get_customer_memory {customer_id, as_of?} |
     get_memory_retention {customer_id, as_of?} |
     list_memory_access_log {customer_id?} |
-    score_case_from_memory {case_id}.
+    score_case_from_memory {case_id} |
+    get_access_pack | list_access_denials.
+
+    Any action may carry a principal (R16): payload["principal"]
+    = {"id": ..., "role": ...}. A carried principal is
+    authenticated against the access pack and the action runs
+    under the same rules as the API — scoped reads, gated acts,
+    recorded denials; the hiding refusals render as the action's
+    ordinary empty result. A payload without a principal takes
+    the pre-R16 trusted-local path, unchanged.
     """
     action = payload.get("action", "intake_feed")
+    principal = None
+    if payload.get("principal") is not None:
+        try:
+            principal = service.authenticate_principal(
+                payload.get("principal"), surface="runtime", target=action
+            )
+        except AccessDeniedError as exc:
+            return {"error": str(exc), "access_reason": exc.reason}
+
+    def _denied(exc: AccessDeniedError, hidden: dict) -> dict:
+        """A guard refusal on the Runtime surface: the hiding
+        reasons render as the action's ordinary empty result;
+        every other refusal is the named error."""
+        if exc.reason in HIDING_REASONS:
+            return hidden
+        return {"error": str(exc), "access_reason": exc.reason}
+
+    def _shortcut_actor() -> str:
+        """The gateway actor for the tool shortcut actions: a
+        carried principal invokes as the actor its role maps to;
+        the legacy path invokes as staff, as it always has."""
+        if principal is None:
+            return "staff"
+        return GATEWAY_ACTOR_FOR_ROLE[principal.role]
     if action == "seed":
         return {
             "seeded_orders": service.seed_orders(),
@@ -140,6 +182,11 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         return {"ingested": results}
     if action == "intake":
         request = ReturnRequest.model_validate(payload["request"])
+        if principal is not None:
+            try:
+                service.require_intake(principal, request.order_id)
+            except AccessDeniedError as exc:
+                return {"error": str(exc), "access_reason": exc.reason}
         try:
             case = service.ingest(request)
             return {"case": case.model_dump(mode="json")}
@@ -148,6 +195,12 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         except ModelGatewayError as exc:
             return {"error": str(exc)}
     if action == "get_case":
+        if principal is not None:
+            try:
+                view = service.get_case_view_as(principal, payload["case_id"])
+            except AccessDeniedError as exc:
+                return _denied(exc, {"case": None})
+            return {"case": view}
         case = service.get_case(payload["case_id"])
         return {"case": case.model_dump(mode="json") if case else None}
     if action == "get_computation":
@@ -172,10 +225,22 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     if action == "get_channels":
         return {"channels": service.get_channels().model_dump(mode="json")}
     if action == "get_fraud_score":
+        if principal is not None:
+            try:
+                score = service.get_fraud_score_as(principal, payload["case_id"])
+            except AccessDeniedError as exc:
+                return _denied(exc, {"fraud_score": None})
+            return {"fraud_score": score.model_dump(mode="json") if score else None}
         score = service.get_fraud_score(payload["case_id"])
         return {"fraud_score": score.model_dump(mode="json") if score else None}
     if action == "get_fraud_signals":
-        score = service.get_fraud_score(payload["case_id"])
+        if principal is not None:
+            try:
+                score = service.get_fraud_score_as(principal, payload["case_id"])
+            except AccessDeniedError as exc:
+                return _denied(exc, {"signals": None})
+        else:
+            score = service.get_fraud_score(payload["case_id"])
         if score is None:
             return {"signals": None}
         return {
@@ -190,17 +255,37 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         problems = service.verify_stored_fraud_score(payload["case_id"])
         return {"case_id": payload["case_id"], "ok": not problems, "problems": problems}
     if action == "rescore_case":
+        if principal is not None:
+            try:
+                service.require_manage_case(principal, payload["case_id"])
+            except AccessDeniedError as exc:
+                return {"error": str(exc), "access_reason": exc.reason}
         score = service.rescore_case(payload["case_id"])
         return {"fraud_score": score.model_dump(mode="json") if score else None}
     if action == "record_fraud_review":
         try:
-            decision = service.record_fraud_review(
-                payload["case_id"],
-                reviewer=payload.get("reviewer", ""),
-                outcome=payload.get("outcome", ""),
-                reason_code=payload.get("reason_code", ""),
-            )
+            if principal is not None:
+                if payload.get("reviewer", "") != principal.id:
+                    service.deny_principal_mismatch(
+                        principal, surface=SURFACE_FRAUD, target=payload["case_id"],
+                        field="reviewer", claimed=payload.get("reviewer", ""),
+                    )
+                decision = service.record_fraud_review_as(
+                    principal,
+                    payload["case_id"],
+                    outcome=payload.get("outcome", ""),
+                    reason_code=payload.get("reason_code", ""),
+                )
+            else:
+                decision = service.record_fraud_review(
+                    payload["case_id"],
+                    reviewer=payload.get("reviewer", ""),
+                    outcome=payload.get("outcome", ""),
+                    reason_code=payload.get("reason_code", ""),
+                )
             return {"fraud_review": decision.model_dump(mode="json")}
+        except AccessDeniedError as exc:
+            return {"error": str(exc), "access_reason": exc.reason}
         except (LookupError, FraudReviewError) as exc:
             return {"error": str(exc)}
     if action == "get_fraud_review":
@@ -212,14 +297,30 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         return {"fraud_scores": [s.model_dump(mode="json") for s in service.list_fraud_scores()]}
     if action == "record_approval":
         try:
-            approval = service.record_approval(
-                payload["case_id"],
-                approver=payload.get("approver", ""),
-                role=payload.get("role", ""),
-                as_of=date.fromisoformat(payload["as_of"]),
-                computation_id=payload.get("computation_id"),
-            )
+            if principal is not None:
+                if payload.get("approver", "") != principal.id:
+                    service.deny_principal_mismatch(
+                        principal, surface=SURFACE_MONEY, target=payload["case_id"],
+                        field="approver", claimed=payload.get("approver", ""),
+                        on=date.fromisoformat(payload["as_of"]),
+                    )
+                approval = service.record_approval_as(
+                    principal,
+                    payload["case_id"],
+                    as_of=date.fromisoformat(payload["as_of"]),
+                    computation_id=payload.get("computation_id"),
+                )
+            else:
+                approval = service.record_approval(
+                    payload["case_id"],
+                    approver=payload.get("approver", ""),
+                    role=payload.get("role", ""),
+                    as_of=date.fromisoformat(payload["as_of"]),
+                    computation_id=payload.get("computation_id"),
+                )
             return {"approval": approval.model_dump(mode="json")}
+        except AccessDeniedError as exc:
+            return {"error": str(exc), "access_reason": exc.reason}
         except (LookupError, ApprovalError, FraudHoldError) as exc:
             return {"error": str(exc)}
     if action == "list_approvals":
@@ -231,19 +332,43 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
             return {"error": str(exc)}
     if action == "execute_refund":
         try:
-            receipt = service.execute_refund(
-                payload["case_id"],
-                idempotency_key=payload.get("idempotency_key", ""),
-                as_of=date.fromisoformat(payload["as_of"]),
-            )
+            if principal is not None:
+                receipt = service.execute_refund_as(
+                    principal,
+                    payload["case_id"],
+                    idempotency_key=payload.get("idempotency_key", ""),
+                    as_of=date.fromisoformat(payload["as_of"]),
+                )
+            else:
+                receipt = service.execute_refund(
+                    payload["case_id"],
+                    idempotency_key=payload.get("idempotency_key", ""),
+                    as_of=date.fromisoformat(payload["as_of"]),
+                )
             return {"receipt": receipt.model_dump(mode="json")}
+        except AccessDeniedError as exc:
+            return {"error": str(exc), "access_reason": exc.reason}
         except (LookupError, ApprovalError, FraudHoldError, PaymentsError) as exc:
             return {"error": str(exc)}
     if action == "get_receipt":
+        if principal is not None:
+            try:
+                service.get_case_as(principal, payload["case_id"])
+            except AccessDeniedError as exc:
+                return _denied(exc, {"receipt": None})
         receipt = service.get_receipt(payload["case_id"])
         return {"receipt": receipt.model_dump(mode="json") if receipt else None}
     if action == "list_receipts":
-        return {"receipts": [r.model_dump(mode="json") for r in service.list_receipts()]}
+        rows = service.list_receipts()
+        if principal is not None:
+            try:
+                service.require_surface(principal, SURFACE_MONEY, target="receipts")
+                if principal.role == "customer":
+                    own = {c.case_id for c in service.list_cases_as(principal)}
+                    rows = [r for r in rows if r.case_id in own]
+            except AccessDeniedError as exc:
+                return {"error": str(exc), "access_reason": exc.reason}
+        return {"receipts": [r.model_dump(mode="json") for r in rows]}
     if action == "list_executions":
         return {"executions": [e.model_dump(mode="json") for e in service.list_executions(payload["case_id"])]}
     if action == "get_tool_definitions":
@@ -253,12 +378,32 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     if action == "get_model_config":
         return {"model_config": service.get_model_config()}
     if action == "get_case_cost_ledger":
+        if principal is not None:
+            try:
+                entries = service.list_cost_entries_as(principal, payload["case_id"])
+            except AccessDeniedError as exc:
+                return _denied(exc, {"cost_entries": []})
+            return {
+                "cost_entries": [
+                    e.model_dump(mode="json") for e in (entries or [])
+                ]
+            }
         return {
             "cost_entries": [
                 e.model_dump(mode="json") for e in service.list_cost_entries(payload["case_id"])
             ]
         }
     if action == "get_cost_ledger":
+        if principal is not None:
+            try:
+                entries = service.list_cost_entries_as(principal)
+            except AccessDeniedError as exc:
+                return {"error": str(exc), "access_reason": exc.reason}
+            return {
+                "cost_entries": [e.model_dump(mode="json") for e in entries],
+                "cost_totals": service.cost_totals(),
+                "verify_problems": service.verify_cost_ledger(),
+            }
         return {
             "cost_entries": [
                 e.model_dump(mode="json") for e in service.list_all_cost_entries()
@@ -271,13 +416,29 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         for key in ("issued_on", "voided_on", "as_of", "scheduled_on", "graded_on"):
             if isinstance(arguments.get(key), str):
                 arguments[key] = date.fromisoformat(arguments[key])
+        actor = payload.get("actor", "staff")
+        if principal is not None:
+            try:
+                service.require_surface(
+                    principal, SURFACE_GATEWAY, target=payload["case_id"]
+                )
+                expected = GATEWAY_ACTOR_FOR_ROLE[principal.role]
+                if payload.get("actor") is not None and payload["actor"] != expected:
+                    service.deny_principal_mismatch(
+                        principal, surface=SURFACE_GATEWAY, target=payload["case_id"],
+                        field="actor", claimed=payload["actor"],
+                        on=date.fromisoformat(payload["called_on"]),
+                    )
+                actor = expected
+            except AccessDeniedError as exc:
+                return {"error": str(exc), "access_reason": exc.reason}
         try:
             result = service.invoke_tool(
                 payload["tool"],
                 arguments,
                 case_id=payload["case_id"],
                 called_on=date.fromisoformat(payload["called_on"]),
-                actor=payload.get("actor", "staff"),
+                actor=actor,
             )
         except PolicyDeniedError as exc:
             # A gateway policy denial rides the transport as the
@@ -295,6 +456,7 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
                 {"case_id": payload["case_id"], "issued_on": date.fromisoformat(payload["issued_on"])},
                 case_id=payload["case_id"],
                 called_on=date.fromisoformat(payload["issued_on"]),
+                actor=_shortcut_actor(),
             )
             return {"label": label.model_dump(mode="json")}
         except (LookupError, CarrierError, FraudHoldError, ToolError, FigureVerificationError) as exc:
@@ -312,6 +474,7 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
                 },
                 case_id=payload["case_id"],
                 called_on=date.fromisoformat(payload["voided_on"]),
+                actor=_shortcut_actor(),
             )
             return {"label_void": void.model_dump(mode="json")}
         except (LookupError, CarrierError, ToolError) as exc:
@@ -327,6 +490,7 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
                 },
                 case_id=payload["case_id"],
                 called_on=date.fromisoformat(payload["as_of"]),
+                actor=_shortcut_actor(),
             )
             return {"events": [e.model_dump(mode="json") for e in events]}
         except (LookupError, ToolError) as exc:
@@ -342,6 +506,7 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
                 },
                 case_id=payload["case_id"],
                 called_on=date.fromisoformat(payload["scheduled_on"]),
+                actor=_shortcut_actor(),
             )
             return {"pickup": booking.model_dump(mode="json")}
         except (LookupError, CarrierError, ToolError) as exc:
@@ -410,12 +575,22 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         }
     if action == "execute_top_up":
         try:
-            receipt = service.execute_top_up(
-                payload["case_id"],
-                idempotency_key=payload.get("idempotency_key", ""),
-                as_of=date.fromisoformat(payload["as_of"]),
-            )
+            if principal is not None:
+                receipt = service.execute_top_up_as(
+                    principal,
+                    payload["case_id"],
+                    idempotency_key=payload.get("idempotency_key", ""),
+                    as_of=date.fromisoformat(payload["as_of"]),
+                )
+            else:
+                receipt = service.execute_top_up(
+                    payload["case_id"],
+                    idempotency_key=payload.get("idempotency_key", ""),
+                    as_of=date.fromisoformat(payload["as_of"]),
+                )
             return {"receipt": receipt.model_dump(mode="json")}
+        except AccessDeniedError as exc:
+            return {"error": str(exc), "access_reason": exc.reason}
         except (LookupError, ApprovalError, FraudHoldError, PaymentsError) as exc:
             return {"error": str(exc)}
     if action == "draft_message":
@@ -476,22 +651,42 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         return {"screening_pack": service.get_screening_pack().model_dump(mode="json")}
     if action == "submit_customer_text":
         try:
-            item = service.submit_customer_text(
-                payload["case_id"],
-                source_surface=payload.get("source_surface", ""),
-                field_name=payload.get("field_name", ""),
-                text=payload.get("text", ""),
-                received_on=date.fromisoformat(payload["received_on"]),
-            )
+            if principal is not None:
+                item = service.submit_customer_text_as(
+                    principal,
+                    payload["case_id"],
+                    source_surface=payload.get("source_surface", ""),
+                    field_name=payload.get("field_name", ""),
+                    text=payload.get("text", ""),
+                    received_on=date.fromisoformat(payload["received_on"]),
+                )
+            else:
+                item = service.submit_customer_text(
+                    payload["case_id"],
+                    source_surface=payload.get("source_surface", ""),
+                    field_name=payload.get("field_name", ""),
+                    text=payload.get("text", ""),
+                    received_on=date.fromisoformat(payload["received_on"]),
+                )
             view = service.quarantine_view_for(item.quarantine_id)
             return {
                 "quarantine_item": item.model_dump(mode="json"),
                 "state": service.quarantine_state(item),
                 "view": view.model_dump(mode="json") if view else None,
             }
+        except AccessDeniedError as exc:
+            return _denied(exc, {"error": f"unknown case: {payload['case_id']}"})
         except (LookupError, QuarantineError) as exc:
             return {"error": str(exc)}
     if action == "list_quarantine":
+        if principal is not None and principal.role == "customer":
+            try:
+                states = service.quarantine_states_as(principal, payload["case_id"])
+            except AccessDeniedError as exc:
+                return _denied(exc, {"items": [], "acts": []})
+            if states is None:
+                return {"items": [], "acts": []}
+            return {"items": states, "acts": []}
         items = service.list_quarantine_items(payload["case_id"])
         views = {v.quarantine_id: v for v in service.list_quarantine_views(payload["case_id"])}
         return {
@@ -514,13 +709,30 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         }
     if action == "release_quarantined_text":
         try:
-            view = service.release_quarantined_text(
-                payload["quarantine_id"],
-                released_by=payload.get("released_by", ""),
-                reason=payload.get("reason", ""),
-                released_on=date.fromisoformat(payload["released_on"]),
-            )
+            if principal is not None:
+                if payload.get("released_by", "") != principal.id:
+                    service.deny_principal_mismatch(
+                        principal, surface=SURFACE_QUARANTINE,
+                        target=payload["quarantine_id"],
+                        field="released_by", claimed=payload.get("released_by", ""),
+                        on=date.fromisoformat(payload["released_on"]),
+                    )
+                view = service.release_quarantined_text_as(
+                    principal,
+                    payload["quarantine_id"],
+                    reason=payload.get("reason", ""),
+                    released_on=date.fromisoformat(payload["released_on"]),
+                )
+            else:
+                view = service.release_quarantined_text(
+                    payload["quarantine_id"],
+                    released_by=payload.get("released_by", ""),
+                    reason=payload.get("reason", ""),
+                    released_on=date.fromisoformat(payload["released_on"]),
+                )
             return {"view": view.model_dump(mode="json")}
+        except AccessDeniedError as exc:
+            return {"error": str(exc), "access_reason": exc.reason}
         except (LookupError, QuarantineError) as exc:
             return {"error": str(exc)}
     if action == "get_memory_config":
@@ -529,6 +741,18 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         return {"records_written": service.sync_memory()}
     if action == "get_customer_memory":
         as_of = payload.get("as_of")
+        if principal is not None:
+            try:
+                records = service.retrieve_memory_as(
+                    principal,
+                    payload["customer_id"],
+                    as_of=date.fromisoformat(as_of) if as_of else None,
+                    purpose="runtime_read",
+                    actor="runtime dispatch",
+                )
+            except AccessDeniedError as exc:
+                return _denied(exc, {"records": []})
+            return {"records": [r.model_dump(mode="json") for r in records]}
         records = service.retrieve_memory(
             payload["customer_id"],
             as_of=date.fromisoformat(as_of) if as_of else None,
@@ -538,6 +762,17 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         return {"records": [r.model_dump(mode="json") for r in records]}
     if action == "get_memory_retention":
         as_of = payload.get("as_of")
+        if principal is not None:
+            try:
+                retention = service.memory_retention_status_as(
+                    principal,
+                    payload["customer_id"],
+                    as_of=date.fromisoformat(as_of) if as_of else None,
+                    actor="runtime dispatch",
+                )
+            except AccessDeniedError as exc:
+                return _denied(exc, {"retention": None})
+            return {"retention": retention}
         return {
             "retention": service.memory_retention_status(
                 payload["customer_id"],
@@ -546,15 +781,59 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
             )
         }
     if action == "list_memory_access_log":
+        if principal is not None:
+            try:
+                entries = service.list_memory_access_log_as(
+                    principal, payload.get("customer_id")
+                )
+            except AccessDeniedError as exc:
+                return _denied(exc, {"access_log": []})
+            return {"access_log": [e.model_dump(mode="json") for e in entries]}
         entries = service.list_memory_access_log(payload.get("customer_id"))
         return {"access_log": [e.model_dump(mode="json") for e in entries]}
     if action == "score_case_from_memory":
         score = service.score_case_from_memory(payload["case_id"])
         return {"fraud_score": score.model_dump(mode="json") if score else None}
     if action == "list_cases":
+        if principal is not None:
+            try:
+                if principal.role == "customer":
+                    return {
+                        "cases": [
+                            service.get_case_view_as(principal, c.case_id)
+                            for c in service.list_cases_as(principal)
+                        ]
+                    }
+                return {
+                    "cases": [
+                        c.model_dump(mode="json") for c in service.list_cases_as(principal)
+                    ]
+                }
+            except AccessDeniedError as exc:
+                return {"error": str(exc), "access_reason": exc.reason}
         return {"cases": [c.model_dump(mode="json") for c in service.list_cases()]}
     if action == "list_orders":
+        if principal is not None:
+            try:
+                return {
+                    "orders": [
+                        o.model_dump(mode="json") for o in service.list_orders_as(principal)
+                    ]
+                }
+            except AccessDeniedError as exc:
+                return {"error": str(exc), "access_reason": exc.reason}
         return {"orders": [o.model_dump(mode="json") for o in service.list_orders()]}
+    if action == "get_access_pack":
+        return {"access_pack": service.get_access_pack().model_dump(mode="json")}
+    if action == "list_access_denials":
+        if principal is not None:
+            try:
+                entries = service.list_access_denials_as(principal)
+            except AccessDeniedError as exc:
+                return {"error": str(exc), "access_reason": exc.reason}
+        else:
+            entries = service.list_access_denials()
+        return {"access_denials": [e.model_dump(mode="json") for e in entries]}
     return {"error": f"unknown action: {action}"}
 
 
