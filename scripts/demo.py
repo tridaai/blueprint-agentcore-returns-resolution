@@ -639,6 +639,82 @@ def main() -> int:
             f"{entry.surface}/{entry.target}: {entry.reason} — {entry.detail}"
         )
 
+    print("\n--- management reporting: figures that re-perform (R17) ---")
+    report_pack = service.get_report_pack()
+    print(
+        f"  report pack {report_pack.version}: "
+        + ", ".join(d.kind for d in report_pack.definitions)
+        + " — every report names its population rule, window rule and measures"
+    )
+    # Plant one more known fraud outcome on the record: the
+    # warehouse grades the WARD jacket (declared new_with_tags) as
+    # damaged, with wear evidence and a fraction of its catalogue
+    # weight — misrepresentation, proven by grading. (CASE-3008's
+    # outcome is already known the other way: r.alvarez cleared it
+    # above, so the flag that fired on it is a proven false
+    # positive. Every other scored case's outcome is unknown —
+    # the report excludes them and counts the exclusion.)
+    service.invoke_tool(
+        "create_return_label", {"case_id": "CASE-3103", "issued_on": _date(2026, 11, 3)},
+        case_id="CASE-3103", called_on=_date(2026, 11, 3),
+    )
+    service.record_warehouse_receipt(
+        "CASE-3103", received_by="w.chen", received_on=_date(2026, 11, 6)
+    )
+    service.record_grading(
+        "CASE-3103", grader="p.novak", graded_condition="damaged_by_customer",
+        graded_on=_date(2026, 11, 7), wear_evidence=True, received_weight_grams=100,
+    )
+    as_of = _date(2026, 11, 8)
+    window = {"window_start": _date(2026, 10, 1), "window_end": _date(2026, 10, 31)}
+    reports = [
+        service.compute_report("return_rate", as_of=as_of, **window),
+        service.compute_report("disposition_mix", as_of=as_of, **window),
+        service.compute_report("fraud_outcomes", as_of=as_of),
+        service.compute_report("money_summary", as_of=as_of),
+        service.compute_report("cost_summary", as_of=as_of),
+    ]
+    by_kind = {r.kind: r for r in reports}
+    rr = by_kind["return_rate"]
+    print(
+        f"  return rate (Oct): {rr.figures['return_rate']} — "
+        f"{rr.population['returns_requested_in_window']} returns over "
+        f"{rr.population['orders_placed_in_window']} orders placed (the orders table "
+        f"is the denominator; no other order population exists)"
+    )
+    mix = by_kind["disposition_mix"]
+    mix_line = ", ".join(
+        f"{row['disposition']} {row['share']}" for row in mix.breakdown
+    )
+    print(
+        f"  disposition mix (Oct): {mix_line} — over {mix.population['decided_cases']} "
+        f"decided cases, shares summing to {mix.figures['mix_total_share']}"
+    )
+    fraud = by_kind["fraud_outcomes"]
+    print(
+        f"  fraud precision: {fraud.figures['precision']} — computed over the "
+        f"{fraud.population['known_outcome_cases']} cases whose outcome is KNOWN "
+        f"({fraud.figures['true_positives']} true positive(s), "
+        f"{fraud.figures['false_positives']} false positive(s)); "
+        f"{fraud.population['excluded_unknown_outcome']} scored cases excluded as "
+        f"unknown, never counted as negatives"
+    )
+    money_rep = by_kind["money_summary"]
+    print(
+        f"  money: executed refunds ${money_rep.figures['executed_refunds']}, "
+        f"top-ups ${money_rep.figures['executed_top_ups']}, recoveries outstanding "
+        f"${money_rep.figures['recoveries_outstanding']} — the console money view's "
+        f"own sums over the same receipts and adjustments"
+    )
+    cost = by_kind["cost_summary"]
+    print(
+        f"  model cost: ${cost.figures['total_cost']} over {cost.population['entries']} "
+        f"ledger entries (the offline profile's rate card is zero, stated as $0)"
+    )
+    for report in reports:
+        problems = service.verify_management_report(report)
+        print(f"  re-performance of {report.kind} ({report.report_id}): problems {problems}")
+
     for case_id in ("CASE-2003", "CASE-2004"):
         case = service.get_case(case_id)
         print(f"\n--- {case_id} summary (figure-verified) ---")
