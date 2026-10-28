@@ -10,9 +10,10 @@ from __future__ import annotations
 from datetime import date
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
-from .gateway import ToolError
+from .gateway import PolicyDeniedError, ToolError
 from .intake import ReferenceFeed
 from .models import ReturnRequest
 from .service import (
@@ -66,6 +67,17 @@ class ExecutionRequest(BaseModel):
         if not v or not v.strip():
             raise ValueError("an idempotency key is mandatory on every refund execution")
         return v.strip()
+
+
+class ToolInvokeRequest(BaseModel):
+    """The generic gateway invocation (R11): a tool, its exact
+    arguments, the case it acts on, and the invoking actor the
+    gateway policy pack evaluates."""
+
+    case_id: str
+    arguments: dict = {}
+    actor: str = "staff"
+    called_on: date
 
 
 class LabelRequest(BaseModel):
@@ -378,6 +390,43 @@ def create_app(service: CaseService) -> FastAPI:
     def tools() -> list[dict]:
         return [d.model_dump(mode="json") for d in service.tool_definitions()]
 
+    @app.get("/gateway/policy-pack")
+    def gateway_policy_pack() -> dict:
+        """The gateway policy pack as data (R11): the policies the
+        gateway evaluates in front of every invocation, in
+        evaluation order."""
+        return service.get_gateway_policy_pack().model_dump(mode="json")
+
+    @app.post("/tools/{tool}/invoke")
+    def invoke_tool(tool: str, body: ToolInvokeRequest):
+        """The generic gateway invocation (R11): any tool, with an
+        explicit actor. A policy denial is NOT an HTTP error — it
+        returns 200 with the AgentCore-shaped JSON-RPC -32002
+        envelope, exactly as AgentCore Policy delivers it."""
+        arguments = dict(body.arguments)
+        for key in ("issued_on", "voided_on", "as_of", "scheduled_on", "graded_on"):
+            if isinstance(arguments.get(key), str):
+                arguments[key] = date.fromisoformat(arguments[key])
+        try:
+            result = service.invoke_tool(
+                tool,
+                arguments,
+                case_id=body.case_id,
+                called_on=body.called_on,
+                actor=body.actor,
+            )
+        except PolicyDeniedError as exc:
+            return JSONResponse(status_code=200, content=exc.envelope())
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (CarrierError, FraudHoldError, GradingError, PaymentsError, ToolError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except FigureVerificationError as exc:
+            raise HTTPException(status_code=422, detail={"violations": exc.violations}) from exc
+        if isinstance(result, list):
+            return [r.model_dump(mode="json") for r in result]
+        return result.model_dump(mode="json")
+
     @app.get("/cases/{case_id}/tool-calls")
     def tool_calls(case_id: str) -> list[dict]:
         if service.get_case(case_id) is None:
@@ -393,6 +442,10 @@ def create_app(service: CaseService) -> FastAPI:
                 case_id=case_id,
                 called_on=body.issued_on,
             )
+        except PolicyDeniedError as exc:
+            # A gateway policy denial is not an HTTP error: 200 with
+            # the JSON-RPC -32002 envelope (R11).
+            return JSONResponse(status_code=200, content=exc.envelope())
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (CarrierError, FraudHoldError, ToolError) as exc:
@@ -433,6 +486,8 @@ def create_app(service: CaseService) -> FastAPI:
                 case_id=case_id,
                 called_on=body.voided_on,
             )
+        except PolicyDeniedError as exc:
+            return JSONResponse(status_code=200, content=exc.envelope())
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (CarrierError, ToolError) as exc:
@@ -448,6 +503,8 @@ def create_app(service: CaseService) -> FastAPI:
                 case_id=case_id,
                 called_on=as_of,
             )
+        except PolicyDeniedError as exc:
+            return JSONResponse(status_code=200, content=exc.envelope())
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ToolError as exc:
@@ -463,6 +520,8 @@ def create_app(service: CaseService) -> FastAPI:
                 case_id=case_id,
                 called_on=body.scheduled_on,
             )
+        except PolicyDeniedError as exc:
+            return JSONResponse(status_code=200, content=exc.envelope())
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (CarrierError, ToolError) as exc:

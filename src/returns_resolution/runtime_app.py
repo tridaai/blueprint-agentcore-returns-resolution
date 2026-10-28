@@ -23,7 +23,7 @@ from .evidence import LocalEvidenceStore
 from .intake import ReferenceFeed
 from .modelport import load_model_port
 from .models import ReturnRequest
-from .gateway import ToolError
+from .gateway import PolicyDeniedError, ToolError
 from .service import (
     ApprovalError,
     CarrierError,
@@ -79,7 +79,8 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     list_approvals {case_id} | approval_status {case_id} |
     execute_refund {case_id, idempotency_key, as_of} |
     get_receipt {case_id} | list_receipts | list_executions {case_id} |
-    get_tool_definitions | invoke_tool {tool, case_id, arguments, called_on} |
+    get_tool_definitions | invoke_tool {tool, case_id, arguments, called_on, actor?} |
+    get_gateway_policy_pack |
     create_return_label {case_id, issued_on} |
     void_return_label {case_id, label_id, voided_by, reason, voided_on} |
     get_carrier_events {case_id, label_id, as_of} |
@@ -229,9 +230,11 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         return {"executions": [e.model_dump(mode="json") for e in service.list_executions(payload["case_id"])]}
     if action == "get_tool_definitions":
         return {"tools": [d.model_dump(mode="json") for d in service.tool_definitions()]}
+    if action == "get_gateway_policy_pack":
+        return {"gateway_policy_pack": service.get_gateway_policy_pack().model_dump(mode="json")}
     if action == "invoke_tool":
         arguments = dict(payload.get("arguments") or {})
-        for key in ("issued_on", "voided_on", "as_of", "scheduled_on"):
+        for key in ("issued_on", "voided_on", "as_of", "scheduled_on", "graded_on"):
             if isinstance(arguments.get(key), str):
                 arguments[key] = date.fromisoformat(arguments[key])
         try:
@@ -240,7 +243,12 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
                 arguments,
                 case_id=payload["case_id"],
                 called_on=date.fromisoformat(payload["called_on"]),
+                actor=payload.get("actor", "staff"),
             )
+        except PolicyDeniedError as exc:
+            # A gateway policy denial rides the transport as the
+            # JSON-RPC -32002 envelope — it is not an action error.
+            return {"gateway_denial": exc.envelope()}
         except (LookupError, CarrierError, FraudHoldError, ToolError, FigureVerificationError) as exc:
             return {"error": str(exc)}
         if isinstance(result, list):
