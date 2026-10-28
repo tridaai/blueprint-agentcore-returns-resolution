@@ -58,7 +58,11 @@ planted feed / POST /returns / Runtime invocation
   local default (`./data/returns.db`); `DATABASE_URL` selects
   Postgres. Payloads are JSON **text** columns in both dialects —
   never JSONB — so a record reads back byte-identical on either.
-  Migrations are numbered, recorded in a ledger, applied once.
+  Migrations are numbered, recorded in a ledger, applied once. R10
+  verified the Postgres dialect end to end (see the section below);
+  the SQLite connection opens with `check_same_thread=False` because
+  the HTTP surfaces serve from a threadpool and a thread-bound
+  connection 500s every threaded store read.
 - **Evidence port**: S3-shaped URIs (`s3://returns-evidence/...`),
   content-hash file names, SHA-256 recorded at put and re-verified on
   read. The local double writes to a directory; docker-compose runs
@@ -470,10 +474,27 @@ port, purpose `message_verification`): a prior refund is sayable
 only as memory states it, only for that customer, and only while
 the record is unexpired.
 
+## The Postgres profile and the production smoke (R10)
+
+The store's second dialect is no longer a claim. The test suite
+gains a Postgres profile via a conftest that redirects each
+sqlite-path store to a private schema (path-hashed) on the test
+database — schema-only `search_path`, because a `,public` tail let
+an unmigrated schema silently resolve against public's tables and
+masked exactly the failures the profile exists to catch. The eval
+gate runs its whole scenario body per profile and compares the
+content-addressed artefact ids across in-memory, SQLite and
+Postgres: identity across dialects is the parity claim, and it
+holds because payloads are JSON text and every ordering the domain
+depends on (chain heads by supersession graph, memory logs by
+recorded sequence) is computed in code, not inherited from a
+dialect's row order. `scripts/prod_smoke.py` is the deploy-shaped
+check: a Runtime subprocess and the API on one store walk a planted
+case across every round's machinery over HTTP and print the ledger.
+
 ## What is deliberately not here yet
 
-Injection quarantine (R10), Gateway + Policy ports (R11), model
-cost ledger (R12), console (R13), Postgres parity + production
-smoke (R15), access control (R16), reporting (R17), carrier
-exceptions (R18), red team (R19), deploy artefacts (R20). The
-README's honest status is the authoritative per-round account.
+Injection quarantine, the full Gateway + Policy ports (R11),
+model cost ledger, console, access control, reporting, carrier
+exceptions, red team, deploy artefacts. The README's honest status
+is the authoritative per-round account.
