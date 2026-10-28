@@ -261,6 +261,21 @@ CREATE TABLE IF NOT EXISTS memory_access_log (
 );
 """
 
+# Migration 0010 — the model cost ledger (R12): one row per
+# gateway call, append-only like the memory tables (an entry id
+# already standing is never overwritten — the insert is
+# conflict-ignore). The payload is the whole CostEntry; the columns
+# are the read paths (per case, per profile).
+_MIGRATION_0010_SQLITE = """
+CREATE TABLE IF NOT EXISTS model_calls (
+    entry_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("0001", _MIGRATION_0001_SQLITE, _MIGRATION_0001_PG),
     ("0002", _MIGRATION_0002_SQLITE, _MIGRATION_0002_SQLITE),
@@ -271,6 +286,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("0007", _MIGRATION_0007_SQLITE, _MIGRATION_0007_SQLITE),
     ("0008", _MIGRATION_0008_SQLITE, _MIGRATION_0008_SQLITE),
     ("0009", _MIGRATION_0009_SQLITE, _MIGRATION_0009_SQLITE),
+    ("0010", _MIGRATION_0010_SQLITE, _MIGRATION_0010_SQLITE),
 ]
 
 
@@ -362,6 +378,9 @@ class Store(Protocol):
     def put_memory_access(self, payload: dict[str, Any]) -> None: ...
     def list_memory_access(self, customer_id: str | None = None) -> list[dict[str, Any]]: ...
     def count_memory_access(self) -> int: ...
+    def put_cost_entry(self, payload: dict[str, Any]) -> None: ...
+    def list_cost_entries(self, case_id: str) -> list[dict[str, Any]]: ...
+    def list_all_cost_entries(self) -> list[dict[str, Any]]: ...
 
 
 class SqlStore:
@@ -1132,6 +1151,34 @@ class SqlStore:
         rows = self._query("SELECT COUNT(*) AS n FROM memory_access_log")
         return int(rows[0]["n"]) if rows else 0
 
+    # -- model cost ledger (R12) ----------------------------------------
+    def put_cost_entry(self, payload: dict[str, Any]) -> None:
+        # Append-only: an entry id already standing is never
+        # overwritten — the ledger is history, not state.
+        self._execute(
+            "INSERT INTO model_calls (entry_id, case_id, profile, status, payload) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (entry_id) DO NOTHING",
+            (
+                payload["entry_id"],
+                payload["case_id"],
+                payload["profile"],
+                payload["status"],
+                json.dumps(payload),
+            ),
+        )
+
+    def list_cost_entries(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM model_calls WHERE case_id = ?", (case_id,)
+        )
+        entries = [json.loads(r["payload"]) for r in rows]
+        return sorted(entries, key=lambda e: (e["seq"], e["entry_id"]))
+
+    def list_all_cost_entries(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT payload FROM model_calls")
+        entries = [json.loads(r["payload"]) for r in rows]
+        return sorted(entries, key=lambda e: (e["case_id"], e["seq"], e["entry_id"]))
+
 
 class InMemoryStore:
     """Test double implementing the same port with dicts."""
@@ -1159,9 +1206,10 @@ class InMemoryStore:
         self._messages: dict[str, dict] = {}
         self._memory_records: dict[str, dict] = {}
         self._memory_access: dict[str, dict] = {}
+        self._cost_entries: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
-        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009"]
+        return ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010"]
 
     def put_order(self, payload: dict[str, Any]) -> None:
         self._orders[payload["order_id"]] = payload
@@ -1486,3 +1534,14 @@ class InMemoryStore:
 
     def count_memory_access(self) -> int:
         return len(self._memory_access)
+
+    def put_cost_entry(self, payload: dict[str, Any]) -> None:
+        self._cost_entries.setdefault(payload["entry_id"], payload)
+
+    def list_cost_entries(self, case_id: str) -> list[dict[str, Any]]:
+        entries = [e for e in self._cost_entries.values() if e["case_id"] == case_id]
+        return sorted(entries, key=lambda e: (e["seq"], e["entry_id"]))
+
+    def list_all_cost_entries(self) -> list[dict[str, Any]]:
+        entries = list(self._cost_entries.values())
+        return sorted(entries, key=lambda e: (e["case_id"], e["seq"], e["entry_id"]))
