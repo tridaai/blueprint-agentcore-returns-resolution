@@ -1,4 +1,4 @@
-"""Eval gate for Blueprint #18 (R1 + R2 + R3 + R4 + R5).
+"""Eval gate for Blueprint #18 (R1 + R2 + R3 + R4 + R5 + R6).
 
 Zero-tolerance counters against planted truth:
 - eligibility_outcome_mismatches: decisions that differ from the
@@ -66,6 +66,24 @@ Zero-tolerance counters against planted truth:
 - failed_execution_partial_receipts: receipts (or money movements)
   left behind by an injected provider failure; the failed case
   must stay executable and land exactly one receipt on retry.
+- duplicate_labels: a case issued more than one active label —
+  re-issuing through the gateway must return the existing artefact
+  and the carrier port must have issued exactly one label.
+- label_for_ineligible_or_blocked_accepted: label issuances that
+  landed for an ineligible case (CASE-2004) or the fraud-blocked
+  case (CASE-3008, before its named review decision).
+- label_cost_mismatches_hidden: labels whose recorded
+  reconciliation does not state the exact variance between the
+  label's cost and the computation's return-shipping deduction,
+  or that call a nonzero variance "matched".
+- timeline_gaps_unnamed: expected-but-absent artefacts the derived
+  timeline failed to name (a refund executed with no label, a
+  ship-by date passed with no label, a fraud block awaiting its
+  review decision), gaps claimed on a fully walked case, or
+  timeline entries carrying no artefact id.
+- non_bulky_pickups_accepted: pickups booked for categories the
+  pack does not flag as bulky; the bulky booking beside it must
+  land against the case's active label.
 
 Prints the counters and GATE: PASS/FAIL; exit code follows.
 """
@@ -79,12 +97,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from returns_resolution.carrier import LocalCarrierDouble
 from returns_resolution.intake import FRAUD_FEED_REQUESTS, PLANTED_REQUESTS
 from returns_resolution.modelport import OfflineComposer
 from returns_resolution.models import RefundApproval, ReturnRequest
 from returns_resolution.payments import LocalPaymentsDouble
 from returns_resolution.service import (
     ApprovalError,
+    CarrierError,
     CaseService,
     DuplicateRefundError,
     FigureVerificationError,
@@ -147,6 +167,11 @@ def main() -> int:
         "stale_computation_approvals_accepted": 0,
         "fraud_blocked_executions": 0,
         "failed_execution_partial_receipts": 0,
+        "duplicate_labels": 0,
+        "label_for_ineligible_or_blocked_accepted": 0,
+        "label_cost_mismatches_hidden": 0,
+        "timeline_gaps_unnamed": 0,
+        "non_bulky_pickups_accepted": 0,
     }
 
     service = CaseService(InMemoryStore(), OfflineComposer())
@@ -647,6 +672,144 @@ def main() -> int:
     trail = [t.state for t in flaky.get_execution_by_key("eval-flaky").transitions]
     if trail != ["requested", "executing", "failed", "executing", "executed"]:
         counters["failed_execution_partial_receipts"] += 1
+
+    # --- R6: carrier tools behind the gateway + the timeline ---------
+    # Labels issue only through the gateway, against the carrier
+    # double (which counts what it actually issued). The timeline is
+    # graded against the record: gaps that exist must be named, and
+    # a fully walked case must claim none.
+    DAY6 = date(2026, 10, 27)
+    carrier = LocalCarrierDouble()
+    ship = CaseService(InMemoryStore(), OfflineComposer(), carrier_port=carrier)
+    ship.seed_orders()
+    for request in PLANTED_REQUESTS:
+        ship.ingest(request)
+
+    def _issue(svc, case_id, on=DAY6):
+        return svc.invoke_tool(
+            "create_return_label", {"case_id": case_id, "issued_on": on},
+            case_id=case_id, called_on=on,
+        )
+
+    # Idempotency: a second issue returns the same artefact, the
+    # store holds one label, and the port issued exactly one.
+    first2003 = _issue(ship, "CASE-2003")
+    again2003 = _issue(ship, "CASE-2003")
+    if (
+        again2003.label_id != first2003.label_id
+        or len(ship.list_labels("CASE-2003")) != 1
+        or carrier.label_count != 1
+    ):
+        counters["duplicate_labels"] += 1
+
+    # The ineligible case refuses, and nothing is stored.
+    try:
+        _issue(ship, "CASE-2004")
+        counters["label_for_ineligible_or_blocked_accepted"] += 1
+    except CarrierError:
+        pass
+    if ship.list_labels("CASE-2004"):
+        counters["label_for_ineligible_or_blocked_accepted"] += 1
+
+    # The fraud-blocked case refuses through the R4 guard — and its
+    # timeline names the pending review decision as the gap.
+    blocked_ship = CaseService(InMemoryStore(), OfflineComposer())
+    blocked_ship.seed_orders()
+    blocked_ship.seed_history()
+    blocked_ship.ingest(FRAUD_FEED_REQUESTS[0])
+    try:
+        _issue(blocked_ship, "CASE-3008")
+        counters["label_for_ineligible_or_blocked_accepted"] += 1
+    except FraudHoldError:
+        pass
+    if blocked_ship.list_labels("CASE-3008"):
+        counters["label_for_ineligible_or_blocked_accepted"] += 1
+    blocked_view = blocked_ship.get_timeline("CASE-3008", DAY6)
+    if [g.kind for g in blocked_view.gaps] != ["fraud_review_decision"]:
+        counters["timeline_gaps_unnamed"] += 1
+
+    # A ship-by date passed with no label is named (CASE-2001 has no
+    # label on this service yet — its label is issued below).
+    shipby_view = ship.get_timeline("CASE-2001", date(2026, 12, 1))
+    if [g.kind for g in shipby_view.gaps] != ["return_label"]:
+        counters["timeline_gaps_unnamed"] += 1
+
+    # Reconciliation honesty: for every label issued here, the
+    # artefact must state the exact variance against the
+    # computation's return-shipping line — a nonzero variance may
+    # never be filed as "matched", and none may be absent.
+    for label in (first2003, _issue(ship, "CASE-2006"), _issue(ship, "CASE-2001")):
+        computation6 = ship.get_computation(label.case_id)
+        shipping_line = next(
+            ln for ln in computation6.lines if ln.line_id == "return_shipping"
+        )
+        rec = label.reconciliation
+        if shipping_line.amount is None:
+            if rec.status != "not_reconcilable":
+                counters["label_cost_mismatches_hidden"] += 1
+            continue
+        expected_variance = label.cost - shipping_line.amount
+        if rec.deducted_amount != shipping_line.amount or rec.variance != expected_variance:
+            counters["label_cost_mismatches_hidden"] += 1
+        if expected_variance == 0 and rec.status != "matched":
+            counters["label_cost_mismatches_hidden"] += 1
+        if expected_variance != 0 and rec.status == "matched":
+            counters["label_cost_mismatches_hidden"] += 1
+    # The planted electronics variance, exactly: $8.50 charged,
+    # $6.95 deducted, $1.55 standing on the record.
+    label2006 = ship.get_active_label("CASE-2006")
+    if (
+        label2006.reconciliation.status != "variance"
+        or label2006.reconciliation.variance != Decimal("1.55")
+    ):
+        counters["label_cost_mismatches_hidden"] += 1
+
+    # A refund executed with no label of record (the R5 `money`
+    # service executed CASE-2006 and never issued one) is named.
+    money_view = money.get_timeline("CASE-2006", DAY5)
+    if [g.kind for g in money_view.gaps] != ["return_label"]:
+        counters["timeline_gaps_unnamed"] += 1
+
+    # The fully walked case — label, approval, execution, carrier
+    # events — claims no gaps, and every entry names its artefact.
+    ship.record_approval("CASE-2003", approver="d.okafor", role="returns_lead", as_of=DAY6)
+    ship.execute_refund("CASE-2003", idempotency_key="eval-r6-walk", as_of=DAY6)
+    walked = ship.get_timeline("CASE-2003", date(2026, 10, 30))
+    if walked.gaps:
+        counters["timeline_gaps_unnamed"] += 1
+    if any(not e.artefact_id for e in walked.entries):
+        counters["timeline_gaps_unnamed"] += 1
+    walked_stages = [e.stage for e in walked.entries]
+    for expected_stage in ("label", "carrier_event", "approval", "receipt"):
+        if expected_stage not in walked_stages:
+            counters["timeline_gaps_unnamed"] += 1
+
+    # Pickups: a non-bulky category refuses naming the pack rule;
+    # the bulky tent case books against its active (freight) label.
+    try:
+        ship.invoke_tool(
+            "book_pickup", {"case_id": "CASE-2003", "scheduled_on": DAY6},
+            case_id="CASE-2003", called_on=DAY6,
+        )
+        counters["non_bulky_pickups_accepted"] += 1
+    except CarrierError:
+        pass
+    tent = ship.ingest(
+        ReturnRequest(
+            request_id="REQ-2010", order_id="ORD-1002", sku="TENT-2P", qty=1,
+            reason_code="changed_mind", condition_declared="used",
+            requested_on=date(2026, 9, 15),
+        )
+    )
+    tent_label = _issue(ship, tent.case_id, on=date(2026, 9, 16))
+    if tent_label.service_level != "freight" or tent_label.cost != Decimal("24.00"):
+        counters["label_cost_mismatches_hidden"] += 1
+    booking = ship.invoke_tool(
+        "book_pickup", {"case_id": tent.case_id, "scheduled_on": date(2026, 9, 17)},
+        case_id=tent.case_id, called_on=date(2026, 9, 17),
+    )
+    if booking.label_id != tent_label.label_id or booking.status != "booked":
+        counters["non_bulky_pickups_accepted"] += 1
 
     for name, value in counters.items():
         print(f"{name}: {value} (required 0)")
