@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "returns-resolution-agentcore"
+version = "0.1.0"
+description = "Returns Resolution & Disposition Agent on AWS Bedrock AgentCore — a governed post-purchase returns blueprint (Trida AI Blueprint #18)."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "bedrock-agentcore==1.25.1",
+    "fastapi==0.162.0",
+    "pydantic==2.14.1",
+    "psycopg[binary]==3.2.9",
+    "uvicorn==0.54.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx==0.28.1",
+    "pytest==8.3.4",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/returns_resolution"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
