@@ -1,4 +1,4 @@
-"""Eval gate for Blueprint #18 (R1 + R2 + R3).
+"""Eval gate for Blueprint #18 (R1 + R2 + R3 + R4).
 
 Zero-tolerance counters against planted truth:
 - eligibility_outcome_mismatches: decisions that differ from the
@@ -32,6 +32,22 @@ Zero-tolerance counters against planted truth:
   name exactly what inspection must establish.
 - disposition_tamper_undetected: stored dispositions altered after
   the fact that the re-performance verifier did not catch.
+- fraud_band_mismatches: scores that differ from the hand-derived
+  planted truth (serial returner 95.00 FRAUD_REVIEW, wardrobing
+  36.00 MONITOR, every feed case 0.00 CLEAR), per-signal
+  contributions included, or insufficient/not-computable signals
+  that fail to name their situation.
+- fraud_block_bypasses: attempts to move a FRAUD_REVIEW case
+  forward without the named review act (tampered score, off-menu
+  outcome, uncoded reason, unnamed reviewer, second decision, a
+  decision on a case not in review) that were not refused.
+- fraud_score_irreproducibility: re-scores over unchanged inputs
+  that produce a different artefact, stored scores the
+  re-performance verifier cannot reproduce, or identical seeds
+  scored differently by two services.
+- fraud_lifted_without_decision: a blocked case found unblocked
+  (or carrying a review artefact) after the bypass probes, before
+  any legitimate decision act.
 
 Prints the counters and GATE: PASS/FAIL; exit code follows.
 """
@@ -45,10 +61,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from returns_resolution.intake import PLANTED_REQUESTS
+from returns_resolution.intake import FRAUD_FEED_REQUESTS, PLANTED_REQUESTS
 from returns_resolution.modelport import OfflineComposer
 from returns_resolution.models import ReturnRequest
-from returns_resolution.service import CaseService, FigureVerificationError
+from returns_resolution.service import (
+    CaseService,
+    FigureVerificationError,
+    FraudHoldError,
+    FraudReviewError,
+)
 from returns_resolution.store import InMemoryStore
 from returns_resolution.verifier import verify_summary
 
@@ -95,6 +116,10 @@ def main() -> int:
         "silent_reroutes": 0,
         "hold_unknowns_unnamed": 0,
         "disposition_tamper_undetected": 0,
+        "fraud_band_mismatches": 0,
+        "fraud_block_bypasses": 0,
+        "fraud_score_irreproducibility": 0,
+        "fraud_lifted_without_decision": 0,
     }
 
     service = CaseService(InMemoryStore(), OfflineComposer())
@@ -335,6 +360,129 @@ def main() -> int:
     probe_disp = service.get_disposition("CASE-2098")
     if probe_disp is None or probe_disp.status != "not_decidable" or probe_disp.missing_dimension != "condition_declared":
         counters["undecidable_but_decided"] += 1
+
+    # --- R4: fraud scoring against hand-derived planted truth ----------
+    # Hand-derived from the seed history (see seed.py): CUST-SER
+    # velocity (7-2)x8=40 at cap + share 8/8=1.0000 -> 35 + churn 4
+    # cards -> 20 = 95.00 FRAUD_REVIEW; CUST-WARD wardrobing 3x12=36
+    # at cap, everything else named-insufficient or zero = 36.00
+    # MONITOR; every R1 feed customer scores 0.00 CLEAR.
+    fraud = CaseService(InMemoryStore(), OfflineComposer())
+    fraud.seed_orders()
+    fraud.seed_history()
+    for request in PLANTED_REQUESTS:
+        clean = fraud.ingest(request)
+        if clean.fraud_score.total_score != Decimal("0.00") or clean.fraud_score.band != "CLEAR":
+            counters["fraud_band_mismatches"] += 1
+    ser = fraud.ingest(FRAUD_FEED_REQUESTS[0])
+    ward = fraud.ingest(FRAUD_FEED_REQUESTS[1])
+
+    def _sig(score, signal_id):
+        return next(s for s in score.signals if s.signal_id == signal_id)
+
+    ser_expected = {
+        "return_velocity": ("computed", "7", Decimal("40.00")),
+        "serial_returner_share": ("computed", "1.0000", Decimal("35.00")),
+        "wardrobing_indicator": ("computed", "0", Decimal("0.00")),
+        "weight_mismatch": ("not_computable", None, Decimal("0")),
+        "card_churn": ("computed", "4", Decimal("20.00")),
+    }
+    if ser.fraud_score.total_score != Decimal("95.00") or ser.fraud_score.band != "FRAUD_REVIEW":
+        counters["fraud_band_mismatches"] += 1
+    for signal_id, (status, raw, contribution) in ser_expected.items():
+        got = _sig(ser.fraud_score, signal_id)
+        if (got.status, got.raw_value, got.contribution) != (status, raw, contribution):
+            counters["fraud_band_mismatches"] += 1
+        if got.status != "computed" and not got.missing_input:
+            counters["fraud_band_mismatches"] += 1
+    if ser.fraud_state != "fraud_review" or not fraud.refund_path_blocked("CASE-3008"):
+        counters["fraud_band_mismatches"] += 1
+
+    ward_expected = {
+        "return_velocity": ("computed", "2", Decimal("0.00")),
+        "serial_returner_share": ("insufficient_data", None, Decimal("0")),
+        "wardrobing_indicator": ("computed", "3", Decimal("36.00")),
+        "weight_mismatch": ("not_computable", None, Decimal("0")),
+        "card_churn": ("insufficient_data", None, Decimal("0")),
+    }
+    if ward.fraud_score.total_score != Decimal("36.00") or ward.fraud_score.band != "MONITOR":
+        counters["fraud_band_mismatches"] += 1
+    for signal_id, (status, raw, contribution) in ward_expected.items():
+        got = _sig(ward.fraud_score, signal_id)
+        if (got.status, got.raw_value, got.contribution) != (status, raw, contribution):
+            counters["fraud_band_mismatches"] += 1
+        if got.status != "computed" and not got.missing_input:
+            counters["fraud_band_mismatches"] += 1
+    if ward.fraud_state != "monitor" or fraud.refund_path_blocked("CASE-3103"):
+        counters["fraud_band_mismatches"] += 1
+
+    # Reproducibility: every stored score re-performs clean, a
+    # re-score over unchanged inputs returns the same artefact, and
+    # an independently seeded twin service agrees byte for byte.
+    for scored_case in fraud.list_cases():
+        if scored_case.fraud_score is not None and fraud.verify_stored_fraud_score(scored_case.case_id):
+            counters["fraud_score_irreproducibility"] += 1
+    if fraud.rescore_case("CASE-3008").score_id != ser.fraud_score.score_id:
+        counters["fraud_score_irreproducibility"] += 1
+    twin = CaseService(InMemoryStore(), OfflineComposer())
+    twin.seed_orders()
+    twin.seed_history()
+    twin_ser = twin.ingest(FRAUD_FEED_REQUESTS[0])
+    if twin_ser.fraud_score.model_dump(mode="json") != ser.fraud_score.model_dump(mode="json"):
+        counters["fraud_score_irreproducibility"] += 1
+
+    # Bypass probes: none of these may move CASE-3008 forward.
+    stored_score = fraud._store.get_fraud_score(ser.fraud_score.score_id)
+    tampered_score = {**stored_score, "band": "CLEAR", "total_score": "0.00"}
+    fraud._store.put_fraud_score(tampered_score)
+    if not fraud.verify_stored_fraud_score("CASE-3008"):
+        counters["fraud_block_bypasses"] += 1  # tamper went undetected
+    fraud._store.put_fraud_score(stored_score)
+    for kwargs in (
+        dict(reviewer="r.alvarez", outcome="edit_score", reason_code="legitimate_pattern_explained"),
+        dict(reviewer="r.alvarez", outcome="cleared_with_reason", reason_code="pattern_verified"),
+        dict(reviewer=" ", outcome="cleared_with_reason", reason_code="legitimate_pattern_explained"),
+    ):
+        try:
+            fraud.record_fraud_review("CASE-3008", **kwargs)
+            counters["fraud_block_bypasses"] += 1  # a refused act landed
+        except FraudReviewError:
+            pass
+    try:
+        fraud.record_fraud_review("CASE-3103", reviewer="r.alvarez",
+                                  outcome="confirmed_fraud", reason_code="pattern_verified")
+        counters["fraud_block_bypasses"] += 1
+    except FraudReviewError:
+        pass
+    try:
+        fraud.assert_refund_path_open("CASE-3008")
+        counters["fraud_block_bypasses"] += 1  # the guard let a blocked case through
+    except FraudHoldError:
+        pass
+    # After every probe: still blocked, and no review artefact exists.
+    if not fraud.refund_path_blocked("CASE-3008"):
+        counters["fraud_lifted_without_decision"] += 1
+    if fraud.get_fraud_review("CASE-3008") is not None:
+        counters["fraud_lifted_without_decision"] += 1
+    if fraud.get_case("CASE-3008").fraud_state != "fraud_review":
+        counters["fraud_lifted_without_decision"] += 1
+
+    # The one legitimate path: a named decision lifts the block, a
+    # second decision on the same score is refused, and the score
+    # artefact itself is untouched by the act.
+    fraud.record_fraud_review("CASE-3008", reviewer="r.alvarez",
+                              outcome="cleared_with_reason",
+                              reason_code="legitimate_pattern_explained")
+    if fraud.refund_path_blocked("CASE-3008") or fraud.get_case("CASE-3008").fraud_state != "fraud_cleared":
+        counters["fraud_band_mismatches"] += 1
+    if fraud.get_fraud_score("CASE-3008").band != "FRAUD_REVIEW" or fraud.verify_stored_fraud_score("CASE-3008"):
+        counters["fraud_band_mismatches"] += 1
+    try:
+        fraud.record_fraud_review("CASE-3008", reviewer="m.osei",
+                                  outcome="confirmed_fraud", reason_code="pattern_verified")
+        counters["fraud_block_bypasses"] += 1
+    except FraudReviewError:
+        pass
 
     for name, value in counters.items():
         print(f"{name}: {value} (required 0)")
