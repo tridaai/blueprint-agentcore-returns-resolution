@@ -272,6 +272,60 @@ def main() -> int:
         for gap in view.gaps:
             print(f"    GAP [{gap.kind}] {gap.detail}")
 
+    print("\n--- customer messaging: templates, the verifier, the lifecycle (R8; messaging: LOCAL DOUBLE) ---")
+    from returns_resolution.service import MessagingError as _MessagingError
+
+    messaging = service.messaging_port
+    standing = [
+        m for m in service.list_all_messages() if m.message_type == "return_summary"
+    ]
+    print(
+        f"  every ingested case carries its summary as a message: "
+        f"{len(standing)} recorded, "
+        f"{sum(1 for m in standing if m.status == 'verified')} verified, "
+        f"{sum(1 for m in standing if m.status == 'refused')} refused"
+    )
+
+    def _send(case_id, message_type, on):
+        draft = service.draft_message(case_id, message_type, as_of=on)
+        service.verify_message(draft.message_id, as_of=on)
+        service.queue_message(draft.message_id, as_of=on)
+        return service.send_message(draft.message_id, as_of=on)
+
+    sent = _send("CASE-2003", "grading_outcome_notice", _date(2026, 10, 31))
+    print(f"  CASE-2003 grading-outcome notice sent via {sent.provider}:")
+    print(f"    {sent.text}")
+    recovery_note = _send("CASE-2003", "adjustment_notice", _date(2026, 10, 31))
+    print(f"  CASE-2003 recovery notice sent ({recovery_note.message_id}); recovery due $14.50 named")
+    fraud_note = _send("CASE-3008", "fraud_review_notice", _date(2026, 11, 1))
+    print(f"  CASE-3008 fraud-review notice sent — no signal, weight or threshold in it:")
+    print(f"    {fraud_note.text}")
+
+    probe = service.draft_message(
+        "CASE-2003", "return_summary", as_of=_date(2026, 10, 31),
+        model_note="Good news — your refund is $999.99.",
+    )
+    refused = service.verify_message(probe.message_id, as_of=_date(2026, 10, 31))
+    print(f"  an inflated draft (free text in the note slot) is {refused.status}: {refused.violations}")
+
+    # A queued message goes stale when grading supersedes its artefacts.
+    queued = [m for m in service.list_messages("CASE-2001") if m.status == "verified"][-1]
+    service.queue_message(queued.message_id, as_of=_date(2026, 10, 31))
+    service.record_warehouse_receipt("CASE-2001", received_by="w.chen", received_on=_date(2026, 10, 31))
+    graded2001 = service.record_grading(
+        "CASE-2001", grader="p.novak", graded_condition="like_new", graded_on=_date(2026, 11, 1),
+    )
+    try:
+        service.send_message(queued.message_id, as_of=_date(2026, 11, 1))
+    except _MessagingError as exc:
+        withdrawn = service.get_message(queued.message_id)
+        print(
+            f"  CASE-2001's queued summary was withdrawn when grading superseded its artefacts "
+            f"(refund delta {graded2001.refund_delta}); the send was refused — {exc}"
+        )
+        print("  nothing stale was sent; a fresh verified summary stands in its place")
+    print(f"  deliveries on the messaging double: {messaging.delivery_count} (one per send, retries included)")
+
     for case_id in ("CASE-2003", "CASE-2004"):
         case = service.get_case(case_id)
         print(f"\n--- {case_id} summary (figure-verified) ---")

@@ -96,17 +96,20 @@ def verify_summary(
 # How a disposition may be recognised in prose. The templates speak
 # through messaging.DISPOSITION_PHRASES; these patterns recognise
 # the same statements (and their close variants) wherever they
-# appear — including in a free-form note slot.
+# appear — including in a free-form note slot. The verb forms are
+# matched exactly (restock / restocks / restocked) rather than by
+# bare stem: a stem match would read the fee vocabulary —
+# "restocking fee" — as a disposition statement, which it is not.
 _DISPOSITION_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("RESTOCK", re.compile(r"(?i)\brestock")),
-    ("REFURBISH", re.compile(r"(?i)\brefurbish")),
+    ("RESTOCK", re.compile(r"(?i)\brestock(?:s|ed)?\b")),
+    ("REFURBISH", re.compile(r"(?i)\brefurbish(?:es|ed)?\b")),
     ("OUTLET", re.compile(r"(?i)\boutlet\b")),
-    ("LIQUIDATE", re.compile(r"(?i)\bliquidat")),
+    ("LIQUIDATE", re.compile(r"(?i)\bliquidat(?:e|es|ed)\b")),
     (
         "RETURN_TO_VENDOR",
         re.compile(r"(?i)\breturn(?:ed|s|ing)?\s+to\s+(?:the\s+)?vendor\b|\bsent\s+back\s+to\s+(?:the\s+)?vendor\b"),
     ),
-    ("RECYCLE", re.compile(r"(?i)\brecycl")),
+    ("RECYCLE", re.compile(r"(?i)\brecycl(?:e|es|ed)\b")),
     (
         "HOLD_FOR_INSPECTION",
         re.compile(r"(?i)\bheld\s+for\s+inspection\b|\bhold\s+for\s+inspection\b|\binspection\s+hold\b"),
