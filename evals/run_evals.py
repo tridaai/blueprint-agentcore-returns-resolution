@@ -1,4 +1,4 @@
-"""Eval gate for Blueprint #18 (R1 + R2 + R3 + R4 + R5 + R6).
+"""Eval gate for Blueprint #18 (R1–R9).
 
 Zero-tolerance counters against planted truth:
 - eligibility_outcome_mismatches: decisions that differ from the
@@ -114,6 +114,22 @@ Zero-tolerance counters against planted truth:
 - figure_fact_violations_sent: message drafts whose figures or
   stated facts disagreed with the artefacts of record and were
   not refused — an inflated refund, a wrong disposition.
+- cross_customer_leaks: memory retrievals returning one
+  customer's records to another (or to a stranger probe), access-
+  log entries whose returned ids belong to a different customer,
+  or a message quoting ANOTHER customer's memory figure that the
+  verifier let through.
+- memory_store_score_divergences: fraud scores recomputed from
+  memory records that differ from the store-path artefact for
+  the same case (id, total, band), milestone records missing or
+  doubled, or the customer's own live memory figure refused in
+  their own message — the memory view must agree with the store.
+- expired_memory_surfaces: records past the pack's retention
+  window returned by retrieval, or an expired record's figure
+  verified in a message.
+- unlogged_memory_retrievals: memory port reads that never
+  reached the access log, or log entries missing their purpose,
+  actor or customer scope.
 
 Prints the counters and GATE: PASS/FAIL; exit code follows.
 """
@@ -129,10 +145,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from returns_resolution.carrier import LocalCarrierDouble
 from returns_resolution.intake import FRAUD_FEED_REQUESTS, PLANTED_REQUESTS
+from returns_resolution.memory import MemoryPack
 from returns_resolution.messaging import LocalMessagingDouble
 from returns_resolution.modelport import OfflineComposer
-from returns_resolution.models import RefundApproval, ReturnRequest
+from returns_resolution.models import Order, OrderLine, RefundApproval, ReturnRequest
 from returns_resolution.payments import LocalPaymentsDouble
+from returns_resolution.seed import CATALOGUE
 from returns_resolution.service import (
     ApprovalError,
     CarrierError,
@@ -214,6 +232,10 @@ def main() -> int:
         "stale_message_sends": 0,
         "forbidden_content_sent": 0,
         "figure_fact_violations_sent": 0,
+        "cross_customer_leaks": 0,
+        "memory_store_score_divergences": 0,
+        "expired_memory_surfaces": 0,
+        "unlogged_memory_retrievals": 0,
     }
 
     service = CaseService(InMemoryStore(), OfflineComposer())
@@ -1225,6 +1247,152 @@ def main() -> int:
     sent_replacement = msg.send_message(replacement.message_id, as_of=GRADED8)
     if msg_double.deliveries.get(sent_replacement.message_id) != sent_replacement.text:
         counters["stale_message_sends"] += 1
+
+    # ================= R9 — customer memory ==========================================
+    # Milestone derivation, customer-scoped logged retrieval,
+    # retention tombstones, store/memory score parity, and the
+    # messaging universe extended to the case's OWN customer only.
+    mem = CaseService(InMemoryStore(), OfflineComposer())
+    mem.seed_orders()
+    mem.seed_history()
+    if mem.sync_memory() != 9:
+        counters["memory_store_score_divergences"] += 1  # the history backfill contract
+    for request in PLANTED_REQUESTS:
+        mem.ingest(request)
+    for request in FRAUD_FEED_REQUESTS:
+        mem.ingest(request)
+    _label7(mem, "CASE-2003")
+    mem.record_approval("CASE-2003", approver="d.okafor", role="returns_lead", as_of=DAY7)
+    mem.execute_refund("CASE-2003", idempotency_key="eval-r9-2003", as_of=DAY7)
+    mem.record_warehouse_receipt("CASE-2003", received_by="w.chen", received_on=RECEIVED7)
+    mem.record_grading("CASE-2003", grader="p.novak", graded_condition="used", graded_on=GRADED7)
+    mem.record_fraud_review(
+        "CASE-3008", reviewer="r.alvarez",
+        outcome="cleared_with_reason", reason_code="legitimate_pattern_explained",
+    )
+    mem.record_approval("CASE-3008", approver="d.okafor", role="returns_lead", as_of=DAY7)
+    mem.execute_refund("CASE-3008", idempotency_key="eval-r9-3008", as_of=DAY7)
+
+    # Milestones: the walked case carries all three of its events,
+    # the reviewed case carries its closure record.
+    cid_events = {r.event_type for r in mem.retrieve_memory("CUST-CID", as_of=GRADED7)}
+    if cid_events != {"case_decided", "refund_executed", "case_graded"}:
+        counters["memory_store_score_divergences"] += 1
+    ser_events = {r.event_type for r in mem.retrieve_memory("CUST-SER", as_of=GRADED7)}
+    if "fraud_review_closed" not in ser_events or "refund_executed" not in ser_events:
+        counters["memory_store_score_divergences"] += 1
+
+    # Scoping: no retrieval — and no access-log line — ever crosses
+    # a customer boundary; a stranger probe returns nothing.
+    index9 = {
+        row["record_id"]: row["customer_id"]
+        for row in mem._store.list_memory_record_index()
+    }
+    for customer_id in ("CUST-ANA", "CUST-BEN", "CUST-CID", "CUST-DIA", "CUST-SER", "CUST-WARD"):
+        for record in mem.retrieve_memory(customer_id, as_of=GRADED7):
+            if record.customer_id != customer_id:
+                counters["cross_customer_leaks"] += 1
+    if mem.retrieve_memory("CUST-NOBODY", as_of=GRADED7) != []:
+        counters["cross_customer_leaks"] += 1
+    for entry in mem.list_memory_access_log():
+        for rid in entry.returned_record_ids:
+            if index9.get(rid) != entry.customer_id:
+                counters["cross_customer_leaks"] += 1
+
+    # Parity: every scored case re-scores from memory alone to the
+    # very artefact the store path produced.
+    for case_id in (
+        "CASE-2001", "CASE-2002", "CASE-2003", "CASE-2004", "CASE-2005",
+        "CASE-2006", "CASE-2007", "CASE-2008", "CASE-3008", "CASE-3103",
+    ):
+        stored = mem.get_fraud_score(case_id)
+        from_memory = mem.score_case_from_memory(case_id)
+        if (
+            stored is None
+            or from_memory is None
+            or from_memory.score_id != stored.score_id
+            or from_memory.total_score != stored.total_score
+            or from_memory.band != stored.band
+        ):
+            counters["memory_store_score_divergences"] += 1
+
+    # Messaging: the second boots case may quote CID's OWN earlier
+    # $130.50 (memory's record of it) — and never SER's $116.00.
+    def _plant_second_boots(svc):
+        svc._store.put_order(
+            Order(
+                order_id="ORD-1009", customer_id="CUST-CID",
+                placed_on=date(2026, 10, 26), delivered_on=date(2026, 10, 28),
+                lines=[OrderLine(sku="BOOT-TRL", qty=1, unit_price=CATALOGUE["BOOT-TRL"].unit_price)],
+                shipping_paid=Decimal("0.00"),
+            ).model_dump(mode="json")
+        )
+        svc.ingest(
+            ReturnRequest(
+                request_id="REQ-2009", order_id="ORD-1009", sku="BOOT-TRL", qty=1,
+                reason_code="changed_mind", condition_declared="new_with_tags",
+                requested_on=date(2026, 11, 2),
+            )
+        )
+
+    _plant_second_boots(mem)
+    own_note = mem.draft_message(
+        "CASE-2009", "return_summary", as_of=date(2026, 11, 2),
+        model_note="As with your earlier return, the refund of $130.50 was "
+                   "sent to your original payment method.",
+    )
+    if mem.verify_message(own_note.message_id, as_of=date(2026, 11, 2)).status != "verified":
+        counters["memory_store_score_divergences"] += 1
+    alien_note = mem.draft_message(
+        "CASE-2009", "return_summary", as_of=date(2026, 11, 2),
+        model_note="Your earlier refund of $116.00 has been processed.",
+    )
+    if mem.verify_message(alien_note.message_id, as_of=date(2026, 11, 2)).status != "refused":
+        counters["cross_customer_leaks"] += 1
+
+    # Expiry: under a 20-day pack, December retrieval surfaces
+    # nothing, the tombstone counts the expired records, and the
+    # expired figure is refused in a message.
+    short = CaseService(
+        InMemoryStore(), OfflineComposer(),
+        memory_pack=MemoryPack(version="2026.10.1", retention_days=20),
+    )
+    short.seed_orders()
+    short.seed_history()
+    short.ingest(PLANTED_REQUESTS[2])  # CASE-2003
+    _label7(short, "CASE-2003")
+    short.record_approval("CASE-2003", approver="d.okafor", role="returns_lead", as_of=DAY7)
+    short.execute_refund("CASE-2003", idempotency_key="eval-r9-short", as_of=DAY7)
+    if short.retrieve_memory("CUST-CID", as_of=date(2026, 12, 5)):
+        counters["expired_memory_surfaces"] += 1
+    status9 = short.memory_retention_status("CUST-CID", as_of=date(2026, 12, 5))
+    if status9["active_count"] != 0 or status9["expired_count"] != 2:
+        counters["expired_memory_surfaces"] += 1
+    _plant_second_boots(short)
+    stale_note = short.draft_message(
+        "CASE-2009", "return_summary", as_of=date(2026, 12, 5),
+        model_note="As with your earlier return, the refund of $130.50 was sent on.",
+    )
+    if short.verify_message(stale_note.message_id, as_of=date(2026, 12, 5)).status != "refused":
+        counters["expired_memory_surfaces"] += 1
+
+    # Logging: four reads, four access-log entries, each carrying
+    # its purpose, actor and customer scope.
+    before9 = len(mem.list_memory_access_log())
+    mem.retrieve_memory("CUST-CID", as_of=GRADED7)
+    mem.retrieve_memory("CUST-SER", as_of=GRADED7, purpose="eval_probe")
+    mem.memory_retention_status("CUST-WARD", as_of=GRADED7)
+    mem.score_case_from_memory("CASE-3008")
+    new_entries = mem.list_memory_access_log()[before9:]
+    if len(new_entries) != 4:
+        counters["unlogged_memory_retrievals"] += 1
+    for entry in new_entries:
+        if (
+            not entry.purpose
+            or not entry.actor
+            or entry.customer_id not in ("CUST-CID", "CUST-SER", "CUST-WARD")
+        ):
+            counters["unlogged_memory_retrievals"] += 1
 
     for name, value in counters.items():
         print(f"{name}: {value} (required 0)")
