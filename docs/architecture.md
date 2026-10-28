@@ -182,10 +182,50 @@ and the act stay separate on the record. History is ordered by
 (requested_on, case_id) with a same-day case-id tie-break, so a
 score never depends on the order cases happened to be ingested in.
 
+## Approval gates and the payments port (R5)
+
+Law 5 has two halves, both mechanical. The **approval gate** reads
+its thresholds from the policy pack (`auto_approve_cap`,
+`dual_approve_cap`): a final refund total at or below the auto cap
+is tier `auto` (no acts required), above it tier `single` (one
+named approver), above the dual cap tier `dual` (two approvers,
+necessarily different people). An approval is a recorded act —
+approver, role, explicit `as_of`, the pack version, and the pinned
+computation id + amount. Acts are counted only when pinned to the
+case's *current* computation, so an approval of a superseded
+computation is inert on the record and refused at record time when
+named explicitly. The act refuses, each by name: an unnamed
+approver or role, the submitting customer as their own approver, a
+denied or not-final computation, an already-executed refund, and —
+through the R4 guard `assert_refund_path_open`, called, not
+reimplemented — any case under a fraud hold.
+
+The **payments port** is the only path money takes. Its contract is
+AgentCore-Payments-shaped: case, pinned computation, amount, the
+computation's tender allocation, and a mandatory idempotency key
+in; a provider reference out. The sole implementation here is
+`LocalPaymentsDouble` — a local stand-in that moves no real money
+and says so in its module, its class and the provider string on
+every receipt; production binds the configured AgentCore Payments
+provider to the same port. Execution checks its preconditions in
+code (final eligible computation, fraud path open, decided
+disposition, tier satisfied — each refusal names the gap), then
+drives a stored execution record through
+`requested → executing → executed/failed`, transitions on the
+record. Idempotency is structural at three levels: the service
+replays a receipt by key before any check that could refuse, the
+store makes receipts unique per computation and per key, and the
+double itself returns the original reference for a repeated key
+without a second movement. A different key on an executed
+computation is refused as `duplicate_refund`. A provider failure
+(injectable per key on the double) lands as a `failed` execution
+with the reason recorded and **no receipt** — the case stays
+executable, and the retry continues the same execution record when
+it reuses the key.
+
 ## What is deliberately not here yet
 
-Approval gates and the
-payments port (R5), carrier tools (R6), warehouse grading (R7),
+Carrier tools (R6), warehouse grading (R7),
 messaging verifier depth (R8), Memory port (R9), injection quarantine
 (R10), Gateway + Policy ports (R11), model cost ledger (R12), console
 (R13), Postgres parity + production smoke (R15), access control (R16),
