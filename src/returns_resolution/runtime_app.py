@@ -23,8 +23,10 @@ from .evidence import LocalEvidenceStore
 from .intake import ReferenceFeed
 from .modelport import load_model_port
 from .models import ReturnRequest
+from .gateway import ToolError
 from .service import (
     ApprovalError,
+    CarrierError,
     CaseService,
     FigureVerificationError,
     FraudHoldError,
@@ -74,7 +76,14 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     record_approval {case_id, approver, role, as_of, computation_id?} |
     list_approvals {case_id} | approval_status {case_id} |
     execute_refund {case_id, idempotency_key, as_of} |
-    get_receipt {case_id} | list_receipts | list_executions {case_id}.
+    get_receipt {case_id} | list_receipts | list_executions {case_id} |
+    get_tool_definitions | invoke_tool {tool, case_id, arguments, called_on} |
+    create_return_label {case_id, issued_on} |
+    void_return_label {case_id, label_id, voided_by, reason, voided_on} |
+    get_carrier_events {case_id, label_id, as_of} |
+    book_pickup {case_id, scheduled_on, label_id?} |
+    get_label {case_id} | list_labels {case_id} | list_pickups {case_id} |
+    list_tool_calls {case_id} | get_timeline {case_id, as_of}.
     """
     action = payload.get("action", "intake_feed")
     if action == "seed":
@@ -199,6 +208,98 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         return {"receipts": [r.model_dump(mode="json") for r in service.list_receipts()]}
     if action == "list_executions":
         return {"executions": [e.model_dump(mode="json") for e in service.list_executions(payload["case_id"])]}
+    if action == "get_tool_definitions":
+        return {"tools": [d.model_dump(mode="json") for d in service.tool_definitions()]}
+    if action == "invoke_tool":
+        arguments = dict(payload.get("arguments") or {})
+        for key in ("issued_on", "voided_on", "as_of", "scheduled_on"):
+            if isinstance(arguments.get(key), str):
+                arguments[key] = date.fromisoformat(arguments[key])
+        try:
+            result = service.invoke_tool(
+                payload["tool"],
+                arguments,
+                case_id=payload["case_id"],
+                called_on=date.fromisoformat(payload["called_on"]),
+            )
+        except (LookupError, CarrierError, FraudHoldError, ToolError, FigureVerificationError) as exc:
+            return {"error": str(exc)}
+        if isinstance(result, list):
+            return {"result": [r.model_dump(mode="json") for r in result]}
+        return {"result": result.model_dump(mode="json")}
+    if action == "create_return_label":
+        try:
+            label = service.invoke_tool(
+                "create_return_label",
+                {"case_id": payload["case_id"], "issued_on": date.fromisoformat(payload["issued_on"])},
+                case_id=payload["case_id"],
+                called_on=date.fromisoformat(payload["issued_on"]),
+            )
+            return {"label": label.model_dump(mode="json")}
+        except (LookupError, CarrierError, FraudHoldError, ToolError, FigureVerificationError) as exc:
+            return {"error": str(exc)}
+    if action == "void_return_label":
+        try:
+            void = service.invoke_tool(
+                "void_return_label",
+                {
+                    "case_id": payload["case_id"],
+                    "label_id": payload["label_id"],
+                    "voided_by": payload.get("voided_by", ""),
+                    "reason": payload.get("reason", ""),
+                    "voided_on": date.fromisoformat(payload["voided_on"]),
+                },
+                case_id=payload["case_id"],
+                called_on=date.fromisoformat(payload["voided_on"]),
+            )
+            return {"label_void": void.model_dump(mode="json")}
+        except (LookupError, CarrierError, ToolError) as exc:
+            return {"error": str(exc)}
+    if action == "get_carrier_events":
+        try:
+            events = service.invoke_tool(
+                "get_carrier_events",
+                {
+                    "case_id": payload["case_id"],
+                    "label_id": payload["label_id"],
+                    "as_of": date.fromisoformat(payload["as_of"]),
+                },
+                case_id=payload["case_id"],
+                called_on=date.fromisoformat(payload["as_of"]),
+            )
+            return {"events": [e.model_dump(mode="json") for e in events]}
+        except (LookupError, ToolError) as exc:
+            return {"error": str(exc)}
+    if action == "book_pickup":
+        try:
+            booking = service.invoke_tool(
+                "book_pickup",
+                {
+                    "case_id": payload["case_id"],
+                    "scheduled_on": date.fromisoformat(payload["scheduled_on"]),
+                    "label_id": payload.get("label_id"),
+                },
+                case_id=payload["case_id"],
+                called_on=date.fromisoformat(payload["scheduled_on"]),
+            )
+            return {"pickup": booking.model_dump(mode="json")}
+        except (LookupError, CarrierError, ToolError) as exc:
+            return {"error": str(exc)}
+    if action == "get_label":
+        label = service.get_active_label(payload["case_id"])
+        return {"label": label.model_dump(mode="json") if label else None}
+    if action == "list_labels":
+        return {"labels": [label.model_dump(mode="json") for label in service.list_labels(payload["case_id"])]}
+    if action == "list_pickups":
+        return {"pickups": [p.model_dump(mode="json") for p in service.list_pickups(payload["case_id"])]}
+    if action == "list_tool_calls":
+        return {"tool_calls": [c.model_dump(mode="json") for c in service.list_tool_calls(payload["case_id"])]}
+    if action == "get_timeline":
+        try:
+            view = service.get_timeline(payload["case_id"], date.fromisoformat(payload["as_of"]))
+            return {"timeline": view.model_dump(mode="json")}
+        except LookupError as exc:
+            return {"error": str(exc)}
     if action == "list_cases":
         return {"cases": [c.model_dump(mode="json") for c in service.list_cases()]}
     if action == "list_orders":

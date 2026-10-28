@@ -140,8 +140,94 @@ def main() -> int:
         print(f"  CASE-2001 retried under a new key: refused — {exc}")
     print(f"  total money movements on the double: {double.movement_count} (one per executed case, retries included)")
 
+    print("\n--- carrier tools via the gateway (carrier: LOCAL DOUBLE — nothing really ships) ---")
+    from returns_resolution.models import ReturnRequest as _ReturnRequest
+    from returns_resolution.service import CarrierError as _CarrierError
+
+    carrier = service.carrier_port
+
+    def _issue(case_id, on):
+        return service.invoke_tool(
+            "create_return_label", {"case_id": case_id, "issued_on": on},
+            case_id=case_id, called_on=on,
+        )
+
+    label2003 = _issue("CASE-2003", today)
+    rec = label2003.reconciliation
+    print(
+        f"  CASE-2003 label {label2003.carrier_ref}: {label2003.service_level}, {label2003.weight_grams} g, "
+        f"cost ${label2003.cost} — reconciliation {rec.status} (deducted ${rec.deducted_amount}, variance ${rec.variance})"
+    )
+    again = _issue("CASE-2003", today)
+    print(
+        f"  re-issue returned the same label ({again.label_id == label2003.label_id}); "
+        f"labels issued at the carrier port: {carrier.label_count}"
+    )
+    events = service.invoke_tool(
+        "get_carrier_events",
+        {"case_id": "CASE-2003", "label_id": label2003.label_id, "as_of": _date(2026, 10, 30)},
+        case_id="CASE-2003", called_on=_date(2026, 10, 30),
+    )
+    print(f"  CASE-2003 tracking by 2026-10-30: {', '.join(e.kind for e in events)}")
+
+    label2006 = _issue("CASE-2006", today)
+    rec6 = label2006.reconciliation
+    print(
+        f"  CASE-2006 label {label2006.carrier_ref}: {label2006.service_level}, cost ${label2006.cost} — "
+        f"reconciliation {rec6.status} (deducted ${rec6.deducted_amount}, variance ${rec6.variance} on the record)"
+    )
+
+    label2001 = _issue("CASE-2001", today)
+    void = service.invoke_tool(
+        "void_return_label",
+        {
+            "case_id": "CASE-2001", "label_id": label2001.label_id,
+            "voided_by": "d.okafor", "reason": "customer printed the wrong size label",
+            "voided_on": today,
+        },
+        case_id="CASE-2001", called_on=today,
+    )
+    fresh = _issue("CASE-2001", _date(2026, 10, 28))
+    print(
+        f"  CASE-2001 label voided by {void.voided_by} ({void.reason}); fresh label {fresh.carrier_ref} "
+        f"supersedes {fresh.supersedes == label2001.label_id}"
+    )
+
+    # A bulky return: the tent order, requested inside its window.
+    tent = service.ingest(
+        _ReturnRequest(
+            request_id="REQ-2010", order_id="ORD-1002", sku="TENT-2P", qty=1,
+            reason_code="changed_mind", condition_declared="used",
+            requested_on=_date(2026, 9, 15),
+        )
+    )
+    tent_label = _issue(tent.case_id, _date(2026, 9, 16))
+    pickup = service.invoke_tool(
+        "book_pickup", {"case_id": tent.case_id, "scheduled_on": _date(2026, 9, 17)},
+        case_id=tent.case_id, called_on=_date(2026, 9, 17),
+    )
+    print(
+        f"  {tent.case_id} (tent, {tent_label.weight_grams} g) label {tent_label.carrier_ref}: "
+        f"{tent_label.service_level} at ${tent_label.cost}; pickup {pickup.carrier_ref} booked for "
+        f"{pickup.scheduled_on} ({pickup.window})"
+    )
+    try:
+        service.invoke_tool(
+            "book_pickup", {"case_id": "CASE-2003", "scheduled_on": today},
+            case_id="CASE-2003", called_on=today,
+        )
+    except _CarrierError as exc:
+        print(f"  CASE-2003 pickup refused — {exc}")
+
+    print("\n--- case timeline (derived from the artefacts of record) ---")
+    for case_id, as_of in (("CASE-2003", _date(2026, 10, 30)), ("CASE-3008", _date(2026, 11, 10))):
+        view = service.get_timeline(case_id, as_of)
+        print(f"  {case_id} as of {as_of}: {len(view.entries)} entries, {len(view.gaps)} gaps")
+        for gap in view.gaps:
+            print(f"    GAP [{gap.kind}] {gap.detail}")
+
     for case_id in ("CASE-2003", "CASE-2004"):
-        case = cases[case_id]
+        case = service.get_case(case_id)
         print(f"\n--- {case_id} summary (figure-verified) ---")
         print(case.summary)
     return 0

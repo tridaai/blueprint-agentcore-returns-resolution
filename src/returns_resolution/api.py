@@ -12,10 +12,12 @@ from datetime import date
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, field_validator
 
+from .gateway import ToolError
 from .intake import ReferenceFeed
 from .models import ReturnRequest
 from .service import (
     ApprovalError,
+    CarrierError,
     CaseService,
     DuplicateRefundError,
     FigureVerificationError,
@@ -62,6 +64,28 @@ class ExecutionRequest(BaseModel):
         if not v or not v.strip():
             raise ValueError("an idempotency key is mandatory on every refund execution")
         return v.strip()
+
+
+class LabelRequest(BaseModel):
+    issued_on: date
+
+
+class LabelVoidRequest(BaseModel):
+    voided_by: str
+    reason: str
+    voided_on: date
+
+    @field_validator("voided_by")
+    @classmethod
+    def _named(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("voiding a label requires a named actor")
+        return v.strip()
+
+
+class PickupRequest(BaseModel):
+    scheduled_on: date
+    label_id: str | None = None
 
 
 def _order_view(order) -> dict:
@@ -306,6 +330,116 @@ def create_app(service: CaseService) -> FastAPI:
         if service.get_case(case_id) is None:
             raise HTTPException(status_code=404, detail="case not found")
         return [e.model_dump(mode="json") for e in service.list_executions(case_id)]
+
+    # -- carrier tools (R6): every act goes through the gateway ----------
+    @app.get("/tools")
+    def tools() -> list[dict]:
+        return [d.model_dump(mode="json") for d in service.tool_definitions()]
+
+    @app.get("/cases/{case_id}/tool-calls")
+    def tool_calls(case_id: str) -> list[dict]:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return [c.model_dump(mode="json") for c in service.list_tool_calls(case_id)]
+
+    @app.post("/cases/{case_id}/labels", status_code=201)
+    def create_label(case_id: str, body: LabelRequest) -> dict:
+        try:
+            label = service.invoke_tool(
+                "create_return_label",
+                {"case_id": case_id, "issued_on": body.issued_on},
+                case_id=case_id,
+                called_on=body.issued_on,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (CarrierError, FraudHoldError, ToolError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except FigureVerificationError as exc:
+            raise HTTPException(status_code=422, detail={"violations": exc.violations}) from exc
+        return label.model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/labels")
+    def labels(case_id: str) -> list[dict]:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return [label.model_dump(mode="json") for label in service.list_labels(case_id)]
+
+    @app.get("/cases/{case_id}/label")
+    def active_label(case_id: str) -> dict:
+        found = service.get_active_label(case_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="no active label for this case")
+        return found.model_dump(mode="json")
+
+    @app.get("/labels")
+    def all_labels() -> list[dict]:
+        return [label.model_dump(mode="json") for label in service.list_all_labels()]
+
+    @app.post("/cases/{case_id}/labels/{label_id}/void", status_code=201)
+    def void_label(case_id: str, label_id: str, body: LabelVoidRequest) -> dict:
+        try:
+            void = service.invoke_tool(
+                "void_return_label",
+                {
+                    "case_id": case_id,
+                    "label_id": label_id,
+                    "voided_by": body.voided_by,
+                    "reason": body.reason,
+                    "voided_on": body.voided_on,
+                },
+                case_id=case_id,
+                called_on=body.voided_on,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (CarrierError, ToolError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return void.model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/labels/{label_id}/events")
+    def carrier_events(case_id: str, label_id: str, as_of: date) -> list[dict]:
+        try:
+            events = service.invoke_tool(
+                "get_carrier_events",
+                {"case_id": case_id, "label_id": label_id, "as_of": as_of},
+                case_id=case_id,
+                called_on=as_of,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ToolError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return [e.model_dump(mode="json") for e in events]
+
+    @app.post("/cases/{case_id}/pickups", status_code=201)
+    def book_pickup(case_id: str, body: PickupRequest) -> dict:
+        try:
+            booking = service.invoke_tool(
+                "book_pickup",
+                {"case_id": case_id, "scheduled_on": body.scheduled_on, "label_id": body.label_id},
+                case_id=case_id,
+                called_on=body.scheduled_on,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (CarrierError, ToolError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return booking.model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/pickups")
+    def pickups(case_id: str) -> list[dict]:
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return [p.model_dump(mode="json") for p in service.list_pickups(case_id)]
+
+    @app.get("/cases/{case_id}/timeline")
+    def timeline(case_id: str, as_of: date) -> dict:
+        try:
+            view = service.get_timeline(case_id, as_of)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return view.model_dump(mode="json")
 
     @app.post("/cases/{case_id}/evidence")
     async def evidence(case_id: str, request: Request, kind: str = "photo", filename: str = "evidence.bin") -> dict:
