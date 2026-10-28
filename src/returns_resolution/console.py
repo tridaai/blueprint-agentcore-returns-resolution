@@ -94,6 +94,8 @@ def _derive_stage(
     This is a presentation grouping over artefacts of record. It
     does not alter the case's stored status or create a close act.
     """
+    if case.status == "closed":
+        return "closed"
     if case.decision is not None and not case.decision.eligible:
         return "closed"
     if case.fraud_state == STATE_FRAUD_CONFIRMED:
