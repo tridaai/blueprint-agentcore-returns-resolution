@@ -130,6 +130,22 @@ DISCLOSURE_PACK_V1 = DisclosurePack(
         "weight mismatch",
         "card_churn",
         "card churn",
+        # Commercial sweeteners (R14 trap find): no template offers
+        # one and the policy pack promises none, so a note-slot
+        # promise of a discount, a coupon or store credit is a
+        # promise the house does not make — refused like the timing
+        # promises below. (Before this row existed, a "20% discount"
+        # note verified clean whenever 20% happened to be a computed
+        # restocking rate: the percent check passed and nothing else
+        # looked at the promise.)
+        "discount",
+        "coupon",
+        "voucher",
+        "promo code",
+        "promotional code",
+        "store credit",
+        "% off",
+        "money off",
     ],
     forbidden_patterns=[
         # A score stated as points — the number a threshold compares

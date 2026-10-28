@@ -328,3 +328,45 @@ def test_trap_role_cap_edge_amounts():
         service.execute_refund(case.case_id, idempotency_key="trap-cap-svc", as_of=DAY)
     assert payments.movement_count == 0
     assert service.list_receipts() == []
+
+
+# --- T-MS4: a discount promise in the note slot --------------------------------
+# The trap that exposed defect 1. The cleared serial case's notice
+# is drafted with a model note promising a discount. The note's
+# percent is chosen to be an ALLOWED percent for this case (20% is
+# the used restocking rate), so the figure checks all pass — only
+# the promise itself can refuse it. No template offers a discount
+# and the policy pack promises none; before the R14 disclosure fix
+# this note verified clean. The trap stands as the regression.
+
+def test_trap_discount_promise_in_a_note_is_refused():
+    messaging = LocalMessagingDouble()
+    service = _service(messaging=messaging)
+    service.seed_history()
+    for request in FRAUD_FEED_REQUESTS:
+        service.ingest(request)
+    service.record_fraud_review(
+        "CASE-3008", reviewer="r.alvarez",
+        outcome="cleared_with_reason", reason_code="legitimate_pattern_explained",
+    )
+    note = "As a goodwill gesture, a 20% discount will be applied to your next order."
+    drafted = service.draft_message("CASE-3008", "fraud_review_notice", as_of=DAY, model_note=note)
+    checked = service.verify_message(drafted.message_id, as_of=DAY)
+    assert checked.status == "refused"
+    assert any("discount" in v for v in checked.violations)
+    with pytest.raises(MessagingError):
+        service.queue_message(drafted.message_id, as_of=DAY)
+    assert messaging.delivery_count == 0
+
+    # The "% off" spelling of the same promise is refused too.
+    drafted2 = service.draft_message(
+        "CASE-3008", "fraud_review_notice", as_of=DAY,
+        model_note="You will also get 20% off your next order.",
+    )
+    checked2 = service.verify_message(drafted2.message_id, as_of=DAY)
+    assert checked2.status == "refused"
+    assert any("forbidden" in v for v in checked2.violations)
+
+    # Control: the plain template notice, no note, verifies.
+    plain = service.draft_message("CASE-3008", "fraud_review_notice", as_of=DAY)
+    assert service.verify_message(plain.message_id, as_of=DAY).status == "verified"
