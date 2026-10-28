@@ -1,13 +1,14 @@
-"""Eval gate for Blueprint #18 (R1–R11).
+"""Eval gate for Blueprint #18 (R1–R12).
 
 Profiles (R10): the full scenario body runs once per store profile
 — in-memory and SQLite always, PostgreSQL when DATABASE_URL (or
 RETURNS_DATABASE_URL) is set. Every profile must produce the same
 zero counters, and the parity counters at the end compare the
 content-addressed artefact ids (receipts, fraud scores,
-computations, dispositions, labels, messages, memory records)
-across profiles: identical planted work must mint identical
-artefact ids on every store, or the gate fails.
+computations, dispositions, labels, messages, memory records,
+model-call ledger entries) across profiles: identical planted
+work must mint identical artefact ids on every store, or the
+gate fails.
 
 Zero-tolerance counters against planted truth:
 - eligibility_outcome_mismatches: decisions that differ from the
@@ -153,6 +154,28 @@ Zero-tolerance counters against planted truth:
   (execute_refund carrying the receipt's provider reference,
   submit_grading_report carrying the report's id) — money and
   grading must exist only as recorded gateway calls.
+- offline_byte_identity_breaks: summaries or summary messages
+  minted through an explicit offline gateway that differ from
+  the default (bare-port) service's for identical work — the
+  gateway meters, it must never touch text.
+- hosted_wrong_figures_accepted: a stubbed hosted profile's
+  well-formed response carrying a wrong figure that the figure
+  verifier let stand as a case summary.
+- invalid_model_outputs_accepted: hosted responses that are not
+  valid structured drafts (non-JSON content, a missing text
+  field, a wrong-typed text) that were coerced or used, or whose
+  rejection was not recorded as rejected_invalid.
+- profile_fallbacks: unreachable hosted profiles (no transport,
+  a dead transport, no model id) that produced output, fell back
+  to another profile, or failed to record failed_closed.
+- cost_ledger_arithmetic_errors: ledger entries whose cost does
+  not re-perform exactly from their recorded tokens and the
+  price pack's prices, or envelope-metered entries whose cost or
+  usage source is not the envelope's.
+- budget_refusals_failed: drafting calls beyond a case's pack
+  budget that landed, refusals that fail to name the budget or
+  to record refused_budget, or one case's exhaustion consuming
+  another case's budget.
 
 Prints the counters and GATE: PASS/FAIL; exit code follows.
 """
@@ -264,6 +287,12 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
         "memory_store_score_divergences": 0,
         "expired_memory_surfaces": 0,
         "unlogged_memory_retrievals": 0,
+        "offline_byte_identity_breaks": 0,
+        "hosted_wrong_figures_accepted": 0,
+        "invalid_model_outputs_accepted": 0,
+        "profile_fallbacks": 0,
+        "cost_ledger_arithmetic_errors": 0,
+        "budget_refusals_failed": 0,
     }
 
     service = CaseService(make_store(), OfflineComposer())
@@ -1591,6 +1620,164 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
             if call.status == "denied" and call.policy_id not in pack_ids:
                 counters["gateway_denials_unrecorded"] += 1
 
+    # --- R12: the model gateway + cost ledger ---------------------------
+    import json as _json
+
+    from returns_resolution.model_gateway import (
+        BedrockGateway,
+        InvalidModelOutputError,
+        ModelBudgetError,
+        ModelProfileUnavailableError,
+        NimGateway,
+        OfflineGateway,
+        PricePack,
+        load_price_pack,
+    )
+
+    # Offline byte-identity: a service whose gateway is explicit
+    # and one relying on the default wrap mint identical summaries
+    # and identical summary messages for identical work — the
+    # gateway meters, it does not touch text.
+    explicit = CaseService(
+        make_store(), OfflineComposer(), model_gateway=OfflineGateway(OfflineComposer())
+    )
+    explicit.seed_orders()
+    for request in PLANTED_REQUESTS:
+        twin = explicit.ingest(request)
+        if twin.summary != service.get_case(twin.case_id).summary:
+            counters["offline_byte_identity_breaks"] += 1
+        twin_msgs = [
+            (m.message_id, m.text, m.status)
+            for m in explicit.list_messages(twin.case_id)
+            if m.message_type == "return_summary"
+        ]
+        base_msgs = [
+            (m.message_id, m.text, m.status)
+            for m in service.list_messages(twin.case_id)
+            if m.message_type == "return_summary"
+        ]
+        if twin_msgs != base_msgs:
+            counters["offline_byte_identity_breaks"] += 1
+    # Every ledger this scenario wrote re-performs exactly.
+    for svc in (service, explicit):
+        if svc.verify_cost_ledger():
+            counters["cost_ledger_arithmetic_errors"] += 1
+
+    # Hosted stub (Bedrock-shaped): a valid envelope carrying the
+    # figure-correct text is metered from the envelope, exactly.
+    def _stub(content: str, *, tin: int = 10000, tout: int = 2000):
+        def _transport(request):
+            return {
+                "output": {"message": {"content": [{"text": content}]}},
+                "usage": {"inputTokens": tin, "outputTokens": tout},
+            }
+
+        return _transport
+
+    good_text = service.get_case("CASE-2001").summary
+    hosted = CaseService(
+        make_store(), OfflineComposer(),
+        model_gateway=BedrockGateway(
+            model_id="eval-stub", transport=_stub(_json.dumps({"text": good_text}))
+        ),
+    )
+    hosted.seed_orders()
+    hosted_case = hosted.ingest(PLANTED_REQUESTS[0])
+    if hosted_case.summary != good_text:
+        counters["hosted_wrong_figures_accepted"] += 1
+    (h_entry,) = hosted.list_cost_entries("CASE-2001")
+    if h_entry.cost != Decimal("0.06") or h_entry.usage_source != "envelope":
+        counters["cost_ledger_arithmetic_errors"] += 1
+    if hosted.verify_cost_ledger():
+        counters["cost_ledger_arithmetic_errors"] += 1
+
+    # The same profile returning a WRONG figure: structurally
+    # valid, so the gateway passes it — and the figure verifier
+    # refuses it, as it refuses any profile's text.
+    wrong = CaseService(
+        make_store(), OfflineComposer(),
+        model_gateway=BedrockGateway(
+            model_id="eval-stub",
+            transport=_stub(_json.dumps({"text": "Your refund due is $999.99."})),
+        ),
+    )
+    wrong.seed_orders()
+    try:
+        wrong.ingest(PLANTED_REQUESTS[0])
+        counters["hosted_wrong_figures_accepted"] += 1  # accepted!
+    except FigureVerificationError:
+        if wrong.get_case("CASE-2001").summary is not None:
+            counters["hosted_wrong_figures_accepted"] += 1
+
+    # Invalid structured outputs are rejected and recorded, never
+    # coerced: non-JSON content, a JSON object without the text
+    # field, a text of the wrong type.
+    for content in ("not json", _json.dumps({"summary": "x"}), _json.dumps({"text": 7})):
+        bad = CaseService(
+            make_store(), OfflineComposer(),
+            model_gateway=BedrockGateway(model_id="eval-stub", transport=_stub(content)),
+        )
+        bad.seed_orders()
+        try:
+            bad.ingest(PLANTED_REQUESTS[0])
+            counters["invalid_model_outputs_accepted"] += 1  # accepted!
+        except InvalidModelOutputError:
+            entries = bad.list_cost_entries("CASE-2001")
+            if len(entries) != 1 or entries[0].status != "rejected_invalid":
+                counters["invalid_model_outputs_accepted"] += 1
+            if bad.get_case("CASE-2001") is not None:
+                counters["invalid_model_outputs_accepted"] += 1
+
+    # Unreachable profiles fail closed: no transport, a dead
+    # transport, no model id — each refuses, records failed_closed,
+    # and stores NO fallback output (the offline text never appears
+    # under a hosted profile's name).
+    def _down(request):
+        raise ConnectionError("connection refused")
+
+    for gw12 in (
+        BedrockGateway(model_id="eval-stub"),
+        BedrockGateway(model_id="eval-stub", transport=_down),
+        NimGateway(model_id="eval-stub"),
+    ):
+        closed = CaseService(make_store(), OfflineComposer(), model_gateway=gw12)
+        closed.seed_orders()
+        try:
+            closed.ingest(PLANTED_REQUESTS[0])
+            counters["profile_fallbacks"] += 1  # it produced output!
+        except ModelProfileUnavailableError:
+            entries = closed.list_cost_entries("CASE-2001")
+            if len(entries) != 1 or entries[0].status != "failed_closed":
+                counters["profile_fallbacks"] += 1
+            if closed.get_case("CASE-2001") is not None:
+                counters["profile_fallbacks"] += 1
+
+    # The runaway guard: a pack budget of 2 calls per case — the
+    # third drafting call is refused with the budget named and the
+    # refusal recorded; another case's budget is its own.
+    small_pack = PricePack(
+        version="2026.10.1", chars_per_token=4, max_calls_per_case=2,
+        profiles=load_price_pack().profiles,
+    )
+    budgeted = CaseService(
+        make_store(), OfflineComposer(),
+        model_gateway=OfflineGateway(OfflineComposer(), pack=small_pack),
+    )
+    budgeted.seed_orders()
+    b_case = budgeted.ingest(PLANTED_REQUESTS[0])  # call 1
+    budgeted.draft_message(b_case.case_id, "return_summary", as_of=DAY8)  # call 2
+    try:
+        budgeted.draft_message(b_case.case_id, "return_summary", as_of=DAY8)
+        counters["budget_refusals_failed"] += 1  # a third call landed!
+    except ModelBudgetError as exc:
+        if "budget" not in str(exc):
+            counters["budget_refusals_failed"] += 1
+        statuses = [e.status for e in budgeted.list_cost_entries(b_case.case_id)]
+        if statuses != ["ok", "ok", "refused_budget"]:
+            counters["budget_refusals_failed"] += 1
+    if budgeted.ingest(PLANTED_REQUESTS[2]).summary is None:
+        counters["budget_refusals_failed"] += 1
+
     # The cross-profile fingerprint (R10): the content-addressed
     # artefact ids the planted work minted on this profile's store.
     # Identical planted work must mint identical ids on every store.
@@ -1617,6 +1804,9 @@ def run_scenarios(make_store) -> tuple[dict, dict]:
         ),
         "memory_records": sorted(
             row["record_id"] for row in mem._store.list_memory_record_index()
+        ),
+        "model_calls": sorted(
+            e["entry_id"] for e in service._store.list_all_cost_entries()
         ),
     }
     return counters, fingerprint

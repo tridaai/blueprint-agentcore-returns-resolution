@@ -374,6 +374,57 @@ def main() -> int:
             f"status={call.status}{extra}  result={call.result_ref}"
         )
 
+    print("\n--- the model gateway + cost ledger (R12; every drafting call above went through it) ---")
+    config = service.get_model_config()
+    print(
+        f"  profile {config['profile']} (model {config['model_id']}), price pack "
+        f"{config['price_pack_version']}, per-case budget {config['max_calls_per_case']} calls"
+    )
+    totals = service.cost_totals()
+    off = totals["by_profile"]["offline"]
+    print(
+        f"  the ledger over the whole walk: {off['calls']} calls, "
+        f"{off['tokens_in']}+{off['tokens_out']} estimated tokens, total cost ${off['cost']} "
+        "(the offline rate card is zero — the calls are recorded, not charged)"
+    )
+    for entry in service.list_cost_entries("CASE-2003"):
+        print(
+            f"    CASE-2003 #{entry.seq} {entry.purpose:<24} {entry.status:<6} "
+            f"est. tokens {entry.tokens_in}/{entry.tokens_out}  cost ${entry.cost}"
+        )
+    print(
+        "  ledger re-performance: "
+        + ("clean — every entry's arithmetic re-performs" if not service.verify_cost_ledger() else "PROBLEMS FOUND")
+    )
+    from returns_resolution.intake import PLANTED_REQUESTS as _PLANTED
+    from returns_resolution.model_gateway import (
+        ModelBudgetError as _ModelBudgetError,
+    )
+    from returns_resolution.model_gateway import (
+        OfflineGateway as _OfflineGateway,
+    )
+    from returns_resolution.model_gateway import PricePack as _PricePack
+    from returns_resolution.model_gateway import (
+        load_price_pack as _load_price_pack,
+    )
+    from returns_resolution.store import InMemoryStore as _InMemoryStore
+
+    small = _PricePack(
+        version="2026.10.1", chars_per_token=4, max_calls_per_case=2,
+        profiles=_load_price_pack().profiles,
+    )
+    tight = CaseService(
+        _InMemoryStore(), OfflineComposer(),
+        model_gateway=_OfflineGateway(OfflineComposer(), pack=small),
+    )
+    tight.seed_orders()
+    tcase = tight.ingest(_PLANTED[0])
+    tight.draft_message(tcase.case_id, "return_summary", as_of=today)
+    try:
+        tight.draft_message(tcase.case_id, "return_summary", as_of=today)
+    except _ModelBudgetError as exc:
+        print(f"  the runaway guard: a third drafting call for {tcase.case_id} is refused — {exc}")
+
     for case_id in ("CASE-2003", "CASE-2004"):
         case = service.get_case(case_id)
         print(f"\n--- {case_id} summary (figure-verified) ---")

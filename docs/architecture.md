@@ -530,9 +530,48 @@ migration ledger write is conflict-tolerant, because a gate that
 only passes on a fresh cluster is grading the cluster, not the
 code.
 
+## The model gateway and the cost ledger (R12)
+
+Every model-shaped call — the three summary composers and the
+messaging note slot — routes through one gateway
+(`model_gateway.py`), which owns everything around the call:
+profile selection, structured-output validation, metering, the
+per-case budget, and the ledger. Profiles differ only in how
+they produce text. The offline profile wraps the model port's
+deterministic composer and passes its text through untouched
+(the eval gate grades byte-identity against the bare port); the
+Bedrock-shaped and NIM-shaped profiles build their providers'
+request envelopes, hand them to an injectable transport
+(stub-tested; unbound by default), and validate the response
+envelope and the JSON draft inside it. A profile that cannot
+answer — no transport, a dead transport, no model id — fails
+closed and is recorded as such; there is no code path that
+substitutes another profile's output.
+
+Validation is structural, and deliberately not semantic: a
+response becomes a `DraftOutput` or it is rejected and recorded
+(`rejected_invalid`), never coerced. Figures remain the figure
+verifier's jurisdiction, downstream, for every profile alike —
+the gateway's stub-graded proof is a well-formed Bedrock
+response carrying a wrong refund figure, refused by the
+verifier exactly as an offline draft would be.
+
+The ledger is the round's second artefact. Each call appends a
+`CostEntry` (migration 0010, append-only): usage from the
+profile's envelope where one exists, else the gateway's stated
+estimate (labelled `gateway-estimate`); unit prices pinned from
+the versioned price pack at call time — sub-cent rate-card data,
+quantised to the micro-unit, because a per-1k price rounded to
+cents is a different price; and the cost computed in code from
+tokens × prices, cent-quantised only at the end. Re-performance
+(`verify_cost_entry`) makes a tampered entry detectable, and
+ledger totals are sums computed at read time, never stored. The
+pack also states the runaway guard: a per-case call budget,
+enforced before the profile is reached, refused with the budget
+named, recorded without consuming budget.
+
 ## What is deliberately not here yet
 
-Injection quarantine, model cost ledger, console, access
-control, reporting, carrier exceptions, red team, deploy
-artefacts. The README's honest status is the authoritative
-per-round account.
+Injection quarantine, console, access control, reporting,
+carrier exceptions, red team, deploy artefacts. The README's
+honest status is the authoritative per-round account.
