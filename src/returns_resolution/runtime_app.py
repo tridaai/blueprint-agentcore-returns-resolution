@@ -16,11 +16,13 @@ and in the README's honest status.
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 from typing import Any
 
 from .access import (
     GATEWAY_ACTOR_FOR_ROLE,
     HIDING_REASONS,
+    SURFACE_EXCEPTIONS,
     SURFACE_FRAUD,
     SURFACE_GATEWAY,
     SURFACE_MONEY,
@@ -28,6 +30,7 @@ from .access import (
     SURFACE_REPORTS,
     AccessDeniedError,
 )
+from .carrier_exceptions import CarrierExceptionError
 from .config import Config
 from .evidence import LocalEvidenceStore
 from .intake import ReferenceFeed
@@ -133,7 +136,19 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     get_report_pack |
     compute_report {kind, window_start?, window_end?, as_of} |
     get_report {report_id} | list_reports {kind?} |
-    verify_report {report_id}.
+    verify_report {report_id} |
+    get_exception_pack |
+    detect_exceptions {case_id, as_of} |
+    list_exceptions {case_id} |
+    get_exception_status {case_id} |
+    record_exception_act {exception_id, exception_action, acted_on,
+        note?} |
+    file_carrier_claim {exception_id, filed_on} |
+    list_carrier_claims {case_id} |
+    record_claim_act {claim_id, claim_action, acted_on,
+        settled_amount?, reason_code?, note?} |
+    verify_exception {exception_id} |
+    verify_carrier_claim {claim_id}.
 
     Any action may carry a principal (R16): payload["principal"]
     = {"id": ..., "role": ...}. A carried principal is
@@ -902,6 +917,164 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         problems = service.verify_management_report(found)
         return {
             "report_id": found.report_id,
+            "verified": not problems,
+            "problems": problems,
+        }
+    if action == "get_exception_pack":
+        return {"exception_pack": service.get_exception_pack().model_dump(mode="json")}
+    if action == "detect_exceptions":
+        as_of = date.fromisoformat(payload["as_of"])
+        try:
+            if principal is not None:
+                found = service.detect_exceptions_as(principal, payload["case_id"], as_of=as_of)
+            else:
+                found = service.detect_carrier_exceptions(payload["case_id"], as_of=as_of)
+        except AccessDeniedError as exc:
+            return _denied(exc, {"exceptions": []})
+        except LookupError as exc:
+            return {"error": str(exc)}
+        return {"exceptions": [service.exception_view(e) for e in found]}
+    if action == "list_exceptions":
+        if principal is not None:
+            try:
+                return {"exceptions": service.list_exceptions_as(principal, payload["case_id"])}
+            except AccessDeniedError as exc:
+                return _denied(exc, {"exceptions": []})
+        if service.get_case(payload["case_id"]) is None:
+            return {"exceptions": []}
+        return {
+            "exceptions": [
+                service.exception_view(e) for e in service.list_exceptions(payload["case_id"])
+            ]
+        }
+    if action == "get_exception_status":
+        if principal is not None:
+            try:
+                found = service.get_exception_status_as(principal, payload["case_id"])
+            except AccessDeniedError as exc:
+                return _denied(exc, {"exception_status": None})
+            return {"exception_status": found}
+        if service.get_case(payload["case_id"]) is None:
+            return {"exception_status": None}
+        return {
+            "exception_status": [
+                service.exception_view(e) for e in service.list_exceptions(payload["case_id"])
+            ]
+        }
+    if action == "record_exception_act":
+        try:
+            if principal is not None:
+                act = service.record_exception_act_as(
+                    principal,
+                    payload["exception_id"],
+                    action=payload["exception_action"],
+                    acted_on=date.fromisoformat(payload["acted_on"]),
+                    note=payload.get("note", ""),
+                )
+            else:
+                act = service.record_exception_act(
+                    payload["exception_id"],
+                    action=payload["exception_action"],
+                    actor=payload.get("actor", ""),
+                    acted_on=date.fromisoformat(payload["acted_on"]),
+                    note=payload.get("note", ""),
+                )
+        except AccessDeniedError as exc:
+            return _denied(exc, {"exception_act": None})
+        except (LookupError, CarrierExceptionError) as exc:
+            return {"error": str(exc)}
+        return {"exception_act": act.model_dump(mode="json")}
+    if action == "file_carrier_claim":
+        try:
+            if principal is not None:
+                claim = service.file_carrier_claim_as(
+                    principal,
+                    payload["exception_id"],
+                    filed_on=date.fromisoformat(payload["filed_on"]),
+                )
+            else:
+                claim = service.file_carrier_claim(
+                    payload["exception_id"],
+                    filed_by=payload.get("filed_by", ""),
+                    filed_on=date.fromisoformat(payload["filed_on"]),
+                )
+        except AccessDeniedError as exc:
+            return _denied(exc, {"claim": None})
+        except (LookupError, CarrierExceptionError) as exc:
+            return {"error": str(exc)}
+        return {"claim": service.claim_view(claim)}
+    if action == "list_carrier_claims":
+        if principal is not None:
+            try:
+                return {"claims": service.list_claims_as(principal, payload["case_id"])}
+            except AccessDeniedError as exc:
+                return _denied(exc, {"claims": None})
+        if service.get_case(payload["case_id"]) is None:
+            return {"claims": []}
+        return {
+            "claims": [service.claim_view(c) for c in service.list_claims(payload["case_id"])]
+        }
+    if action == "record_claim_act":
+        settled = (
+            Decimal(str(payload["settled_amount"]))
+            if payload.get("settled_amount") is not None
+            else None
+        )
+        try:
+            if principal is not None:
+                act = service.record_claim_act_as(
+                    principal,
+                    payload["claim_id"],
+                    action=payload["claim_action"],
+                    acted_on=date.fromisoformat(payload["acted_on"]),
+                    settled_amount=settled,
+                    reason_code=payload.get("reason_code"),
+                    note=payload.get("note", ""),
+                )
+            else:
+                act = service.record_claim_act(
+                    payload["claim_id"],
+                    action=payload["claim_action"],
+                    actor=payload.get("actor", ""),
+                    acted_on=date.fromisoformat(payload["acted_on"]),
+                    settled_amount=settled,
+                    reason_code=payload.get("reason_code"),
+                    note=payload.get("note", ""),
+                )
+        except AccessDeniedError as exc:
+            return _denied(exc, {"claim_act": None})
+        except (LookupError, CarrierExceptionError) as exc:
+            return {"error": str(exc)}
+        return {"claim_act": act.model_dump(mode="json")}
+    if action == "verify_exception":
+        if principal is not None:
+            try:
+                service.require_surface(
+                    principal, SURFACE_EXCEPTIONS, target=payload["exception_id"]
+                )
+            except AccessDeniedError as exc:
+                return _denied(exc, {"exception_id": payload["exception_id"], "verified": False, "problems": []})
+        if service.get_exception(payload["exception_id"]) is None:
+            return {"exception_id": payload["exception_id"], "verified": False, "problems": ["exception not found"]}
+        problems = service.verify_exception(payload["exception_id"])
+        return {
+            "exception_id": payload["exception_id"],
+            "verified": not problems,
+            "problems": problems,
+        }
+    if action == "verify_carrier_claim":
+        if principal is not None:
+            try:
+                service.require_surface(
+                    principal, SURFACE_EXCEPTIONS, target=payload["claim_id"]
+                )
+            except AccessDeniedError as exc:
+                return _denied(exc, {"claim_id": payload["claim_id"], "verified": False, "problems": []})
+        if service.get_claim(payload["claim_id"]) is None:
+            return {"claim_id": payload["claim_id"], "verified": False, "problems": ["claim not found"]}
+        problems = service.verify_carrier_claim(payload["claim_id"])
+        return {
+            "claim_id": payload["claim_id"],
             "verified": not problems,
             "problems": problems,
         }

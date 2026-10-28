@@ -8,6 +8,7 @@ through one surface reads identically through the other.
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -21,6 +22,7 @@ from .access import (
     SURFACE_CONSOLE,
     SURFACE_COST_LEDGER,
     SURFACE_DENIAL_LOG,
+    SURFACE_EXCEPTIONS,
     SURFACE_FRAUD,
     SURFACE_GATEWAY,
     SURFACE_MEMORY,
@@ -31,6 +33,7 @@ from .access import (
     AccessDeniedError,
     Principal,
 )
+from .carrier_exceptions import CarrierExceptionError
 from .console import build_case_detail, build_console_data
 from .gateway import PolicyDeniedError, ToolError
 from .intake import ReferenceFeed
@@ -202,6 +205,32 @@ class ReportComputeRequest(BaseModel):
     window_start: date | None = None
     window_end: date | None = None
     as_of: date
+
+
+class ExceptionDetectRequest(BaseModel):
+    as_of: date
+
+
+class ExceptionActRequest(BaseModel):
+    action: str
+    actor: str = ""
+    acted_on: date
+    note: str = ""
+
+
+class ClaimFileRequest(BaseModel):
+    exception_id: str
+    filed_by: str = ""
+    filed_on: date
+
+
+class ClaimActRequest(BaseModel):
+    action: str
+    actor: str = ""
+    acted_on: date
+    settled_amount: str | None = None
+    reason_code: str | None = None
+    note: str = ""
 
 
 def _order_view(order) -> dict:
@@ -424,6 +453,212 @@ def create_app(service: CaseService) -> FastAPI:
             raise HTTPException(status_code=404, detail="report not found")
         problems = service.verify_management_report(found)
         return {"report_id": report_id, "verified": not problems, "problems": problems}
+
+    @app.get("/exceptions/pack")
+    def exception_pack() -> dict:
+        """The carrier exception pack as data (R18): detection
+        windows, the paths per kind with their consequences, the
+        claim formula inputs and deny vocabulary, the transit
+        disposition row — the rules the endpoints below enforce."""
+        return service.get_exception_pack().model_dump(mode="json")
+
+    @app.post("/cases/{case_id}/exceptions/detect", status_code=201)
+    def detect_exceptions(case_id: str, body: ExceptionDetectRequest, request: Request) -> list[dict]:
+        """Run exception detection over the case's carrier record
+        (R18): exceptions are raised in code from the events, and
+        the case's standing exceptions are returned with their
+        derived states. With a principal, detection is manage_case
+        work under the exceptions surface."""
+        principal = _principal(request, service, surface=SURFACE_EXCEPTIONS, target=case_id)
+        try:
+            found = (
+                service.detect_exceptions_as(principal, case_id, as_of=body.as_of)
+                if principal is not None
+                else service.detect_carrier_exceptions(case_id, as_of=body.as_of)
+            )
+        except AccessDeniedError as exc:
+            _guard(exc, not_found="case not found")
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="case not found") from exc
+        return [service.exception_view(e) for e in found]
+
+    @app.get("/cases/{case_id}/exceptions")
+    def exceptions(case_id: str, request: Request) -> list[dict]:
+        """The case's carrier exceptions (R18), staff view. A
+        customer principal is not served this surface at all —
+        their shape is /exception-status."""
+        principal = _principal(request, service, surface=SURFACE_EXCEPTIONS, target=case_id)
+        if principal is None:
+            if service.get_case(case_id) is None:
+                raise HTTPException(status_code=404, detail="case not found")
+            return [service.exception_view(e) for e in service.list_exceptions(case_id)]
+        try:
+            return service.list_exceptions_as(principal, case_id)
+        except AccessDeniedError as exc:
+            _guard(exc, not_found="case not found")
+
+    @app.get("/cases/{case_id}/exception-status")
+    def exception_status(case_id: str, request: Request) -> list[dict]:
+        """The case's exception STATUS (R18): for a customer
+        principal, the narrowed shape (kind, state, raised_on)
+        over their own case only — another customer's case
+        renders as this endpoint's ordinary not-found, byte for
+        byte, exactly like the case itself."""
+        principal = _principal(request, service, surface=SURFACE_CASE, target=case_id)
+        if principal is None:
+            if service.get_case(case_id) is None:
+                raise HTTPException(status_code=404, detail="case not found")
+            return [service.exception_view(e) for e in service.list_exceptions(case_id)]
+        try:
+            found = service.get_exception_status_as(principal, case_id)
+        except AccessDeniedError as exc:
+            _guard(exc, not_found="case not found")
+        if found is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        return found
+
+    @app.post("/exceptions/{exception_id}/acts", status_code=201)
+    def exception_act(exception_id: str, body: ExceptionActRequest, request: Request) -> dict:
+        """A handling act on an exception (R18): a named actor
+        chooses a pack path or escalates. With a principal, the
+        actor is the principal — a body naming someone else is
+        refused as a mismatch, on the record."""
+        principal = _principal(request, service, surface=SURFACE_EXCEPTIONS, target=exception_id)
+        try:
+            if principal is None:
+                act = service.record_exception_act(
+                    exception_id, action=body.action, actor=body.actor,
+                    acted_on=body.acted_on, note=body.note,
+                )
+            else:
+                if body.actor and body.actor != principal.id:
+                    service.deny_principal_mismatch(
+                        principal, surface=SURFACE_EXCEPTIONS, target=exception_id,
+                        field="actor", claimed=body.actor,
+                    )
+                act = service.record_exception_act_as(
+                    principal, exception_id, action=body.action,
+                    acted_on=body.acted_on, note=body.note,
+                )
+        except AccessDeniedError as exc:
+            _guard(exc)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="exception not found") from exc
+        except CarrierExceptionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return act.model_dump(mode="json")
+
+    @app.get("/exceptions/{exception_id}/verify")
+    def verify_exception_endpoint(exception_id: str, request: Request) -> dict:
+        """Re-perform one exception's raising from the carrier
+        record (R18)."""
+        principal = _principal(request, service, surface=SURFACE_EXCEPTIONS, target=exception_id)
+        if principal is not None:
+            try:
+                service.require_surface(principal, SURFACE_EXCEPTIONS, target=exception_id)
+            except AccessDeniedError as exc:
+                _guard(exc)
+        if service.get_exception(exception_id) is None:
+            raise HTTPException(status_code=404, detail="exception not found")
+        problems = service.verify_exception(exception_id)
+        return {"exception_id": exception_id, "verified": not problems, "problems": problems}
+
+    @app.post("/cases/{case_id}/claims", status_code=201)
+    def file_claim(case_id: str, body: ClaimFileRequest, request: Request) -> dict:
+        """File the carrier claim for one of the case's exceptions
+        (R18): assembled only from artefacts of record, at the
+        pack's formula. One claim per exception — a second filing
+        returns the standing claim."""
+        principal = _principal(request, service, surface=SURFACE_EXCEPTIONS, target=case_id)
+        exception = service.get_exception(body.exception_id)
+        if exception is None or exception.case_id != case_id:
+            raise HTTPException(status_code=404, detail="exception not found")
+        try:
+            if principal is None:
+                claim = service.file_carrier_claim(
+                    body.exception_id, filed_by=body.filed_by, filed_on=body.filed_on
+                )
+            else:
+                if body.filed_by and body.filed_by != principal.id:
+                    service.deny_principal_mismatch(
+                        principal, surface=SURFACE_EXCEPTIONS, target=case_id,
+                        field="filed_by", claimed=body.filed_by,
+                    )
+                claim = service.file_carrier_claim_as(
+                    principal, body.exception_id, filed_on=body.filed_on
+                )
+        except AccessDeniedError as exc:
+            _guard(exc)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="exception not found") from exc
+        except CarrierExceptionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return service.claim_view(claim)
+
+    @app.get("/cases/{case_id}/claims")
+    def claims(case_id: str, request: Request) -> list[dict]:
+        """The case's carrier claims (R18). Claims are the house's
+        recovery record — a customer principal is refused with
+        the hiding shape, like reports."""
+        principal = _principal(request, service, surface=SURFACE_EXCEPTIONS, target=case_id)
+        if principal is None:
+            if service.get_case(case_id) is None:
+                raise HTTPException(status_code=404, detail="case not found")
+            return [service.claim_view(c) for c in service.list_claims(case_id)]
+        try:
+            return service.list_claims_as(principal, case_id)
+        except AccessDeniedError as exc:
+            _guard(exc, not_found="case not found")
+
+    @app.post("/claims/{claim_id}/acts", status_code=201)
+    def claim_act(claim_id: str, body: ClaimActRequest, request: Request) -> dict:
+        """A lifecycle act on a claim (R18): acknowledged, settled
+        (with the amount the carrier paid) or denied (with a pack
+        reason). A settlement above the exception pack's
+        supervisor threshold is a supervisor act under access
+        control."""
+        principal = _principal(request, service, surface=SURFACE_EXCEPTIONS, target=claim_id)
+        settled = Decimal(body.settled_amount) if body.settled_amount is not None else None
+        try:
+            if principal is None:
+                act = service.record_claim_act(
+                    claim_id, action=body.action, actor=body.actor,
+                    acted_on=body.acted_on, settled_amount=settled,
+                    reason_code=body.reason_code, note=body.note,
+                )
+            else:
+                if body.actor and body.actor != principal.id:
+                    service.deny_principal_mismatch(
+                        principal, surface=SURFACE_EXCEPTIONS, target=claim_id,
+                        field="actor", claimed=body.actor,
+                    )
+                act = service.record_claim_act_as(
+                    principal, claim_id, action=body.action,
+                    acted_on=body.acted_on, settled_amount=settled,
+                    reason_code=body.reason_code, note=body.note,
+                )
+        except AccessDeniedError as exc:
+            _guard(exc)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="claim not found") from exc
+        except CarrierExceptionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return act.model_dump(mode="json")
+
+    @app.get("/claims/{claim_id}/verify")
+    def verify_claim_endpoint(claim_id: str, request: Request) -> dict:
+        """Re-assemble one claim from the record and compare every
+        bound field (R18)."""
+        principal = _principal(request, service, surface=SURFACE_EXCEPTIONS, target=claim_id)
+        if principal is not None:
+            try:
+                service.require_surface(principal, SURFACE_EXCEPTIONS, target=claim_id)
+            except AccessDeniedError as exc:
+                _guard(exc)
+        if service.get_claim(claim_id) is None:
+            raise HTTPException(status_code=404, detail="claim not found")
+        problems = service.verify_carrier_claim(claim_id)
+        return {"claim_id": claim_id, "verified": not problems, "problems": problems}
 
     @app.get("/orders")
     def orders(request: Request) -> list[dict]:
