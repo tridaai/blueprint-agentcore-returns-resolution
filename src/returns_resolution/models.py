@@ -450,6 +450,179 @@ class RefundReceipt(BaseModel):
         return money(Decimal(str(v)))
 
 
+class LabelCostReconciliation(BaseModel):
+    """The label cost against the computation (R6) — a mismatch is
+    surfaced here, on the artefact, never absorbed silently.
+
+    `deducted_amount` is the R2 computation's return-shipping line —
+    what the customer was charged for the return. `label_cost` is
+    what the carrier actually charges for the label that fired.
+    `status`:
+    - "matched": the two are equal; nothing to explain.
+    - "retailer_absorbed": the pack makes this category a free
+      return (deduction 0.00 by rule) and the retailer carries the
+      label cost — the variance is stated, and it is the pack's
+      stated intent, not an error.
+    - "variance": the two differ for any other reason; the variance
+      stands on the record for a human to see.
+    - "not_reconcilable": the computation's shipping line is not
+      computable, so there is no deduction to reconcile against —
+      the missing input is named.
+    """
+
+    deducted_amount: Decimal | None = None
+    label_cost: Decimal
+    variance: Decimal | None = None
+    status: str  # matched | retailer_absorbed | variance | not_reconcilable
+    detail: str = ""
+
+    @field_validator("deducted_amount", "label_cost", "variance", mode="before")
+    @classmethod
+    def _money(cls, v: object) -> Decimal | None:
+        return None if v is None else money(Decimal(str(v)))
+
+
+class ReturnLabel(BaseModel):
+    """A return shipping label (R6) — a stored artefact of record.
+
+    Issued only through the `create_return_label` gateway tool, for
+    an eligible case with its fraud path open. One ACTIVE label per
+    case: re-issuing returns the active artefact, and a fresh label
+    may issue only after the active one is voided (the new label's
+    `supersedes` names the voided one). The service level and cost
+    come from the policy pack's carrier schedule — the artefact
+    records the pack version and the exact line that fired.
+    """
+
+    label_id: str
+    case_id: str
+    provider: str
+    carrier_ref: str
+    service_level: str
+    category: str
+    weight_grams: int
+    cost: Decimal
+    reconciliation: LabelCostReconciliation
+    status: str  # issued | voided
+    issued_on: date
+    policy_pack_version: str
+    via_call_id: str | None = None
+    supersedes: str | None = None
+
+    @field_validator("cost", mode="before")
+    @classmethod
+    def _money(cls, v: object) -> Decimal:
+        return money(Decimal(str(v)))
+
+
+class LabelVoid(BaseModel):
+    """The void act (R6): a named actor voids a label, on the record.
+
+    Voiding never edits the label artefact's history — the label's
+    status flips to voided and this act stands as the reason. Only
+    an active label can be voided, and only once.
+    """
+
+    void_id: str
+    label_id: str
+    case_id: str
+    voided_by: str
+    reason: str
+    voided_on: date
+
+
+class PickupBooking(BaseModel):
+    """A carrier pickup booking (R6) — bulky categories only.
+
+    Booked through the `book_pickup` gateway tool against an active
+    label: the carrier collects the parcel instead of the customer
+    dropping it off. The pack flags which categories are bulky; the
+    refusal for any other category names that rule.
+    """
+
+    pickup_id: str
+    case_id: str
+    label_id: str
+    provider: str
+    carrier_ref: str
+    scheduled_on: date
+    window: str
+    status: str = "booked"
+    via_call_id: str | None = None
+
+
+class CarrierEvent(BaseModel):
+    """One tracking event from the carrier port (R6), read-only.
+
+    Events are the carrier's record, produced by the port — the
+    local double derives a deterministic script per label
+    (tendered → in transit → received). Nothing in the service
+    writes or edits them.
+    """
+
+    event_id: str
+    label_id: str
+    carrier_ref: str
+    kind: str  # tendered | in_transit | received
+    at: str  # ISO datetime from the carrier
+    detail: str = ""
+
+
+class ToolCallRecord(BaseModel):
+    """One gateway tool invocation, on the record (R6).
+
+    Every call through the ToolGateway — success or refusal — is
+    stored: the tool, the case it acted on, a hash of the exact
+    inputs, the outcome, and what the call produced or why it
+    refused. This is the audit trail Law 6 asks for: carrier and
+    label actions happen only as recorded tool calls.
+    """
+
+    call_id: str
+    tool: str
+    case_id: str
+    inputs_hash: str
+    status: str  # ok | error
+    called_on: date
+    result_ref: str | None = None
+    error: str | None = None
+
+
+class TimelineEntry(BaseModel):
+    """One artefact of record on a case's timeline (R6), derived."""
+
+    at: date
+    stage: str
+    artefact_id: str
+    detail: str = ""
+
+
+class TimelineGap(BaseModel):
+    """An artefact the case's state expects but the record lacks.
+
+    Named, never papered over: the timeline states what is missing
+    and why it is expected, so a reader never mistakes an absent
+    artefact for a completed step.
+    """
+
+    kind: str
+    detail: str
+
+
+class CaseTimeline(BaseModel):
+    """The derived, read-only chronological view of a case (R6).
+
+    Assembled in code at read time from the artefacts of record —
+    never stored as prose. Entries are ordered by their recorded
+    dates; `gaps` names expected-but-absent artefacts.
+    """
+
+    case_id: str
+    as_of: date
+    entries: list[TimelineEntry] = []
+    gaps: list[TimelineGap] = []
+
+
 class ReturnCase(BaseModel):
     case_id: str
     request: ReturnRequest

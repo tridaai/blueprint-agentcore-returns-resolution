@@ -49,6 +49,23 @@ class PolicyPack(BaseModel):
     # approval act records the pack version it was taken under.
     auto_approve_cap: Decimal = Decimal("0.00")
     dual_approve_cap: Decimal = Decimal("0.00")
+    # --- Carrier schedule (R6) ------------------------------------------
+    # Law 6 as data: the label's service level is read off this
+    # schedule, never chosen by the caller — by category, with a
+    # weight threshold above which the parcel moves as freight
+    # regardless of category. The label's cost is the schedule's cost
+    # for the level that fired, recorded on the label artefact and
+    # reconciled against the R2 computation's return-shipping
+    # deduction: a difference is surfaced on the artefact, never
+    # absorbed silently.
+    label_service_by_category: dict[str, str] = {}
+    label_freight_weight_grams: int = 0
+    label_costs: dict[str, str] = {}
+    # Categories flagged bulky in this pack: only these may book a
+    # carrier pickup. Any other category's pickup request is refused
+    # naming this rule.
+    bulky_categories: set[str] = set()
+    pickup_window: str = ""
 
     @field_validator("return_shipping_fee", "auto_approve_cap", "dual_approve_cap", mode="before")
     @classmethod
@@ -76,6 +93,20 @@ POLICY_PACK_V1 = PolicyPack(
     return_shipping_fee=Decimal("6.95"),
     auto_approve_cap=Decimal("50.00"),
     dual_approve_cap=Decimal("150.00"),
+    label_service_by_category={
+        "apparel": "ground",
+        "footwear": "ground",
+        "gear": "ground",
+        "electronics": "ground_tracked",
+    },
+    label_freight_weight_grams=2000,
+    label_costs={
+        "ground": "6.95",
+        "ground_tracked": "8.50",
+        "freight": "24.00",
+    },
+    bulky_categories={"gear"},
+    pickup_window="08:00-12:00",
 )
 
 # Clause ids — stable names that decisions, evals and (later) customer
