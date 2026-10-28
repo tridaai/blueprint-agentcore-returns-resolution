@@ -1,6 +1,6 @@
 UV ?= uv
 
-.PHONY: install install-pip test evals demo harness serve lint
+.PHONY: install install-pip test evals demo harness smoke serve lint
 
 install:
 	$(UV) sync --extra dev
@@ -22,6 +22,9 @@ demo:
 
 harness:
 	$(UV) run python scripts/local_harness.py
+
+smoke:
+	$(UV) run python scripts/prod_smoke.py
 
 serve:
 	$(UV) run python -m returns_resolution.runtime_app
