@@ -84,6 +84,24 @@ Zero-tolerance counters against planted truth:
 - non_bulky_pickups_accepted: pickups booked for categories the
   pack does not flag as bulky; the bulky booking beside it must
   land against the case's active label.
+- grading_delta_mismatches: grading cascades whose re-priced
+  totals, recorded deltas or adjustment positions differ from the
+  hand-computed truth (boots like_new→used −$14.50; the under-
+  refunded top-up +$14.50; the held lamp resolving to REFURBISH).
+- in_place_artefact_edits: superseded computations, dispositions
+  or fraud scores whose stored payload changed during a grading
+  cascade — supersession must be by new artefact, never by edit.
+- ungated_top_ups: top-up executions that landed without the
+  approval gate re-checked against the NEW computation, full
+  re-executions of an already-settled case that landed, or a
+  second top-up under a fresh key.
+- holds_finalised_without_fields: grading reports on the held
+  electronics case that finalised without BOTH inspection facts
+  (functional test result, data-wipe status) on the record.
+- grading_gate_bypasses: warehouse/grading acts that landed
+  without their gates — receipt before the carrier's received
+  event, the receiver grading their own parcel, grading before
+  any warehouse receipt, or a second grading act.
 
 Prints the counters and GATE: PASS/FAIL; exit code follows.
 """
@@ -110,6 +128,7 @@ from returns_resolution.service import (
     FigureVerificationError,
     FraudHoldError,
     FraudReviewError,
+    GradingError,
     PaymentsError,
 )
 from returns_resolution.store import InMemoryStore
@@ -172,6 +191,11 @@ def main() -> int:
         "label_cost_mismatches_hidden": 0,
         "timeline_gaps_unnamed": 0,
         "non_bulky_pickups_accepted": 0,
+        "grading_delta_mismatches": 0,
+        "in_place_artefact_edits": 0,
+        "ungated_top_ups": 0,
+        "holds_finalised_without_fields": 0,
+        "grading_gate_bypasses": 0,
     }
 
     service = CaseService(InMemoryStore(), OfflineComposer())
@@ -810,6 +834,248 @@ def main() -> int:
     )
     if booking.label_id != tent_label.label_id or booking.status != "booked":
         counters["non_bulky_pickups_accepted"] += 1
+
+    # --- R7: warehouse grading + the supersession cascade ------------
+    # Hand-computed truth: CASE-2003 boots, declared like_new —
+    # $145.00 at a 10% fee = $130.50; graded used — a 20% fee =
+    # $116.00, delta −$14.50, disposition RESTOCK → OUTLET. CASE-2099
+    # (same boots, declared used) executes at $116.00 and grades
+    # like_new: +$14.50 owed back through the gated top-up. CASE-2006
+    # is the held lamp: no grading finalises without both inspection
+    # facts, and pass + verified wipe resolves it to REFURBISH.
+    DAY7 = date(2026, 10, 27)
+    RECEIVED7 = date(2026, 10, 30)  # the carrier script's received day
+    GRADED7 = date(2026, 10, 31)
+
+    def _grade_service():
+        svc = CaseService(InMemoryStore(), OfflineComposer())
+        svc.seed_orders()
+        return svc
+
+    def _label7(svc, case_id):
+        return svc.invoke_tool(
+            "create_return_label", {"case_id": case_id, "issued_on": DAY7},
+            case_id=case_id, called_on=DAY7,
+        )
+
+    def _snapshot(svc, case_id):
+        store = svc._store
+        return (
+            {p["computation_id"]: p for p in store.list_computations_for_case(case_id)},
+            {p["disposition_id"]: p for p in store.list_dispositions_for_case(case_id)},
+            {p["score_id"]: p for p in store.list_fraud_scores(case_id)},
+        )
+
+    def _check_unedited(svc, case_id, before):
+        after = _snapshot(svc, case_id)
+        for kind in range(3):
+            for artefact_id, payload in before[kind].items():
+                if after[kind].get(artefact_id) != payload:
+                    counters["in_place_artefact_edits"] += 1
+
+    # The gates: no receipt before the carrier's word, grading only
+    # after a receipt, never by the receiver, never twice.
+    gated = _grade_service()
+    gated.ingest(PLANTED_REQUESTS[2])  # REQ-2003
+    try:
+        gated.record_grading(
+            "CASE-2003", grader="p.novak", graded_condition="used", graded_on=GRADED7
+        )
+        counters["grading_gate_bypasses"] += 1  # graded with nothing received
+    except GradingError:
+        pass
+    _label7(gated, "CASE-2003")
+    try:
+        gated.record_warehouse_receipt(
+            "CASE-2003", received_by="w.chen", received_on=date(2026, 10, 28)
+        )
+        counters["grading_gate_bypasses"] += 1  # carrier shows it in transit still
+    except GradingError:
+        pass
+    gated.record_warehouse_receipt("CASE-2003", received_by="w.chen", received_on=RECEIVED7)
+    try:
+        gated.record_grading(
+            "CASE-2003", grader="w.chen", graded_condition="used", graded_on=GRADED7
+        )
+        counters["grading_gate_bypasses"] += 1  # the receiver grading their own parcel
+    except GradingError:
+        pass
+
+    # The cascade itself, against hand-computed truth.
+    before = _snapshot(gated, "CASE-2003")
+    report = gated.record_grading(
+        "CASE-2003", grader="p.novak", graded_condition="used", graded_on=GRADED7,
+        damage_notes="heel counter scuffed",
+    )
+    new_computation = gated.get_computation("CASE-2003")
+    new_disposition = gated.get_disposition("CASE-2003")
+    if (
+        report.refund_delta != Decimal("-14.50")
+        or new_computation.refund_total != Decimal("116.00")
+        or new_computation.condition_basis != "graded"
+        or new_disposition.disposition != "OUTLET"
+        or new_disposition.basis != "graded"
+        or new_disposition.supersedes != report.superseded_disposition_id
+    ):
+        counters["grading_delta_mismatches"] += 1
+    if gated.list_adjustments("CASE-2003"):
+        counters["grading_delta_mismatches"] += 1  # nothing executed: no position
+    if gated.verify_stored_computation("CASE-2003") or gated.verify_stored_disposition("CASE-2003"):
+        counters["grading_delta_mismatches"] += 1
+    _check_unedited(gated, "CASE-2003", before)
+    try:
+        gated.record_grading(
+            "CASE-2003", grader="g.osei", graded_condition="like_new", graded_on=GRADED7
+        )
+        counters["grading_gate_bypasses"] += 1  # a second grading act landed
+    except GradingError:
+        pass
+
+    # The held lamp: nothing finalises without both inspection facts.
+    held = _grade_service()
+    held.ingest(PLANTED_REQUESTS[5])  # REQ-2006
+    _label7(held, "CASE-2006")
+    held.record_warehouse_receipt("CASE-2006", received_by="w.chen", received_on=RECEIVED7)
+    for kwargs in (
+        {},
+        {"functional_test_result": "pass"},
+        {"data_wipe_status": "verified"},
+    ):
+        try:
+            held.record_grading(
+                "CASE-2006", grader="p.novak", graded_condition="used",
+                graded_on=GRADED7, **kwargs,
+            )
+            counters["holds_finalised_without_fields"] += 1
+        except GradingError:
+            pass
+    if held.list_grading_reports("CASE-2006"):
+        counters["holds_finalised_without_fields"] += 1
+    held_before = _snapshot(held, "CASE-2006")
+    held_report = held.record_grading(
+        "CASE-2006", grader="p.novak", graded_condition="used", graded_on=GRADED7,
+        functional_test_result="pass", data_wipe_status="verified",
+    )
+    resolved = held.get_disposition("CASE-2006")
+    if (
+        resolved.disposition != "REFURBISH"
+        or resolved.cell_id != "GR-ELEC-PASS-WIPED"
+        or resolved.supersedes != held_report.superseded_disposition_id
+        or held_report.new_computation_id is not None
+    ):
+        counters["grading_delta_mismatches"] += 1
+    _check_unedited(held, "CASE-2006", held_before)
+
+    # Executed, then graded WORSE: a recovery position, and no
+    # surface through which money can move again.
+    settled = _grade_service()
+    settled.ingest(PLANTED_REQUESTS[2])  # REQ-2003
+    settled.record_approval(
+        "CASE-2003", approver="d.okafor", role="returns_lead", as_of=DAY7
+    )
+    settled.execute_refund("CASE-2003", idempotency_key="eval-r7-rec", as_of=DAY7)
+    _label7(settled, "CASE-2003")
+    settled.record_warehouse_receipt("CASE-2003", received_by="w.chen", received_on=RECEIVED7)
+    settled.record_grading(
+        "CASE-2003", grader="p.novak", graded_condition="used", graded_on=GRADED7
+    )
+    (recovery,) = settled.list_adjustments("CASE-2003")
+    if (
+        recovery.kind != "recovery_due"
+        or recovery.amount != Decimal("14.50")
+        or recovery.status != "open"
+    ):
+        counters["grading_delta_mismatches"] += 1
+    try:
+        settled.execute_top_up("CASE-2003", idempotency_key="tp-rec", as_of=GRADED7)
+        counters["ungated_top_ups"] += 1  # a recovery is not a top-up
+    except PaymentsError:
+        pass
+    settled.record_approval(
+        "CASE-2003", approver="m.osei", role="finance_manager", as_of=GRADED7
+    )
+    try:
+        settled.execute_refund("CASE-2003", idempotency_key="eval-r7-again", as_of=GRADED7)
+        counters["ungated_top_ups"] += 1  # the settled refund executed twice
+    except PaymentsError:
+        pass
+
+    # Executed, then graded BETTER: the top-up, gated on the NEW
+    # computation's approvals, in the topup: key domain, exactly once.
+    topup_double = LocalPaymentsDouble()
+    owing = CaseService(InMemoryStore(), OfflineComposer(), payments_port=topup_double)
+    owing.seed_orders()
+    owing.ingest(
+        ReturnRequest(
+            request_id="REQ-2099", order_id="ORD-1003", sku="BOOT-TRL", qty=1,
+            reason_code="wrong_size", condition_declared="used",
+            requested_on=date(2026, 10, 26),
+        )
+    )
+    owing.record_approval(
+        "CASE-2099", approver="d.okafor", role="returns_lead", as_of=DAY7
+    )
+    owing.execute_refund("CASE-2099", idempotency_key="eval-r7-orig", as_of=DAY7)
+    _label7(owing, "CASE-2099")
+    owing.record_warehouse_receipt("CASE-2099", received_by="w.chen", received_on=RECEIVED7)
+    owing_before = _snapshot(owing, "CASE-2099")
+    owing_report = owing.record_grading(
+        "CASE-2099", grader="p.novak", graded_condition="like_new", graded_on=GRADED7
+    )
+    (top_up,) = owing.list_adjustments("CASE-2099")
+    if (
+        owing_report.refund_delta != Decimal("14.50")
+        or top_up.kind != "top_up_due"
+        or top_up.amount != Decimal("14.50")
+    ):
+        counters["grading_delta_mismatches"] += 1
+    try:
+        owing.execute_top_up("CASE-2099", idempotency_key="tp-1", as_of=GRADED7)
+        counters["ungated_top_ups"] += 1  # landed on the OLD computation's approval
+    except ApprovalError:
+        pass
+    owing.record_approval(
+        "CASE-2099", approver="m.osei", role="finance_manager", as_of=GRADED7
+    )
+    top_receipt = owing.execute_top_up("CASE-2099", idempotency_key="tp-1", as_of=GRADED7)
+    if (
+        top_receipt.amount != Decimal("14.50")
+        or top_receipt.idempotency_key != "topup:tp-1"
+        or topup_double.movement_count != 2
+    ):
+        counters["ungated_top_ups"] += 1
+    try:
+        owing.execute_top_up("CASE-2099", idempotency_key="tp-2", as_of=GRADED7)
+        counters["ungated_top_ups"] += 1  # a second top-up under a fresh key
+    except DuplicateRefundError:
+        pass
+    _check_unedited(owing, "CASE-2099", owing_before)
+
+    # The fraud trigger: the jacket declared new-with-tags, graded
+    # used (two rank steps) with wear evidence and a 100 g weigh-in
+    # against an 820 g product — the re-score lands the empty-box
+    # band (30.00 → MONITOR) on a NEW artefact; without the full
+    # trigger (boots, one rank step) nothing re-scores.
+    fraud7 = _grade_service()
+    fraud7.ingest(PLANTED_REQUESTS[0])  # REQ-2001
+    score_before = fraud7.get_fraud_score("CASE-2001")
+    _label7(fraud7, "CASE-2001")
+    fraud7.record_warehouse_receipt("CASE-2001", received_by="w.chen", received_on=RECEIVED7)
+    fraud_before = _snapshot(fraud7, "CASE-2001")
+    fraud_report = fraud7.record_grading(
+        "CASE-2001", grader="p.novak", graded_condition="used", graded_on=GRADED7,
+        received_weight_grams=100, wear_evidence=True,
+    )
+    rescored = fraud7.get_fraud_score("CASE-2001")
+    if (
+        not fraud_report.fraud_rescore_triggered
+        or rescored.score_id == score_before.score_id
+        or rescored.supersedes != score_before.score_id
+        or rescored.total_score != Decimal("30.00")
+        or rescored.band != "MONITOR"
+    ):
+        counters["grading_delta_mismatches"] += 1
+    _check_unedited(fraud7, "CASE-2001", fraud_before)
 
     for name, value in counters.items():
         print(f"{name}: {value} (required 0)")
