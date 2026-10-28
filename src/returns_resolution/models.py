@@ -784,6 +784,10 @@ class CustomerMessage(BaseModel):
     case_id: str
     message_type: str  # one of messaging.MESSAGE_TYPES
     status: str  # draft | verified | refused | queued | sent | withdrawn
+    # Per-case creation order (1-based): message ids are content
+    # hashes and do not sort chronologically, so the sequence is
+    # what "the case's latest message of a type" means.
+    seq: int = 0
     text: str
     violations: list[str] = []
     template_version: str

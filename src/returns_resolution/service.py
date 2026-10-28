@@ -48,10 +48,27 @@ from .fraud import (
     verify_fraud_score,
 )
 from .gateway import ToolCallRecord, ToolDefinition, ToolError, ToolGateway
+from .messaging import (
+    MESSAGING_PACK_VERSION,
+    STATE_DRAFT,
+    STATE_QUEUED,
+    STATE_REFUSED,
+    STATE_SENT,
+    STATE_VERIFIED,
+    STATE_WITHDRAWN,
+    TEMPLATES,
+    DisclosurePack,
+    LocalMessagingDouble,
+    MessageFacts,
+    MessagingPort,
+    MessagingProviderError,
+    load_disclosure_pack,
+)
 from .modelport import ModelPort
 from .models import (
     CarrierEvent,
     CaseTimeline,
+    CustomerMessage,
     DispositionDecision,
     ExecutionTransition,
     FraudReviewDecision,
@@ -59,6 +76,7 @@ from .models import (
     GradingReport,
     LabelCostReconciliation,
     LabelVoid,
+    MessageTransition,
     Order,
     PickupBooking,
     RefundAdjustment,
@@ -85,7 +103,7 @@ from .refunds import compute_refund, verify_computation
 from .seed import CATALOGUE, HISTORY_CASES, HISTORY_ORDERS, ORDERS, PRODUCT_WEIGHTS_GRAMS
 from .store import Store
 from .timeline import build_timeline
-from .verifier import verify_summary
+from .verifier import MessageContext, verify_message_text, verify_summary
 
 
 class FigureVerificationError(RuntimeError):
@@ -131,6 +149,13 @@ class GradingError(RuntimeError):
     graded without its inspection facts, …)."""
 
 
+class MessagingError(RuntimeError):
+    """A customer-message act was refused — the message names the
+    gap (an unknown message type with no template, a missing
+    prerequisite artefact, a lifecycle transition the message's
+    state does not allow, a stale message at send time, …)."""
+
+
 def _chain_order(payloads: list[dict], id_key: str) -> list[dict]:
     """Order a supersession chain oldest-first by walking its links:
     the root is the artefact that supersedes nothing in the set, and
@@ -164,6 +189,8 @@ class CaseService:
         scoring_pack: ScoringPack | None = None,
         payments_port: PaymentsPort | None = None,
         carrier_port: CarrierPort | None = None,
+        messaging_port: MessagingPort | None = None,
+        disclosure_pack: DisclosurePack | None = None,
     ):
         self._store = store
         self._model = model_port
@@ -181,6 +208,13 @@ class CaseService:
         # (labelled on every artefact): no real label prints until a
         # deployment binds the retailer's carrier integration.
         self._carrier = carrier_port or LocalCarrierDouble()
+        # The messaging port (R8) likewise defaults to the LOCAL
+        # DOUBLE (labelled on every delivery): no message reaches a
+        # real customer until a deployment binds the retailer's
+        # messaging provider. The disclosure pack is the versioned
+        # data the messaging verifier enforces alongside it.
+        self._messaging = messaging_port or LocalMessagingDouble()
+        self._disclosure = disclosure_pack or load_disclosure_pack()
         # The tool gateway (R6): the ONLY path carrier/label actions
         # take. Handlers are the _tool_* methods below; every call —
         # success or refusal — is recorded into the store.
@@ -202,6 +236,10 @@ class CaseService:
     @property
     def carrier_port(self) -> CarrierPort:
         return self._carrier
+
+    @property
+    def messaging_port(self) -> MessagingPort:
+        return self._messaging
 
     # -- seeding ---------------------------------------------------------
     def seed_orders(self) -> int:
@@ -258,11 +296,7 @@ class CaseService:
         fraud_state = derive_fraud_state(score.band, current_score_id=score.score_id, reviews=[])
 
         product_name = product.name if product else request.sku
-        refund_composer = getattr(self._model, "compose_refund_summary", None)
-        if refund_composer is not None and decision.eligible:
-            summary_text = refund_composer(decision, product_name, computation)
-        else:
-            summary_text = self._model.compose_summary(decision, product_name)
+        summary_text = self._compose_summary_text(decision, computation, product_name)
         violations = verify_summary(summary_text, decision, computation)
         case = ReturnCase(
             case_id=case_id_for(request.request_id),
@@ -288,9 +322,37 @@ class CaseService:
                 "profile": self._model.profile_name,
             },
         )
+        # The summary is a customer message (R8): it enters the
+        # message lifecycle here — verified when the draft passed,
+        # refused with its violations listed when it did not. The
+        # case-level gate above is unchanged (R1 semantics); the
+        # message record is the lifecycle the summary now lives in.
+        self._record_summary_message(case, summary_text, violations, as_of=request.requested_on)
         if violations:
             raise FigureVerificationError(violations)
         return case
+
+    def _compose_summary_text(
+        self,
+        decision,
+        computation: RefundComputation,
+        product_name: str,
+        label: ReturnLabel | None = None,
+    ) -> str:
+        """The ONE summary composition path (R8): the return_summary
+        template's body. With a label, the label composer's text
+        (the R6 extended summary); for an eligible case, the refund
+        composer's (the R2 text quoting the computation); otherwise
+        the R1 composer's. Every surface that (re-)issues a summary
+        — ingest, label issuance, grading, message drafting — goes
+        through here, so the text can never diverge between them."""
+        label_composer = getattr(self._model, "compose_label_summary", None)
+        refund_composer = getattr(self._model, "compose_refund_summary", None)
+        if label is not None and label_composer is not None:
+            return label_composer(decision, product_name, computation, label)
+        if refund_composer is not None and decision.eligible:
+            return refund_composer(decision, product_name, computation)
+        return self._model.compose_summary(decision, product_name)
 
     def attach_evidence(self, case_id: str, kind: str, filename: str, content: bytes) -> dict:
         if self._evidence is None:
@@ -1262,12 +1324,14 @@ class CaseService:
         # re-verified against the artefacts (the label's cost is
         # sayable only as the label states it) before it is stored.
         label_composer = getattr(self._model, "compose_label_summary", None)
+        summary_text: str | None = None
         if case.summary is not None and computation is not None and label_composer is not None:
-            text = label_composer(decision, product.name, computation, label)
+            text = self._compose_summary_text(decision, computation, product.name, label=label)
             violations = verify_summary(text, decision, computation, label)
             if violations:
                 raise FigureVerificationError(violations)
             case.summary = text
+            summary_text = text
             self._store.put_case(case.model_dump(mode="json"))
             self._store.put_summary(
                 case.case_id,
@@ -1280,6 +1344,13 @@ class CaseService:
                 },
             )
         self._store.put_label(label.model_dump(mode="json"))
+        if summary_text is not None:
+            # The re-issued summary enters the message lifecycle
+            # (R8): the prior unsent summary message is withdrawn as
+            # superseded and the new text stands as a fresh verified
+            # message — a queued copy of the old text can never be
+            # sent now that the label exists.
+            self._record_summary_message(case, summary_text, [], as_of=issued_on)
         return label
 
     def _tool_void_label(
@@ -1812,21 +1883,12 @@ class CaseService:
         if new_computation is not None:
             product_name = product.name if product else case.request.sku
             active_label = self.get_active_label(case_id)
-            label_composer = getattr(self._model, "compose_label_summary", None)
-            refund_composer = getattr(self._model, "compose_refund_summary", None)
-            if active_label is not None and label_composer is not None:
-                summary_text = label_composer(
-                    decision, product_name, new_computation, active_label
-                )
-                violations = verify_summary(
-                    summary_text, decision, new_computation, active_label
-                )
-            elif refund_composer is not None:
-                summary_text = refund_composer(decision, product_name, new_computation)
-                violations = verify_summary(summary_text, decision, new_computation)
-            else:
-                summary_text = self._model.compose_summary(decision, product_name)
-                violations = verify_summary(summary_text, decision, new_computation)
+            summary_text = self._compose_summary_text(
+                decision, new_computation, product_name, label=active_label
+            )
+            violations = verify_summary(
+                summary_text, decision, new_computation, active_label
+            )
             if violations:
                 raise FigureVerificationError(violations)
 
@@ -1902,6 +1964,11 @@ class CaseService:
                         "profile": self._model.profile_name,
                     },
                 )
+                # The re-issued summary enters the message lifecycle
+                # (R8): any unsent summary message drafted against the
+                # superseded computation is withdrawn, and the new
+                # text stands as a fresh verified message.
+                self._record_summary_message(fresh, summary_text, [], as_of=graded_on)
         return report
 
     # -- the top-up execution (R7) --------------------------------------------
@@ -2091,6 +2158,627 @@ class CaseService:
         adjustment.idempotency_key = namespaced
         self._store.put_adjustment(adjustment.model_dump(mode="json"))
         return receipt
+
+    # -- customer messaging (R8) ---------------------------------------------
+    def get_disclosure_pack(self) -> DisclosurePack:
+        return self._disclosure
+
+    def _case_receipts(self, case_id: str) -> list[RefundReceipt]:
+        receipts = [r for r in self.list_receipts() if r.case_id == case_id]
+        return sorted(receipts, key=lambda r: (r.executed_on, r.receipt_id))
+
+    def _message_universe(
+        self, case: ReturnCase, message_type: str, label_override: ReturnLabel | None = None
+    ) -> tuple[MessageContext, dict[str, str], str]:
+        """The verified universe for one message of this case, plus
+        the artefact pin: (context, refs, fingerprint).
+
+        The context is case-wide — every figure any artefact of the
+        case computed, every disposition and condition the record
+        states, the case's own public references, and the disclosure
+        rules resolved (pack terms + the scoring pack's signal names
+        and review reason codes, derived here so the ban can never
+        drift from the pack). The pin is per message TYPE: the refs
+        name the artefacts that type renders against, and the
+        fingerprint hashes their payloads — recomputed at send
+        time, it is how a stale message is recognised.
+        """
+        decision = case.decision
+        if decision is None:
+            raise MessagingError(
+                f"case {case.case_id} has no decision of record; no message can be drafted or checked"
+            )
+        computations = self.list_computations_for_case(case.case_id)
+        computation = computations[-1] if computations else None
+        dispositions = self.list_dispositions_for_case(case.case_id)
+        label = label_override if label_override is not None else self.get_active_label(case.case_id)
+        labels = self.list_labels(case.case_id)
+        receipts = self._case_receipts(case.case_id)
+        report = self.get_grading_report(case.case_id)
+        adjustments = self.list_adjustments(case.case_id)
+        adjustment = adjustments[-1] if adjustments else None
+        review = self.get_fraud_review(case.case_id)
+        score = self._current_score(case.case_id)
+        pickups = self.list_pickups(case.case_id)
+        pickup = pickups[-1] if pickups else None
+        original_receipt = next(
+            (r for r in receipts if not r.idempotency_key.startswith("topup:")), None
+        )
+        top_up_receipt = next(
+            (r for r in receipts if r.idempotency_key.startswith("topup:")), None
+        )
+
+        amounts = set(decision.allowed_amounts)
+        for comp in computations:
+            amounts |= comp.allowed_amounts
+        if label is not None:
+            amounts.add(label.cost)
+        for receipt in receipts:
+            amounts.add(receipt.amount)
+            amounts |= {a.amount for a in receipt.tender_allocations}
+        if report is not None and report.refund_delta is not None:
+            amounts.add(abs(report.refund_delta))
+        for adj in adjustments:
+            amounts.add(adj.amount)
+
+        dates = set(decision.allowed_dates)
+        if label is not None:
+            dates.add(label.issued_on)
+        for receipt in receipts:
+            dates.add(receipt.executed_on)
+        if report is not None:
+            dates.add(report.graded_on)
+        for adj in adjustments:
+            dates.add(adj.created_on)
+        for booking in pickups:
+            dates.add(booking.scheduled_on)
+        if score is not None:
+            dates.add(score.as_of)
+
+        percents: set[Decimal] = set()
+        for comp in computations:
+            condition = (
+                comp.graded_condition
+                if comp.condition_basis == "graded"
+                else case.request.condition_declared
+            )
+            rate = self._pack.restocking_fee_rates.get(condition or "")
+            if rate is not None:
+                percents.add(Decimal(rate) * 100)
+
+        forbidden_terms = list(self._disclosure.forbidden_terms)
+        for reasons in self._scoring.review_outcomes.values():
+            forbidden_terms.extend(reasons)
+        if score is not None:
+            forbidden_terms.extend(s.signal_id for s in score.signals)
+        forbidden_terms = list(dict.fromkeys(forbidden_terms))
+
+        context = MessageContext(
+            case_id=case.case_id,
+            order_id=case.order_id,
+            allowed_amounts=amounts,
+            allowed_dates=dates,
+            allowed_percents=percents,
+            disposition_facts={d.disposition for d in dispositions if d.disposition},
+            condition_facts=(
+                {case.request.condition_declared}
+                | {c.graded_condition for c in computations if c.graded_condition}
+                | ({report.graded_condition} if report is not None else set())
+            ),
+            allowed_refs=(
+                {case.case_id, case.order_id}
+                | {lbl.carrier_ref for lbl in labels}
+                | {r.provider_ref for r in receipts}
+            ),
+            forbidden_terms=forbidden_terms,
+            forbidden_patterns=list(self._disclosure.forbidden_patterns),
+        )
+
+        def dump(model) -> dict | None:
+            return model.model_dump(mode="json") if model is not None else None
+
+        if message_type == "return_summary":
+            payloads = {
+                "decision": dump(decision),
+                "computation": dump(computation),
+                "label": dump(label),
+            }
+            refs = {"decision": f"decision:{case.case_id}"}
+            if computation is not None:
+                refs["computation"] = computation.computation_id
+            if label is not None:
+                refs["label"] = label.label_id
+        elif message_type == "label_instructions":
+            payloads = {
+                "label": dump(label),
+                "decision": dump(decision),
+                "pickup": dump(pickup),
+            }
+            refs = {"decision": f"decision:{case.case_id}"}
+            if label is not None:
+                refs["label"] = label.label_id
+            if pickup is not None:
+                refs["pickup"] = pickup.pickup_id
+        elif message_type == "grading_outcome_notice":
+            payloads = {
+                "report": dump(report),
+                "computations": [dump(c) for c in computations],
+                "dispositions": [dump(d) for d in dispositions],
+                "adjustment": dump(adjustment),
+            }
+            refs = {}
+            if report is not None:
+                refs["grading_report"] = report.report_id
+            if computations:
+                refs["computations"] = ",".join(c.computation_id for c in computations)
+            if dispositions:
+                refs["dispositions"] = ",".join(d.disposition_id for d in dispositions)
+            if adjustment is not None:
+                refs["adjustment"] = adjustment.adjustment_id
+        elif message_type == "fraud_review_notice":
+            payloads = {
+                "review": dump(review),
+                "score": dump(score),
+                "computation": dump(computation),
+            }
+            refs = {}
+            if review is not None:
+                refs["fraud_review"] = review.review_id
+            if score is not None:
+                refs["fraud_score"] = score.score_id
+            if computation is not None:
+                refs["computation"] = computation.computation_id
+        elif message_type == "refund_executed_notice":
+            payloads = {
+                "receipt": dump(original_receipt),
+                "computation": dump(computation),
+            }
+            refs = {}
+            if original_receipt is not None:
+                refs["receipt"] = original_receipt.receipt_id
+            if computation is not None:
+                refs["computation"] = computation.computation_id
+        elif message_type == "adjustment_notice":
+            payloads = {
+                "adjustment": dump(adjustment),
+                "computations": [dump(c) for c in computations],
+                "receipts": [dump(r) for r in receipts],
+            }
+            refs = {}
+            if adjustment is not None:
+                refs["adjustment"] = adjustment.adjustment_id
+            if computations:
+                refs["computations"] = ",".join(c.computation_id for c in computations)
+            if receipts:
+                refs["receipts"] = ",".join(r.receipt_id for r in receipts)
+        else:
+            raise MessagingError(
+                f"unknown message type {message_type!r}: no template exists for it, "
+                "so no text can be drafted"
+            )
+        fingerprint = hashlib.sha256(
+            json.dumps(payloads, sort_keys=True, separators=(",", ":"), default=str).encode()
+        ).hexdigest()
+        return context, refs, fingerprint
+
+    def _message_facts(self, case: ReturnCase, message_type: str) -> MessageFacts:
+        """Assemble the facts a template renders from, checking the
+        type's prerequisites — each refusal names the artefact that
+        is missing, because a message about an event that has not
+        happened cannot be drafted."""
+        if case.decision is None:
+            raise MessagingError(
+                f"case {case.case_id} has no decision of record; no message can be drafted"
+            )
+        product = CATALOGUE.get(case.request.sku)
+        facts = MessageFacts(
+            case=case,
+            product_name=product.name if product is not None else case.request.sku,
+        )
+        facts.computation = self.get_computation(case.case_id)
+        facts.computations = self.list_computations_for_case(case.case_id)
+        facts.disposition = self.get_disposition(case.case_id)
+        facts.dispositions = self.list_dispositions_for_case(case.case_id)
+        facts.label = self.get_active_label(case.case_id)
+        receipts = self._case_receipts(case.case_id)
+        facts.receipt = next(
+            (r for r in receipts if not r.idempotency_key.startswith("topup:")), None
+        )
+        facts.top_up_receipt = next(
+            (r for r in receipts if r.idempotency_key.startswith("topup:")), None
+        )
+        facts.report = self.get_grading_report(case.case_id)
+        adjustments = self.list_adjustments(case.case_id)
+        facts.adjustment = adjustments[-1] if adjustments else None
+        facts.review = self.get_fraud_review(case.case_id)
+        pickups = self.list_pickups(case.case_id)
+        facts.pickup = pickups[-1] if pickups else None
+
+        if message_type == "return_summary":
+            facts.summary_text = self._compose_summary_text(
+                case.decision, facts.computation, facts.product_name, label=facts.label
+            )
+        elif message_type == "label_instructions":
+            if facts.label is None:
+                raise MessagingError(
+                    f"case {case.case_id} has no active return label; there are "
+                    "no label instructions to send"
+                )
+            if facts.pickup is not None and facts.pickup.label_id != facts.label.label_id:
+                facts.pickup = None
+        elif message_type == "grading_outcome_notice":
+            if facts.report is None:
+                raise MessagingError(
+                    f"case {case.case_id} has no grading report of record; there "
+                    "is no grading outcome to notify"
+                )
+            if (
+                facts.report.new_computation_id is None
+                and facts.report.new_disposition_id is None
+            ):
+                raise MessagingError(
+                    f"grading on case {case.case_id} changed neither the refund "
+                    "nor the disposition; there is no grading outcome to notify"
+                )
+        elif message_type == "fraud_review_notice":
+            if facts.review is None:
+                raise MessagingError(
+                    f"case {case.case_id} has no fraud-review decision of record; "
+                    "there is no review outcome to notify"
+                )
+        elif message_type == "refund_executed_notice":
+            if facts.receipt is None:
+                raise MessagingError(
+                    f"case {case.case_id} has no executed refund receipt; there "
+                    "is no execution to notify"
+                )
+        elif message_type == "adjustment_notice":
+            if facts.adjustment is None:
+                raise MessagingError(
+                    f"case {case.case_id} has no refund adjustment of record; "
+                    "there is no adjustment to notify"
+                )
+        return facts
+
+    def _withdraw_message(self, message: CustomerMessage, *, at: date, detail: str) -> None:
+        """Withdraw an unsent message, on the record. Sent, refused
+        and already-withdrawn messages stand as they are — history
+        is not rewritten."""
+        if message.status not in (STATE_DRAFT, STATE_VERIFIED, STATE_QUEUED):
+            return
+        message.status = STATE_WITHDRAWN
+        message.transitions.append(
+            MessageTransition(state=STATE_WITHDRAWN, at=at, actor="case service", detail=detail)
+        )
+        self._store.put_message(message.model_dump(mode="json"))
+
+    def _create_message(
+        self,
+        case: ReturnCase,
+        message_type: str,
+        text: str,
+        *,
+        as_of: date,
+        refs: dict[str, str],
+        fingerprint: str,
+        initial_violations: list[str] | None = None,
+    ) -> CustomerMessage:
+        """Store a new draft. Any prior UNSENT message of the same
+        type for this case is withdrawn as superseded first — one
+        live draft per type, and the superseded text can never be
+        queued or sent from that moment. When `initial_violations`
+        is given (the summary path, whose draft was verified as it
+        was composed), the verification transition is recorded with
+        the draft: verified when clean, refused with the violations
+        listed when not."""
+        seq = self._store.count_messages(case.case_id) + 1
+        blob = json.dumps(
+            {
+                "case_id": case.case_id,
+                "message_type": message_type,
+                "seq": seq,
+                "fingerprint": fingerprint,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        message_id = "MSG-" + hashlib.sha256(blob.encode()).hexdigest()[:16]
+        supersedes = None
+        for prior in self.list_messages(case.case_id):
+            if prior.message_type != message_type:
+                continue
+            if prior.status in (STATE_DRAFT, STATE_VERIFIED, STATE_QUEUED):
+                self._withdraw_message(
+                    prior, at=as_of, detail=f"superseded by new draft {message_id}"
+                )
+                supersedes = prior.message_id
+        message = CustomerMessage(
+            message_id=message_id,
+            case_id=case.case_id,
+            message_type=message_type,
+            status=STATE_DRAFT,
+            seq=seq,
+            text=text,
+            template_version=MESSAGING_PACK_VERSION,
+            disclosure_pack_version=self._disclosure.version,
+            artefact_refs=refs,
+            artefact_fingerprint=fingerprint,
+            supersedes=supersedes,
+            created_on=as_of,
+            transitions=[
+                MessageTransition(
+                    state=STATE_DRAFT,
+                    at=as_of,
+                    actor=f"composer ({self._model.profile_name})",
+                    detail="drafted from the type's template over the artefacts of record",
+                )
+            ],
+        )
+        if initial_violations is not None:
+            message.violations = list(initial_violations)
+            if initial_violations:
+                message.status = STATE_REFUSED
+                message.transitions.append(
+                    MessageTransition(
+                        state=STATE_REFUSED,
+                        at=as_of,
+                        actor="messaging verifier",
+                        detail=(
+                            f"verification failed with {len(initial_violations)} "
+                            "violation(s); the message is refused and will not be sent"
+                        ),
+                    )
+                )
+            else:
+                message.status = STATE_VERIFIED
+                message.transitions.append(
+                    MessageTransition(
+                        state=STATE_VERIFIED,
+                        at=as_of,
+                        actor="messaging verifier",
+                        detail="figures, facts and disclosure checks passed",
+                    )
+                )
+        self._store.put_message(message.model_dump(mode="json"))
+        return message
+
+    def _record_summary_message(
+        self, case: ReturnCase, text: str, figure_violations: list[str], *, as_of: date
+    ) -> CustomerMessage:
+        """Enter a (re-)issued case summary into the message
+        lifecycle. Idempotent: the same text against the same
+        artefacts already standing as an unsent summary message is
+        returned unchanged. A figure-clean text is then checked by
+        the full messaging verifier; a figure-failing text is
+        recorded refused with the figure violations as they stand."""
+        _ctx, refs, fingerprint = self._message_universe(case, "return_summary")
+        for existing in self.list_messages(case.case_id):
+            if (
+                existing.message_type == "return_summary"
+                and existing.status in (STATE_DRAFT, STATE_VERIFIED, STATE_QUEUED)
+                and existing.text == text
+                and existing.artefact_fingerprint == fingerprint
+            ):
+                return existing
+        if figure_violations:
+            return self._create_message(
+                case,
+                "return_summary",
+                text,
+                as_of=as_of,
+                refs=refs,
+                fingerprint=fingerprint,
+                initial_violations=list(figure_violations),
+            )
+        checked = verify_message_text(text, _ctx)
+        return self._create_message(
+            case,
+            "return_summary",
+            text,
+            as_of=as_of,
+            refs=refs,
+            fingerprint=fingerprint,
+            initial_violations=checked,
+        )
+
+    def draft_message(
+        self,
+        case_id: str,
+        message_type: str,
+        *,
+        as_of: date,
+        model_note: str | None = None,
+    ) -> CustomerMessage:
+        """Draft a customer message from its type's template over
+        the case's current artefacts. `model_note` is the model
+        port's free-form slot — appended as the closing paragraph
+        and verified with the rest of the text at the verify step.
+        Refusals name the gap: an unknown type (no template), a
+        missing prerequisite artefact."""
+        case = self.get_case(case_id)
+        if case is None:
+            raise LookupError(f"unknown case: {case_id}")
+        if message_type not in TEMPLATES:
+            raise MessagingError(
+                f"unknown message type {message_type!r}: no template exists for it, "
+                "so no text can be drafted"
+            )
+        facts = self._message_facts(case, message_type)
+        text = TEMPLATES[message_type](facts, model_note)
+        _ctx, refs, fingerprint = self._message_universe(case, message_type)
+        return self._create_message(
+            case, message_type, text, as_of=as_of, refs=refs, fingerprint=fingerprint
+        )
+
+    def verify_message(self, message_id: str, *, as_of: date) -> CustomerMessage:
+        """The verification act: the messaging verifier runs over
+        the draft's final text against the case's CURRENT verified
+        universe. Clean → verified (sendable after queueing).
+        Violations → stored as refused, with the violations listed
+        on the artefact — never sent, never silently fixed."""
+        message = self.get_message(message_id)
+        if message is None:
+            raise LookupError(f"unknown message: {message_id}")
+        if message.status != STATE_DRAFT:
+            raise MessagingError(
+                f"message {message_id} is {message.status}; only a draft can be verified"
+            )
+        case = self.get_case(message.case_id)
+        if case is None:
+            raise LookupError(f"unknown case: {message.case_id}")
+        context, _refs, _fingerprint = self._message_universe(case, message.message_type)
+        violations = verify_message_text(message.text, context)
+        message.violations = violations
+        if violations:
+            message.status = STATE_REFUSED
+            message.transitions.append(
+                MessageTransition(
+                    state=STATE_REFUSED,
+                    at=as_of,
+                    actor="messaging verifier",
+                    detail=(
+                        f"verification failed with {len(violations)} violation(s); "
+                        "the message is refused and will not be sent"
+                    ),
+                )
+            )
+        else:
+            message.status = STATE_VERIFIED
+            message.transitions.append(
+                MessageTransition(
+                    state=STATE_VERIFIED,
+                    at=as_of,
+                    actor="messaging verifier",
+                    detail="figures, facts and disclosure checks passed",
+                )
+            )
+        self._store.put_message(message.model_dump(mode="json"))
+        return message
+
+    def queue_message(self, message_id: str, *, as_of: date) -> CustomerMessage:
+        """Queue a verified message for sending. A draft (never
+        verified) or a refused message cannot be queued — the
+        refusal names the state it is actually in."""
+        message = self.get_message(message_id)
+        if message is None:
+            raise LookupError(f"unknown message: {message_id}")
+        if message.status != STATE_VERIFIED:
+            raise MessagingError(
+                f"message {message_id} is {message.status}; only a verified message can be queued"
+            )
+        message.status = STATE_QUEUED
+        message.transitions.append(
+            MessageTransition(
+                state=STATE_QUEUED,
+                at=as_of,
+                actor="operations",
+                detail="queued for sending",
+            )
+        )
+        self._store.put_message(message.model_dump(mode="json"))
+        return message
+
+    def send_message(self, message_id: str, *, as_of: date) -> CustomerMessage:
+        """Send a queued message through the messaging port.
+
+        Idempotent per message id: an already-sent message returns
+        as it stands and the port is not called again. Staleness is
+        checked first, in code: the artefact fingerprint is
+        recomputed from the current record, and a mismatch means
+        the case moved under the message — the message is WITHDRAWN
+        unsent and re-drafted from the current artefacts (the fresh
+        draft is verified and left standing), and this act refuses,
+        naming the replacement. A provider failure leaves the
+        message queued and sendable later.
+        """
+        message = self.get_message(message_id)
+        if message is None:
+            raise LookupError(f"unknown message: {message_id}")
+        if message.status == STATE_SENT:
+            return message
+        if message.status != STATE_QUEUED:
+            raise MessagingError(
+                f"message {message_id} is {message.status}; only a queued message can be sent"
+            )
+        case = self.get_case(message.case_id)
+        if case is None:
+            raise LookupError(f"unknown case: {message.case_id}")
+        try:
+            _ctx, _refs, fingerprint = self._message_universe(case, message.message_type)
+        except MessagingError:
+            fingerprint = None
+        if fingerprint != message.artefact_fingerprint:
+            self._withdraw_message(
+                message,
+                at=as_of,
+                detail=(
+                    "withdrawn at send time: the artefacts this message was "
+                    "rendered against changed after it was queued (stale); "
+                    "re-drafting from the current artefacts"
+                ),
+            )
+            replacement = None
+            try:
+                candidate = self.draft_message(case.case_id, message.message_type, as_of=as_of)
+                candidate.supersedes = message.message_id
+                self._store.put_message(candidate.model_dump(mode="json"))
+                replacement = self.verify_message(candidate.message_id, as_of=as_of)
+            except MessagingError:
+                replacement = None
+            raise MessagingError(
+                f"message {message_id} went stale before sending and was withdrawn unsent"
+                + (
+                    f"; a fresh draft {replacement.message_id} (status "
+                    f"{replacement.status}) replaces it"
+                    if replacement is not None
+                    else "; no replacement could be drafted from the current artefacts"
+                )
+            )
+        try:
+            delivery = self._messaging.send(
+                message_id=message.message_id, case_id=message.case_id, text=message.text
+            )
+        except MessagingProviderError as exc:
+            raise MessagingError(
+                f"messaging provider failed for message {message_id}: {exc} "
+                "Nothing was delivered; the message stays queued."
+            ) from exc
+        message.status = STATE_SENT
+        message.provider = delivery.provider
+        message.provider_ref = delivery.provider_ref
+        message.transitions.append(
+            MessageTransition(
+                state=STATE_SENT,
+                at=as_of,
+                actor="messaging port",
+                detail=f"delivered via {delivery.provider} (ref {delivery.provider_ref})",
+            )
+        )
+        self._store.put_message(message.model_dump(mode="json"))
+        return message
+
+    def get_message(self, message_id: str) -> CustomerMessage | None:
+        payload = self._store.get_message(message_id)
+        return CustomerMessage.model_validate(payload) if payload else None
+
+    def list_messages(self, case_id: str) -> list[CustomerMessage]:
+        """Every message of record for the case — drafts, verified,
+        refused, queued, sent, withdrawn — in creation order."""
+        messages = [
+            CustomerMessage.model_validate(p) for p in self._store.list_messages(case_id)
+        ]
+        return sorted(messages, key=lambda m: (m.seq, m.message_id))
+
+    def list_refused_messages(self, case_id: str) -> list[CustomerMessage]:
+        """The case's refused messages, with their violations — the
+        refusal read: what was drafted, why it may not be sent."""
+        return [m for m in self.list_messages(case_id) if m.status == STATE_REFUSED]
+
+    def list_all_messages(self) -> list[CustomerMessage]:
+        messages = [
+            CustomerMessage.model_validate(p) for p in self._store.list_all_messages()
+        ]
+        return sorted(messages, key=lambda m: (m.case_id, m.seq, m.message_id))
 
     # -- reads ---------------------------------------------------------------
     def get_case(self, case_id: str) -> ReturnCase | None:
