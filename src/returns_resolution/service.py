@@ -1503,6 +1503,7 @@ class CaseService:
             warehouse_receipts=self.list_warehouse_receipts(case_id),
             grading_reports=self.list_grading_reports(case_id),
             adjustments=self.list_adjustments(case_id),
+            messages=self.list_messages(case_id),
             as_of=as_of,
         )
 

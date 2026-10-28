@@ -5,8 +5,10 @@ intake request, the eligibility decision, the refund computation
 chain, the disposition chain, the fraud score chain and its review
 decisions, approvals, refund executions and the receipt, labels
 and their voids, pickups, the carrier events read back through the
-carrier port, and — from R7 — warehouse receipts, grading reports
-and refund adjustments. Every entry carries the recorded date of
+carrier port, warehouse receipts, grading reports and refund
+adjustments (R7), and the lifecycle of every customer message —
+draft, verification, queueing, send, refusal, withdrawal (R8).
+Every entry carries the recorded date of
 its artefact and the artefact's own id, so a reader can walk from
 any line of the timeline to the record it summarises.
 
@@ -25,6 +27,7 @@ from .fraud import BLOCKED_STATES
 from .models import (
     CarrierEvent,
     CaseTimeline,
+    CustomerMessage,
     DispositionDecision,
     FraudReviewDecision,
     FraudScore,
@@ -63,6 +66,7 @@ _STAGE_RANK = {
     "refund_execution": 100,
     "receipt": 110,
     "adjustment": 115,
+    "message": 120,
 }
 
 
@@ -85,6 +89,7 @@ def build_timeline(
     warehouse_receipts: list[WarehouseReceipt] | None = None,
     grading_reports: list[GradingReport] | None = None,
     adjustments: list[RefundAdjustment] | None = None,
+    messages: list[CustomerMessage] | None = None,
     as_of: date,
 ) -> CaseTimeline:
     computation_chain = computation_chain or ([computation] if computation is not None else [])
@@ -92,6 +97,7 @@ def build_timeline(
     warehouse_receipts = warehouse_receipts or []
     grading_reports = grading_reports or []
     adjustments = adjustments or []
+    messages = messages or []
     # A graded artefact's recorded date is the grading act's date —
     # the report names the artefacts it created.
     graded_dates: dict[str, date] = {}
@@ -275,6 +281,16 @@ def build_timeline(
             f"(ref {receipt.provider_ref}, key {receipt.idempotency_key})",
         )
 
+    for message in messages:
+        for transition in message.transitions:
+            detail = (
+                f"customer message {message.message_type} ({message.message_id}) "
+                f"{transition.state} by {transition.actor}"
+            )
+            if transition.detail:
+                detail += f" — {transition.detail}"
+            add(transition.at, "message", message.message_id, detail)
+
     staged.sort(key=lambda item: (item[0], item[1], item[2]))
     entries = [entry for _at, _rank, _seq, entry in staged]
 
@@ -334,6 +350,16 @@ def build_timeline(
                         "the parcel is received into the warehouse but no grading report "
                         "is on record — the disposition and the refund still rest on the "
                         "customer's declared condition"
+                    ),
+                )
+            )
+        if any(message.status == "queued" for message in messages):
+            gaps.append(
+                TimelineGap(
+                    kind="customer_message",
+                    detail=(
+                        "a customer message is verified and queued but has not been "
+                        "sent — the customer is still waiting on it"
                     ),
                 )
             )
