@@ -52,6 +52,24 @@ def main() -> int:
         for component in computation.not_computable:
             print(f"  not computable: {component.component} — missing {component.missing_input}")
 
+    print("\n--- dispositions (matrix 2026.10.1, basis: declared) ---")
+    for case_id in sorted(cases):
+        disp = service.get_disposition(case_id)
+        if disp is None:
+            print(f"  {case_id}  — (ineligible: no disposition)")
+        elif disp.status == "not_decidable":
+            print(f"  {case_id}  NOT DECIDABLE — missing dimension: {disp.missing_dimension}")
+        else:
+            route = disp.cell_id
+            if disp.reroutes:
+                hops = " -> ".join(
+                    f"{s.from_cell_id} [{s.closed_channel} closed]" for s in disp.reroutes
+                )
+                route = f"{hops} -> {disp.cell_id}"
+            print(f"  {case_id}  {disp.disposition:<18} via {disp.channel:<10} cell {route}")
+            for unknown in disp.inspection_unknowns:
+                print(f"      inspection must establish: {unknown}")
+
     for case_id in ("CASE-2003", "CASE-2004"):
         case = cases[case_id]
         print(f"\n--- {case_id} summary (figure-verified) ---")
