@@ -85,10 +85,31 @@ CREATE TABLE IF NOT EXISTS dispositions (
 );
 """
 
+# Migration 0004 — fraud scores + review decisions (R4). Scores are
+# a chain per case (a re-score supersedes, never edits), so the case
+# key is deliberately NOT unique; reviews are one per score artefact,
+# enforced by the UNIQUE score key here and by the service above it.
+_MIGRATION_0004_SQLITE = """
+CREATE TABLE IF NOT EXISTS fraud_scores (
+    score_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    pack_version TEXT NOT NULL,
+    band TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fraud_reviews (
+    review_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    score_id TEXT NOT NULL UNIQUE,
+    payload TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("0001", _MIGRATION_0001_SQLITE, _MIGRATION_0001_PG),
     ("0002", _MIGRATION_0002_SQLITE, _MIGRATION_0002_SQLITE),
     ("0003", _MIGRATION_0003_SQLITE, _MIGRATION_0003_SQLITE),
+    ("0004", _MIGRATION_0004_SQLITE, _MIGRATION_0004_SQLITE),
 ]
 
 
@@ -113,6 +134,13 @@ class Store(Protocol):
     def put_disposition(self, payload: dict[str, Any]) -> None: ...
     def get_disposition(self, case_id: str) -> dict[str, Any] | None: ...
     def list_dispositions(self) -> list[dict[str, Any]]: ...
+    def put_fraud_score(self, payload: dict[str, Any]) -> None: ...
+    def get_fraud_score(self, score_id: str) -> dict[str, Any] | None: ...
+    def list_fraud_scores(self, case_id: str) -> list[dict[str, Any]]: ...
+    def list_all_fraud_scores(self) -> list[dict[str, Any]]: ...
+    def put_fraud_review(self, payload: dict[str, Any]) -> None: ...
+    def get_fraud_review(self, score_id: str) -> dict[str, Any] | None: ...
+    def list_fraud_reviews(self, case_id: str) -> list[dict[str, Any]]: ...
 
 
 class SqlStore:
@@ -347,6 +375,68 @@ class SqlStore:
     def list_dispositions(self) -> list[dict[str, Any]]:
         return [json.loads(r["payload"]) for r in self._query("SELECT payload FROM dispositions ORDER BY case_id")]
 
+    # -- fraud scores + reviews (R4) --------------------------------------
+    def put_fraud_score(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO fraud_scores (score_id, case_id, pack_version, band, payload) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (score_id) DO UPDATE SET payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO fraud_scores (score_id, case_id, pack_version, band, payload) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (score_id) DO UPDATE SET payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["score_id"],
+                payload["case_id"],
+                payload["pack_version"],
+                payload["band"],
+                json.dumps(payload),
+            ),
+        )
+
+    def get_fraud_score(self, score_id: str) -> dict[str, Any] | None:
+        row = self._query_one("SELECT payload FROM fraud_scores WHERE score_id = ?", (score_id,))
+        return json.loads(row["payload"]) if row else None
+
+    def list_fraud_scores(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM fraud_scores WHERE case_id = ? ORDER BY score_id", (case_id,)
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
+    def list_all_fraud_scores(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT payload FROM fraud_scores ORDER BY case_id, score_id")
+        return [json.loads(r["payload"]) for r in rows]
+
+    def put_fraud_review(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO fraud_reviews (review_id, case_id, score_id, payload) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (review_id) DO UPDATE SET payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO fraud_reviews (review_id, case_id, score_id, payload) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (review_id) DO UPDATE SET payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["review_id"],
+                payload["case_id"],
+                payload["score_id"],
+                json.dumps(payload),
+            ),
+        )
+
+    def get_fraud_review(self, score_id: str) -> dict[str, Any] | None:
+        row = self._query_one("SELECT payload FROM fraud_reviews WHERE score_id = ?", (score_id,))
+        return json.loads(row["payload"]) if row else None
+
+    def list_fraud_reviews(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM fraud_reviews WHERE case_id = ? ORDER BY review_id", (case_id,)
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
 
 class InMemoryStore:
     """Test double implementing the same port with dicts."""
@@ -359,9 +449,11 @@ class InMemoryStore:
         self._evidence: dict[str, dict] = {}
         self._computations: dict[str, dict] = {}
         self._dispositions: dict[str, dict] = {}
+        self._fraud_scores: dict[str, dict] = {}
+        self._fraud_reviews: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
-        return ["0001", "0002", "0003"]
+        return ["0001", "0002", "0003", "0004"]
 
     def put_order(self, payload: dict[str, Any]) -> None:
         self._orders[payload["order_id"]] = payload
@@ -422,3 +514,35 @@ class InMemoryStore:
 
     def list_dispositions(self) -> list[dict[str, Any]]:
         return [self._dispositions[k] for k in sorted(self._dispositions)]
+
+    def put_fraud_score(self, payload: dict[str, Any]) -> None:
+        self._fraud_scores[payload["score_id"]] = payload
+
+    def get_fraud_score(self, score_id: str) -> dict[str, Any] | None:
+        return self._fraud_scores.get(score_id)
+
+    def list_fraud_scores(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._fraud_scores[k]
+            for k in sorted(self._fraud_scores)
+            if self._fraud_scores[k]["case_id"] == case_id
+        ]
+
+    def list_all_fraud_scores(self) -> list[dict[str, Any]]:
+        return [self._fraud_scores[k] for k in sorted(self._fraud_scores)]
+
+    def put_fraud_review(self, payload: dict[str, Any]) -> None:
+        self._fraud_reviews[payload["review_id"]] = payload
+
+    def get_fraud_review(self, score_id: str) -> dict[str, Any] | None:
+        for review in self._fraud_reviews.values():
+            if review["score_id"] == score_id:
+                return review
+        return None
+
+    def list_fraud_reviews(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._fraud_reviews[k]
+            for k in sorted(self._fraud_reviews)
+            if self._fraud_reviews[k]["case_id"] == case_id
+        ]

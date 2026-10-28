@@ -73,3 +73,22 @@ class ReferenceFeed:
 
     def fetch_requests(self) -> list[ReturnRequest]:
         return list(self._requests)
+
+
+# The live fraud-history requests (R4): the current returns of the
+# two planted history customers (see seed.py's fraud history). They
+# are deliberately NOT part of PLANTED_REQUESTS — they are only
+# meaningful once the history seed is loaded, and surfaces ingest
+# them explicitly.
+FRAUD_FEED_REQUESTS: list[ReturnRequest] = [
+    ReturnRequest(
+        request_id="REQ-3008", order_id="ORD-3008", sku="BOOT-TRL", qty=1,
+        reason_code="changed_mind", condition_declared="used",
+        requested_on=date(2026, 10, 24),
+    ),
+    ReturnRequest(
+        request_id="REQ-3103", order_id="ORD-3103", sku="JKT-ALPINE", qty=1,
+        reason_code="changed_mind", condition_declared="new_with_tags",
+        requested_on=date(2026, 10, 23),
+    ),
+]

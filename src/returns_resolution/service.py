@@ -9,6 +9,9 @@ never exists anywhere in the system.
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 from .disposition import (
     ChannelTable,
     MatrixPack,
@@ -19,11 +22,28 @@ from .disposition import (
 )
 from .eligibility import case_id_for, evaluate
 from .evidence import EvidenceStore
+from .fraud import (
+    BLOCKED_STATES,
+    CaseFact,
+    ScoringPack,
+    derive_fraud_state,
+    load_scoring_pack,
+    score_case,
+    verify_fraud_score,
+)
 from .modelport import ModelPort
-from .models import DispositionDecision, Order, RefundComputation, ReturnCase, ReturnRequest
+from .models import (
+    DispositionDecision,
+    FraudReviewDecision,
+    FraudScore,
+    Order,
+    RefundComputation,
+    ReturnCase,
+    ReturnRequest,
+)
 from .policy import PolicyPack, load_policy_pack
 from .refunds import compute_refund, verify_computation
-from .seed import CATALOGUE, ORDERS
+from .seed import CATALOGUE, HISTORY_CASES, HISTORY_ORDERS, ORDERS, PRODUCT_WEIGHTS_GRAMS
 from .store import Store
 from .verifier import verify_summary
 
@@ -32,6 +52,15 @@ class FigureVerificationError(RuntimeError):
     def __init__(self, violations: list[str]):
         super().__init__("; ".join(violations))
         self.violations = violations
+
+
+class FraudHoldError(RuntimeError):
+    """The case's refund path is blocked by its fraud state."""
+
+
+class FraudReviewError(RuntimeError):
+    """A fraud-review act was refused (wrong state, unnamed reviewer,
+    or an outcome/reason outside the pack's vocabulary)."""
 
 
 class CaseService:
@@ -43,6 +72,7 @@ class CaseService:
         evidence_store: EvidenceStore | None = None,
         matrix: MatrixPack | None = None,
         channels: ChannelTable | None = None,
+        scoring_pack: ScoringPack | None = None,
     ):
         self._store = store
         self._model = model_port
@@ -50,12 +80,23 @@ class CaseService:
         self._evidence = evidence_store
         self._matrix = matrix or load_matrix_pack()
         self._channels = channels or load_channel_table()
+        self._scoring = scoring_pack or load_scoring_pack()
 
     # -- seeding ---------------------------------------------------------
     def seed_orders(self) -> int:
         for order in ORDERS.values():
             self._store.put_order(order.model_dump(mode="json"))
         return len(ORDERS)
+
+    def seed_history(self) -> int:
+        """Load the R4 fraud-history seed: the planted customers'
+        orders and their closed historical cases, as stored
+        artefacts. Idempotent — re-seeding restores the same rows."""
+        for order in HISTORY_ORDERS.values():
+            self._store.put_order(order.model_dump(mode="json"))
+        for case in HISTORY_CASES:
+            self._store.put_case(case.model_dump(mode="json"))
+        return len(HISTORY_CASES)
 
     # -- workflow ----------------------------------------------------------
     def ingest(self, request: ReturnRequest) -> ReturnCase:
@@ -85,6 +126,16 @@ class CaseService:
             disposition = self._decide_for(order, product, request, computation.computation_id)
             self._store.put_disposition(disposition.model_dump(mode="json"))
 
+        # Fraud scoring (R4): every case is scored over the stored
+        # artefacts at ingest. The artefact is content-addressed and
+        # pinned to its inputs; the case carries it plus the derived
+        # fraud state. A FRAUD_REVIEW band blocks the refund path as
+        # state — the R5 gates must consult it.
+        scored_fact = self._fact_for(order, request)
+        score = self._score_over(scored_fact)
+        self._store.put_fraud_score(score.model_dump(mode="json"))
+        fraud_state = derive_fraud_state(score.band, current_score_id=score.score_id, reviews=[])
+
         product_name = product.name if product else request.sku
         refund_composer = getattr(self._model, "compose_refund_summary", None)
         if refund_composer is not None and decision.eligible:
@@ -102,6 +153,8 @@ class CaseService:
             computation=computation,
             disposition=disposition,
             summary=summary_text if not violations else None,
+            fraud_score=score,
+            fraud_state=fraud_state,
         )
         self._store.put_case(case.model_dump(mode="json"))
         self._store.put_summary(
@@ -226,6 +279,228 @@ class CaseService:
 
     def get_channels(self) -> ChannelTable:
         return self._channels
+
+    # -- fraud scoring (R4) --------------------------------------------------
+    def _fact_for(self, order: Order, request: ReturnRequest) -> CaseFact:
+        product = CATALOGUE.get(request.sku)
+        return CaseFact(
+            case_id=case_id_for(request.request_id),
+            order_id=order.order_id,
+            customer_id=order.customer_id,
+            sku=request.sku,
+            qty=request.qty,
+            category=product.category if product is not None else None,
+            condition_declared=request.condition_declared,
+            requested_on=request.requested_on,
+            delivered_on=order.delivered_on,
+            returned_weight_grams=request.returned_weight_grams,
+        )
+
+    def _fact_of_case(self, case: ReturnCase) -> CaseFact | None:
+        order = self.get_order(case.order_id)
+        if order is None:
+            return None
+        return self._fact_for(order, case.request)
+
+    def _score_over(self, scored: CaseFact, supersedes: str | None = None) -> FraudScore:
+        facts = [scored]
+        for payload in self._store.list_cases():
+            other = ReturnCase.model_validate(payload)
+            if other.customer_id != scored.customer_id or other.case_id == scored.case_id:
+                continue
+            fact = self._fact_of_case(other)
+            if fact is not None:
+                facts.append(fact)
+        orders = [
+            Order.model_validate(p)
+            for p in self._store.list_orders()
+            if p["customer_id"] == scored.customer_id
+        ]
+        return score_case(
+            self._scoring,
+            scored=scored,
+            facts=facts,
+            orders=orders,
+            weights_grams=PRODUCT_WEIGHTS_GRAMS,
+            supersedes=supersedes,
+        )
+
+    def _current_score(self, case_id: str) -> FraudScore | None:
+        scores = [FraudScore.model_validate(p) for p in self._store.list_fraud_scores(case_id)]
+        if not scores:
+            return None
+        superseded = {s.supersedes for s in scores if s.supersedes}
+        current = [s for s in scores if s.score_id not in superseded]
+        return current[0] if len(current) == 1 else scores[-1]
+
+    def _reviews_for(self, case_id: str) -> list[FraudReviewDecision]:
+        return [FraudReviewDecision.model_validate(p) for p in self._store.list_fraud_reviews(case_id)]
+
+    def _refresh_case_fraud(self, case: ReturnCase) -> ReturnCase:
+        """Re-derive the case's fraud fields from the artefacts of
+        record (current score + review decisions) and persist."""
+        score = self._current_score(case.case_id)
+        reviews = self._reviews_for(case.case_id)
+        case.fraud_score = score
+        case.fraud_review = reviews[-1] if reviews else None
+        case.fraud_state = (
+            derive_fraud_state(score.band, current_score_id=score.score_id, reviews=reviews)
+            if score is not None
+            else case.fraud_state
+        )
+        self._store.put_case(case.model_dump(mode="json"))
+        return case
+
+    def get_fraud_score(self, case_id: str) -> FraudScore | None:
+        """The case's current score; scored+stored on demand for a
+        case ingested before R4 (its inputs are still pinned)."""
+        current = self._current_score(case_id)
+        if current is not None:
+            return current
+        case = self.get_case(case_id)
+        if case is None:
+            return None
+        fact = self._fact_of_case(case)
+        if fact is None:
+            return None
+        score = self._score_over(fact)
+        self._store.put_fraud_score(score.model_dump(mode="json"))
+        self._refresh_case_fraud(case)
+        return score
+
+    def rescore_case(self, case_id: str) -> FraudScore | None:
+        """Re-score over the store's current artefacts. If nothing
+        changed, the same content-addressed artefact comes back and
+        nothing new is written; if new evidence landed, the new
+        artefact supersedes the old by link — the old one stands."""
+        case = self.get_case(case_id)
+        if case is None:
+            return None
+        fact = self._fact_of_case(case)
+        if fact is None:
+            return None
+        current = self._current_score(case_id)
+        fresh = self._score_over(fact, supersedes=current.score_id if current else None)
+        if current is not None and fresh.score_id == current.score_id:
+            return current
+        if current is None:
+            fresh = self._score_over(fact)
+        self._store.put_fraud_score(fresh.model_dump(mode="json"))
+        self._refresh_case_fraud(case)
+        return fresh
+
+    def verify_stored_fraud_score(self, case_id: str) -> list[str]:
+        """Re-perform the current score from its pinned inputs;
+        [] = intact. The inputs are re-read by the ids the artefact
+        pins — a missing input is itself a named problem."""
+        score = self._current_score(case_id)
+        case = self.get_case(case_id)
+        if score is None or case is None:
+            return ["no fraud score for this case"]
+        scored = self._fact_of_case(case)
+        if scored is None:
+            return ["order missing for this case"]
+        facts = [scored]
+        for pinned_id in score.input_case_ids:
+            if pinned_id == case_id:
+                continue
+            pinned = self.get_case(pinned_id)
+            if pinned is None:
+                return [f"pinned input case {pinned_id} is missing from the store"]
+            fact = self._fact_of_case(pinned)
+            if fact is None:
+                return [f"order missing for pinned input case {pinned_id}"]
+            facts.append(fact)
+        orders = []
+        for order_id in score.input_order_ids:
+            order = self.get_order(order_id)
+            if order is None:
+                return [f"pinned input order {order_id} is missing from the store"]
+            orders.append(order)
+        return verify_fraud_score(
+            score, self._scoring, scored=scored, facts=facts,
+            orders=orders, weights_grams=PRODUCT_WEIGHTS_GRAMS,
+        )
+
+    def list_fraud_scores(self) -> list[FraudScore]:
+        return [FraudScore.model_validate(p) for p in self._store.list_all_fraud_scores()]
+
+    def get_scoring_pack(self) -> ScoringPack:
+        return self._scoring
+
+    # -- the fraud block + the review act -------------------------------------
+    def refund_path_blocked(self, case_id: str) -> bool:
+        case = self.get_case(case_id)
+        if case is None:
+            return False
+        return case.fraud_state in BLOCKED_STATES
+
+    def assert_refund_path_open(self, case_id: str) -> None:
+        """The guard every money-moving surface (R5 onward) must call
+        before proceeding: a blocked case refuses here, in code."""
+        case = self.get_case(case_id)
+        if case is not None and case.fraud_state in BLOCKED_STATES:
+            raise FraudHoldError(
+                f"case {case_id} is under fraud hold (state={case.fraud_state}); "
+                "only a named fraud-review decision can change that"
+            )
+
+    def record_fraud_review(
+        self, case_id: str, *, reviewer: str, outcome: str, reason_code: str
+    ) -> FraudReviewDecision:
+        """The decision act — the ONLY way a fraud block is lifted or
+        confirmed. Refusals: case not in FRAUD_REVIEW, a decision
+        already recorded on the current score, an unnamed reviewer,
+        or an outcome/reason outside the pack's vocabulary. The
+        score artefact is never modified by this act."""
+        case = self.get_case(case_id)
+        if case is None:
+            raise LookupError(f"unknown case: {case_id}")
+        reviewer = (reviewer or "").strip()
+        if not reviewer:
+            raise FraudReviewError("a fraud-review decision requires a named reviewer")
+        score = self.get_fraud_score(case_id)
+        if score is None or score.band != "FRAUD_REVIEW":
+            raise FraudReviewError(f"case {case_id} is not in fraud review")
+        if self._store.get_fraud_review(score.score_id) is not None:
+            raise FraudReviewError(f"score {score.score_id} already has a review decision")
+        reasons = self._scoring.review_outcomes.get(outcome)
+        if reasons is None:
+            raise FraudReviewError(
+                f"outcome {outcome!r} is not in the scoring pack's review vocabulary"
+            )
+        if reason_code not in reasons:
+            raise FraudReviewError(
+                f"reason {reason_code!r} is not a coded reason for outcome {outcome!r}"
+            )
+        blob = json.dumps(
+            {
+                "case_id": case_id,
+                "score_id": score.score_id,
+                "reviewer": reviewer,
+                "outcome": outcome,
+                "reason_code": reason_code,
+                "pack_version": self._scoring.version,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        decision = FraudReviewDecision(
+            review_id="FR-" + hashlib.sha256(blob.encode()).hexdigest()[:16],
+            case_id=case_id,
+            score_id=score.score_id,
+            reviewer=reviewer,
+            outcome=outcome,
+            reason_code=reason_code,
+            pack_version=self._scoring.version,
+        )
+        self._store.put_fraud_review(decision.model_dump(mode="json"))
+        self._refresh_case_fraud(case)
+        return decision
+
+    def get_fraud_review(self, case_id: str) -> FraudReviewDecision | None:
+        reviews = self._reviews_for(case_id)
+        return reviews[-1] if reviews else None
 
     # -- reads ---------------------------------------------------------------
     def get_case(self, case_id: str) -> ReturnCase | None:
