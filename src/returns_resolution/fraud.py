@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 
@@ -209,6 +210,27 @@ class CaseFact(BaseModel):
     returned_weight_grams: int | None = None
 
 
+@dataclass
+class HistoryFacts:
+    """The engine's history input, as one provenance-tagged bundle
+    (R9). `source` states where the fact set came from — "store"
+    (the artefacts of record) or "memory" (reconstructed from
+    memory-port records) — and the tag lands on the score artefact
+    as `history_source`. The tag is deliberately NOT an input to
+    the arithmetic or the fingerprint: the same facts produce the
+    same score from either source, which is exactly the parity the
+    memory path is graded on.
+
+    `orders` are the customer's Order models as read from the order
+    book — reference data of the OMS, identical for both sources;
+    memory holds case history, not a second order book.
+    """
+
+    source: str  # "store" | "memory"
+    facts: list[CaseFact] = field(default_factory=list)
+    orders: list = field(default_factory=list)
+
+
 def _canonical(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -240,6 +262,7 @@ def score_case(
     orders: list,
     weights_grams: dict[str, int],
     supersedes: str | None = None,
+    history_source: str = "store",
 ):
     """The pure evaluation. Same pack + same stored artefacts -> the
     same FraudScore, byte for byte. `orders` are the customer's Order
@@ -490,6 +513,30 @@ def score_case(
         band=band,
         as_of=as_of,
         supersedes=supersedes,
+        history_source=history_source,
+    )
+
+
+def score_from_history(
+    pack: ScoringPack,
+    *,
+    scored: CaseFact,
+    history: HistoryFacts,
+    weights_grams: dict[str, int],
+    supersedes: str | None = None,
+):
+    """Score over a provenance-tagged history bundle (R9) — the
+    one entry point both input paths (store, memory) go through,
+    so the engine cannot tell them apart except by the tag it
+    stamps on the artefact."""
+    return score_case(
+        pack,
+        scored=scored,
+        facts=history.facts,
+        orders=history.orders,
+        weights_grams=weights_grams,
+        supersedes=supersedes,
+        history_source=history.source,
     )
 
 
@@ -502,6 +549,7 @@ def verify_fraud_score(score, pack: ScoringPack, *, scored: CaseFact, facts: lis
     expected = score_case(
         pack, scored=scored, facts=facts, orders=orders,
         weights_grams=weights_grams, supersedes=score.supersedes,
+        history_source=score.history_source,
     )
     problems: list[str] = []
     if score.score_id != expected.score_id:
