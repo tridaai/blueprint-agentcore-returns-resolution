@@ -25,6 +25,7 @@ from .model_gateway import ModelGatewayError, load_model_gateway
 from .modelport import OfflineComposer
 from .models import ReturnRequest
 from .gateway import PolicyDeniedError, ToolError
+from .quarantine import QuarantineError
 from .service import (
     ApprovalError,
     CarrierError,
@@ -100,14 +101,18 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     list_warehouse_receipts {case_id} |
     record_grading {case_id, grader, graded_condition, graded_on,
     functional_test_result?, data_wipe_status?, damage_notes?,
-    received_weight_grams?, wear_evidence?} |
+    received_weight_grams?, wear_evidence?, photo_metadata?} |
     list_grading_reports {case_id} | list_adjustments {case_id} |
     execute_top_up {case_id, idempotency_key, as_of} |
-    draft_message {case_id, message_type, as_of, model_note?} |
+    draft_message {case_id, message_type, as_of, model_note?, customer_note?} |
     verify_message {message_id, as_of} | queue_message {message_id, as_of} |
     send_message {message_id, as_of} | get_message {message_id} |
     list_messages {case_id} | list_refused_messages {case_id} |
     get_disclosure_pack |
+    get_screening_pack |
+    submit_customer_text {case_id, source_surface, field_name, text, received_on} |
+    list_quarantine {case_id} |
+    release_quarantined_text {quarantine_id, released_by, reason, released_on} |
     get_memory_config | sync_memory |
     get_customer_memory {customer_id, as_of?} |
     get_memory_retention {customer_id, as_of?} |
@@ -385,6 +390,7 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
                 damage_notes=payload.get("damage_notes", ""),
                 received_weight_grams=payload.get("received_weight_grams"),
                 wear_evidence=bool(payload.get("wear_evidence", False)),
+                photo_metadata=payload.get("photo_metadata"),
             )
             return {"grading_report": report.model_dump(mode="json")}
         except (LookupError, GradingError, FigureVerificationError) as exc:
@@ -419,6 +425,7 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
                 payload.get("message_type", ""),
                 as_of=date.fromisoformat(payload["as_of"]),
                 model_note=payload.get("model_note"),
+                customer_note=payload.get("customer_note"),
             )
             return {"message": message.model_dump(mode="json")}
         except (LookupError, MessagingError, ModelGatewayError) as exc:
@@ -465,6 +472,57 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         }
     if action == "get_disclosure_pack":
         return {"disclosure_pack": service.get_disclosure_pack().model_dump(mode="json")}
+    if action == "get_screening_pack":
+        return {"screening_pack": service.get_screening_pack().model_dump(mode="json")}
+    if action == "submit_customer_text":
+        try:
+            item = service.submit_customer_text(
+                payload["case_id"],
+                source_surface=payload.get("source_surface", ""),
+                field_name=payload.get("field_name", ""),
+                text=payload.get("text", ""),
+                received_on=date.fromisoformat(payload["received_on"]),
+            )
+            view = service.quarantine_view_for(item.quarantine_id)
+            return {
+                "quarantine_item": item.model_dump(mode="json"),
+                "state": service.quarantine_state(item),
+                "view": view.model_dump(mode="json") if view else None,
+            }
+        except (LookupError, QuarantineError) as exc:
+            return {"error": str(exc)}
+    if action == "list_quarantine":
+        items = service.list_quarantine_items(payload["case_id"])
+        views = {v.quarantine_id: v for v in service.list_quarantine_views(payload["case_id"])}
+        return {
+            "items": [
+                {
+                    **item.model_dump(mode="json"),
+                    "state": service.quarantine_state(item),
+                    "view": (
+                        views[item.quarantine_id].model_dump(mode="json")
+                        if item.quarantine_id in views
+                        else None
+                    ),
+                }
+                for item in items
+            ],
+            "acts": [
+                a.model_dump(mode="json")
+                for a in service.list_quarantine_acts(payload["case_id"])
+            ],
+        }
+    if action == "release_quarantined_text":
+        try:
+            view = service.release_quarantined_text(
+                payload["quarantine_id"],
+                released_by=payload.get("released_by", ""),
+                reason=payload.get("reason", ""),
+                released_on=date.fromisoformat(payload["released_on"]),
+            )
+            return {"view": view.model_dump(mode="json")}
+        except (LookupError, QuarantineError) as exc:
+            return {"error": str(exc)}
     if action == "get_memory_config":
         return {"memory_pack": service.get_memory_pack().model_dump(mode="json")}
     if action == "sync_memory":

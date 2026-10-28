@@ -139,6 +139,19 @@ from .payments import (
     approval_tier,
 )
 from .policy import PolicyPack, load_policy_pack
+from .quarantine import (
+    SOURCE_GRADING_DAMAGE_NOTES,
+    SOURCE_INTAKE_NOTE,
+    SOURCE_MESSAGE_NOTE,
+    SOURCE_PHOTO_METADATA,
+    QuarantineBook,
+    QuarantineError,
+    QuarantineItem,
+    QuarantineReleaseAct,
+    ReleasedTextView,
+    ScreeningPack,
+    load_screening_pack,
+)
 from .refunds import compute_refund, verify_computation
 from .seed import CATALOGUE, HISTORY_CASES, HISTORY_ORDERS, ORDERS, PRODUCT_WEIGHTS_GRAMS
 from .store import Store
@@ -235,6 +248,7 @@ class CaseService:
         disclosure_pack: DisclosurePack | None = None,
         memory_pack: MemoryPack | None = None,
         memory_port: MemoryPort | None = None,
+        screening_pack: ScreeningPack | None = None,
     ):
         self._store = store
         # The model gateway (R12): the ONE path every model-shaped
@@ -293,6 +307,12 @@ class CaseService:
         # A denial is recorded with the policy's id and the handler
         # is never reached.
         self._gateway_policy = gateway_policy_pack or load_gateway_policy_pack()
+        # The injection quarantine (R15): every customer-controlled
+        # text lands in the QuarantineBook over this store BEFORE
+        # any engine reads the submission that carried it, and the
+        # book is the only path back out — as released views. The
+        # service never touches the store's raw quarantine rows.
+        self._quarantine = QuarantineBook(store, screening_pack or load_screening_pack())
         # The tool gateway (R6, generalized R11): the ONLY path
         # tool-shaped actions take — carrier tools, refund execution
         # and the grading callback alike. Handlers are the _tool_*
@@ -360,6 +380,26 @@ class CaseService:
         order = Order.model_validate(order_payload)
         product = CATALOGUE.get(request.sku)
 
+        # The customer's free-text note (R15) lands in quarantine
+        # FIRST — before any engine reads this request — and is
+        # stripped from the request of record: the engines evaluate
+        # the stripped request, so raw customer text reaches no
+        # decision, computation or score. What the summary may
+        # quote is the note's RELEASED VIEW, and only that.
+        note_view: ReleasedTextView | None = None
+        if request.customer_note and request.customer_note.strip():
+            item = self._quarantine.submit(
+                case_id=case_id_for(request.request_id),
+                source_surface=SOURCE_INTAKE_NOTE,
+                field_name="customer_note",
+                text=request.customer_note,
+                received_on=request.requested_on,
+            )
+            note_view = self._quarantine.view_for(item.quarantine_id)
+            request = request.model_copy(
+                update={"customer_note": "", "note_quarantine_id": item.quarantine_id}
+            )
+
         decision = evaluate(self._pack, order, product, request)
         self._store.put_decision(decision.model_dump(mode="json"))
 
@@ -387,7 +427,9 @@ class CaseService:
         fraud_state = derive_fraud_state(score.band, current_score_id=score.score_id, reviews=[])
 
         product_name = product.name if product else request.sku
-        summary_text = self._compose_summary_text(decision, computation, product_name)
+        summary_text = self._compose_summary_text(
+            decision, computation, product_name, customer_view=note_view
+        )
         violations = verify_summary(summary_text, decision, computation)
         case = ReturnCase(
             case_id=case_id_for(request.request_id),
@@ -439,6 +481,7 @@ class CaseService:
         computation: RefundComputation,
         product_name: str,
         label: ReturnLabel | None = None,
+        customer_view: ReleasedTextView | None = None,
     ) -> str:
         """The ONE summary composition path (R8): the return_summary
         template's body. With a label, the label composer's text
@@ -446,14 +489,101 @@ class CaseService:
         composer's (the R2 text quoting the computation); otherwise
         the R1 composer's. Every surface that (re-)issues a summary
         — ingest, label issuance, grading, message drafting — goes
-        through here, so the text can never diverge between them."""
+        through here, so the text can never diverge between them.
+
+        The customer's own words (R15) may close the summary as an
+        attributed quote — but ONLY as a quarantine released view's
+        render text, appended after composition and inside the same
+        figure verification as everything else. A case whose note
+        is held has no quote: held text has no downstream form."""
         label_composer = getattr(self._model, "compose_label_summary", None)
         refund_composer = getattr(self._model, "compose_refund_summary", None)
         if label is not None and label_composer is not None:
-            return label_composer(decision, product_name, computation, label)
-        if refund_composer is not None and decision.eligible:
-            return refund_composer(decision, product_name, computation)
-        return self._model.compose_summary(decision, product_name)
+            text = label_composer(decision, product_name, computation, label)
+        elif refund_composer is not None and decision.eligible:
+            text = refund_composer(decision, product_name, computation)
+        else:
+            text = self._model.compose_summary(decision, product_name)
+        if customer_view is not None:
+            text += self._customer_quote_suffix(customer_view)
+        return text
+
+    @staticmethod
+    def _customer_quote_suffix(view: ReleasedTextView) -> str:
+        """The attributed quote block for a released customer text:
+        the view's render form, marked as the customer's words. The
+        render form is the guarantee — verbatim for clean text,
+        masked where the pack masks, figures neutralised where a
+        named act released a held text."""
+        return f' You told us: "{view.render_text}"'
+
+    def _intake_note_view(self, case_id: str) -> ReleasedTextView | None:
+        """The released view standing for a case's intake note, if
+        one exists — the read the summary re-issue paths (label,
+        grading) use so a re-issued summary quotes exactly what the
+        original quoted."""
+        return self._quarantine.view_for_slot(case_id, SOURCE_INTAKE_NOTE, "customer_note")
+
+    # -- injection quarantine (R15) --------------------------------------
+    def get_screening_pack(self) -> ScreeningPack:
+        return self._quarantine.pack
+
+    def submit_customer_text(
+        self,
+        case_id: str,
+        *,
+        source_surface: str,
+        field_name: str,
+        text: str,
+        received_on: date,
+    ) -> QuarantineItem:
+        """Land a customer-controlled text in quarantine for a case
+        that exists. (Intake and grading submit against their case
+        as part of their own acts; this is the standing surface for
+        the remaining entry path — text a customer sends against an
+        open case.)"""
+        if self.get_case(case_id) is None:
+            raise LookupError(f"unknown case: {case_id}")
+        return self._quarantine.submit(
+            case_id=case_id,
+            source_surface=source_surface,
+            field_name=field_name,
+            text=text,
+            received_on=received_on,
+        )
+
+    def release_quarantined_text(
+        self,
+        quarantine_id: str,
+        *,
+        released_by: str,
+        reason: str,
+        released_on: date,
+    ) -> ReleasedTextView:
+        """The named staff act that releases a held text — in
+        escaped, data-only form. The book refuses unnamed actors,
+        unstated reasons, non-held items and second releases."""
+        return self._quarantine.release(
+            quarantine_id, released_by=released_by, reason=reason, released_on=released_on
+        )
+
+    def list_quarantine_items(self, case_id: str) -> list[QuarantineItem]:
+        return self._quarantine.items_for_case(case_id)
+
+    def list_all_quarantine_items(self) -> list[QuarantineItem]:
+        return self._quarantine.all_items()
+
+    def list_quarantine_views(self, case_id: str) -> list[ReleasedTextView]:
+        return self._quarantine.views_for_case(case_id)
+
+    def list_quarantine_acts(self, case_id: str) -> list[QuarantineReleaseAct]:
+        return self._quarantine.acts_for_case(case_id)
+
+    def quarantine_view_for(self, quarantine_id: str) -> ReleasedTextView | None:
+        return self._quarantine.view_for(quarantine_id)
+
+    def quarantine_state(self, item: QuarantineItem) -> str:
+        return self._quarantine.state_of(item)
 
     def attach_evidence(self, case_id: str, kind: str, filename: str, content: bytes) -> dict:
         if self._evidence is None:
@@ -1953,6 +2083,7 @@ class CaseService:
         damage_notes: str = "",
         received_weight_grams: int | None = None,
         wear_evidence: bool = False,
+        photo_metadata: dict | None = None,
     ) -> GradingReport:
         """submit_grading_report: the warehouse's grading callback.
         The grading act itself — gates and cascade — is
@@ -1967,6 +2098,7 @@ class CaseService:
             damage_notes=damage_notes,
             received_weight_grams=received_weight_grams,
             wear_evidence=wear_evidence,
+            photo_metadata=photo_metadata,
         )
 
     def _tool_create_label(self, *, call_id: str, case_id: str, issued_on: date) -> ReturnLabel:
@@ -2057,7 +2189,13 @@ class CaseService:
         label_composer = getattr(self._model, "compose_label_summary", None)
         summary_text: str | None = None
         if case.summary is not None and computation is not None and label_composer is not None:
-            text = self._compose_summary_text(decision, computation, product.name, label=label)
+            text = self._compose_summary_text(
+                decision,
+                computation,
+                product.name,
+                label=label,
+                customer_view=self._intake_note_view(case_id),
+            )
             violations = verify_summary(text, decision, computation, label)
             if violations:
                 raise FigureVerificationError(violations)
@@ -2354,6 +2492,7 @@ class CaseService:
         damage_notes: str = "",
         received_weight_grams: int | None = None,
         wear_evidence: bool = False,
+        photo_metadata: dict | None = None,
     ) -> GradingReport:
         """Record the warehouse's grading report for a case.
 
@@ -2376,6 +2515,7 @@ class CaseService:
                 "damage_notes": damage_notes,
                 "received_weight_grams": received_weight_grams,
                 "wear_evidence": wear_evidence,
+                "photo_metadata": photo_metadata,
             },
             case_id=case_id,
             called_on=graded_on,
@@ -2394,6 +2534,7 @@ class CaseService:
         damage_notes: str = "",
         received_weight_grams: int | None = None,
         wear_evidence: bool = False,
+        photo_metadata: dict | None = None,
     ) -> GradingReport:
         """The grading act and its supersession cascade, in order.
 
@@ -2406,7 +2547,10 @@ class CaseService:
         when inspection facts are required — the current disposition
         is HOLD_FOR_INSPECTION, or the graded facts would hold the
         item again — the report records BOTH of them, or it does not
-        finalise.
+        finalise. Once the gates pass, the act's free text (damage
+        notes, photo metadata) routes through the R15 quarantine
+        before the report reads it — as released views, or as named
+        gaps where a field is held.
 
         The cascade then runs in its stated order, each step a new
         linked artefact, the superseded ones never edited:
@@ -2480,6 +2624,58 @@ class CaseService:
             )
         if received_weight_grams is not None and received_weight_grams <= 0:
             raise GradingError("a warehouse weigh-in must be a positive weight in grams")
+
+        # -- the free text routes through quarantine (R15) ------------
+        # Every refusal gate above has passed, so the act will land;
+        # only now do its text fields enter the system. The damage
+        # notes and each photo-metadata field land in quarantine
+        # FIRST, and the grading act reads them ONLY as released
+        # views: a clean field reads verbatim (today's behaviour),
+        # a masked field reads masked, and a HELD field is not read
+        # at all — it is named in the report's gaps, never silently
+        # dropped and never silently used.
+        damage_notes_read = ""
+        photo_metadata_read: dict[str, str] = {}
+        grading_gaps: list[str] = []
+        quarantine_refs: list[str] = []
+        if damage_notes and damage_notes.strip():
+            item = self._quarantine.submit(
+                case_id=case_id,
+                source_surface=SOURCE_GRADING_DAMAGE_NOTES,
+                field_name="damage_notes",
+                text=damage_notes,
+                received_on=graded_on,
+            )
+            quarantine_refs.append(item.quarantine_id)
+            view = self._quarantine.view_for(item.quarantine_id)
+            if view is not None:
+                damage_notes_read = view.render_text
+            else:
+                grading_gaps.append(
+                    f"damage_notes held in quarantine ({item.quarantine_id}): "
+                    "instruction-risk text is not read by the grading service"
+                )
+        for field_name in sorted((photo_metadata or {}).keys()):
+            field_text = (photo_metadata or {})[field_name]
+            if not (field_text and str(field_text).strip()):
+                continue
+            item = self._quarantine.submit(
+                case_id=case_id,
+                source_surface=SOURCE_PHOTO_METADATA,
+                field_name=str(field_name),
+                text=str(field_text),
+                received_on=graded_on,
+            )
+            quarantine_refs.append(item.quarantine_id)
+            view = self._quarantine.view_for(item.quarantine_id)
+            if view is not None:
+                photo_metadata_read[str(field_name)] = view.render_text
+            else:
+                grading_gaps.append(
+                    f"photo_metadata.{field_name} held in quarantine "
+                    f"({item.quarantine_id}): instruction-risk text is not "
+                    "read by the grading service"
+                )
 
         order = self.get_order(case.order_id)
         if order is None:
@@ -2663,7 +2859,11 @@ class CaseService:
             product_name = product.name if product else case.request.sku
             active_label = self.get_active_label(case_id)
             summary_text = self._compose_summary_text(
-                decision, new_computation, product_name, label=active_label
+                decision,
+                new_computation,
+                product_name,
+                label=active_label,
+                customer_view=self._intake_note_view(case_id),
             )
             violations = verify_summary(
                 summary_text, decision, new_computation, active_label
@@ -2686,9 +2886,12 @@ class CaseService:
             graded_condition=graded_condition,
             functional_test_result=functional_test_result,
             data_wipe_status=data_wipe_status,
-            damage_notes=damage_notes,
+            damage_notes=damage_notes_read,
             received_weight_grams=received_weight_grams,
             wear_evidence=wear_evidence,
+            photo_metadata=photo_metadata_read,
+            gaps=grading_gaps,
+            quarantine_refs=quarantine_refs,
             grading_pack_version=GRADING_PACK_VERSION,
             superseded_disposition_id=(
                 current_disposition.disposition_id
@@ -3251,7 +3454,11 @@ class CaseService:
 
         if message_type == "return_summary":
             facts.summary_text = self._compose_summary_text(
-                case.decision, facts.computation, facts.product_name, label=facts.label
+                case.decision,
+                facts.computation,
+                facts.product_name,
+                label=facts.label,
+                customer_view=self._intake_note_view(case.case_id),
             )
         elif message_type == "label_instructions":
             if facts.label is None:
@@ -3443,13 +3650,21 @@ class CaseService:
         *,
         as_of: date,
         model_note: str | None = None,
+        customer_note: str | None = None,
     ) -> CustomerMessage:
         """Draft a customer message from its type's template over
         the case's current artefacts. `model_note` is the model
         port's free-form slot — appended as the closing paragraph
         and verified with the rest of the text at the verify step.
         Refusals name the gap: an unknown type (no template), a
-        missing prerequisite artefact."""
+        missing prerequisite artefact.
+
+        `customer_note` is CUSTOMER text offered for the message
+        (R15): it lands in quarantine first, and only its RELEASED
+        VIEW's render text is appended, as an attributed quote. A
+        held text refuses the draft outright, naming the quarantine
+        item and the release act — the messaging layer has no path
+        that accepts raw customer text."""
         case = self.get_case(case_id)
         if case is None:
             raise LookupError(f"unknown case: {case_id}")
@@ -3466,8 +3681,30 @@ class CaseService:
             # the case's budget exhausted above all — means no
             # message is drafted at all.
             self._model_gateway.submit_note(case_id=case.case_id, text=model_note)
+        customer_suffix = ""
+        if customer_note is not None and customer_note.strip():
+            item = self._quarantine.submit(
+                case_id=case.case_id,
+                source_surface=SOURCE_MESSAGE_NOTE,
+                field_name="customer_note",
+                text=customer_note,
+                received_on=as_of,
+            )
+            view = self._quarantine.view_for(item.quarantine_id)
+            if view is None:
+                raise MessagingError(
+                    f"the customer text for case {case.case_id} is held in "
+                    f"quarantine ({item.quarantine_id}: "
+                    f"{', '.join(f.finding_id for f in item.findings)}); "
+                    "instruction-risk text enters a message only after a named "
+                    "staff release act, and then only in its escaped form — "
+                    "no message was drafted"
+                )
+            customer_suffix = "\n\n" + self._customer_quote_suffix(view).strip()
         facts = self._message_facts(case, message_type)
         text = TEMPLATES[message_type](facts, model_note)
+        if customer_suffix:
+            text += customer_suffix
         _ctx, refs, fingerprint = self._message_universe(case, message_type, as_of=as_of)
         return self._create_message(
             case, message_type, text, as_of=as_of, refs=refs, fingerprint=fingerprint

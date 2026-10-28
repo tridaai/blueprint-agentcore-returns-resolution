@@ -19,6 +19,7 @@ from .gateway import PolicyDeniedError, ToolError
 from .intake import ReferenceFeed
 from .model_gateway import ModelBudgetError, ModelGatewayError
 from .models import ReturnRequest
+from .quarantine import QuarantineError
 from .service import (
     ApprovalError,
     CarrierError,
@@ -121,6 +122,36 @@ class MessageDraftRequest(BaseModel):
     message_type: str
     as_of: date
     model_note: str | None = None
+    # Customer text offered for the message (R15): it lands in
+    # quarantine first and only its released view is quoted.
+    customer_note: str | None = None
+
+
+class QuarantineSubmitRequest(BaseModel):
+    source_surface: str
+    field_name: str
+    text: str
+    received_on: date
+
+
+class QuarantineReleaseRequest(BaseModel):
+    released_by: str
+    reason: str
+    released_on: date
+
+    @field_validator("released_by")
+    @classmethod
+    def _named(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("releasing a held text requires a named staff member")
+        return v.strip()
+
+    @field_validator("reason")
+    @classmethod
+    def _stated(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("releasing a held text requires a stated reason")
+        return v.strip()
 
 
 class MessageActRequest(BaseModel):
@@ -136,6 +167,9 @@ class GradingRequest(BaseModel):
     damage_notes: str = ""
     received_weight_grams: int | None = None
     wear_evidence: bool = False
+    # Free-text photo-evidence metadata (R15): field name → text.
+    # Each field routes through quarantine before grading reads it.
+    photo_metadata: dict[str, str] | None = None
 
     @field_validator("grader")
     @classmethod
@@ -628,6 +662,7 @@ def create_app(service: CaseService) -> FastAPI:
                 damage_notes=body.damage_notes,
                 received_weight_grams=body.received_weight_grams,
                 wear_evidence=body.wear_evidence,
+                photo_metadata=body.photo_metadata,
             )
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -676,7 +711,11 @@ def create_app(service: CaseService) -> FastAPI:
     def draft_message(case_id: str, body: MessageDraftRequest) -> dict:
         try:
             message = service.draft_message(
-                case_id, body.message_type, as_of=body.as_of, model_note=body.model_note
+                case_id,
+                body.message_type,
+                as_of=body.as_of,
+                model_note=body.model_note,
+                customer_note=body.customer_note,
             )
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -739,6 +778,89 @@ def create_app(service: CaseService) -> FastAPI:
         except MessagingError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return sent.model_dump(mode="json")
+
+    # -- injection quarantine (R15): submit, read, release ---------------
+    @app.get("/quarantine/screening-pack")
+    def screening_pack() -> dict:
+        """The screening pack as data (R15): the rules customer
+        text is judged under, in the pack's own statement."""
+        return service.get_screening_pack().model_dump(mode="json")
+
+    @app.get("/cases/{case_id}/quarantine")
+    def quarantine_for_case(case_id: str) -> dict:
+        """The case's quarantine record — the staff surface. Items
+        carry their original text HERE (the operations API is where
+        a release decision is made from); the console's read model
+        never receives it. Views and acts stand beside the items."""
+        if service.get_case(case_id) is None:
+            raise HTTPException(status_code=404, detail="case not found")
+        items = service.list_quarantine_items(case_id)
+        views = {v.quarantine_id: v for v in service.list_quarantine_views(case_id)}
+        return {
+            "items": [
+                {
+                    **item.model_dump(mode="json"),
+                    "state": service.quarantine_state(item),
+                    "view": (
+                        views[item.quarantine_id].model_dump(mode="json")
+                        if item.quarantine_id in views
+                        else None
+                    ),
+                }
+                for item in items
+            ],
+            "acts": [a.model_dump(mode="json") for a in service.list_quarantine_acts(case_id)],
+        }
+
+    @app.post("/cases/{case_id}/quarantine", status_code=201)
+    def submit_quarantine_text(case_id: str, body: QuarantineSubmitRequest) -> dict:
+        """Land a customer text sent against an open case in
+        quarantine. The response is the item: findings, risk, and
+        the released view where one was minted automatically."""
+        try:
+            item = service.submit_customer_text(
+                case_id,
+                source_surface=body.source_surface,
+                field_name=body.field_name,
+                text=body.text,
+                received_on=body.received_on,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except QuarantineError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        view = service.quarantine_view_for(item.quarantine_id)
+        return {
+            **item.model_dump(mode="json"),
+            "state": service.quarantine_state(item),
+            "view": view.model_dump(mode="json") if view else None,
+        }
+
+    @app.post("/cases/{case_id}/quarantine/{quarantine_id}/release", status_code=201)
+    def release_quarantine_text(
+        case_id: str, quarantine_id: str, body: QuarantineReleaseRequest
+    ) -> dict:
+        """The named staff release act for a held text. The view it
+        returns is the escaped, data-only form — the act opens the
+        text to reading, never to obedience."""
+        item = next(
+            (i for i in service.list_quarantine_items(case_id) if i.quarantine_id == quarantine_id),
+            None,
+        )
+        if item is None:
+            raise HTTPException(status_code=404, detail="quarantine item not found")
+        try:
+            view = service.release_quarantined_text(
+                quarantine_id,
+                released_by=body.released_by,
+                reason=body.reason,
+                released_on=body.released_on,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except QuarantineError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return view.model_dump(mode="json")
 
     # -- customer memory (R9): scoped reads, retention, access log --------
     @app.get("/memory/config")

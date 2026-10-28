@@ -255,6 +255,7 @@ TOOL_DEFINITIONS: list[ToolDefinition] = [
                 "damage_notes": {"type": "string"},
                 "received_weight_grams": {"type": ["integer", "null"]},
                 "wear_evidence": {"type": "boolean"},
+                "photo_metadata": {"type": ["object", "null"]},
             },
             "required": ["case_id", "grader", "graded_condition", "graded_on"],
         },
