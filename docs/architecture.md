@@ -492,9 +492,47 @@ dialect's row order. `scripts/prod_smoke.py` is the deploy-shaped
 check: a Runtime subprocess and the API on one store walk a planted
 case across every round's machinery over HTTP and print the ledger.
 
+## The gateway and the policy pack (R11)
+
+R6 built the gateway as the carrier tools' road; R11 makes it the
+only road. Every tool-shaped operation — the four carrier tools,
+refund execution, the warehouse grading callback — is a named
+tool with an MCP-style definition, invoked through one path, and
+recorded in one invocation log: tool, case, actor, digests of the
+arguments and of the result, outcome. The money tool adds a
+prepared-execution contract on top: the service's governed flow
+prepares an execution record (gates passed, status `executing`),
+and the handler verifies that record — case, computation, amount —
+before the payments port is called, so a bare tool invocation
+cannot become a money path that skips the ledger.
+
+In front of the handlers stands the policy pack
+(`gateway_policy.py`): versioned data in the Cedar shape — named
+policies, each governing named tools under one stated deny
+condition over a closed kind vocabulary (actor blocked, actor
+permit, required fact, amount-not-above-fact, per-role amount
+cap) — evaluated first-match in pack order by a small evaluator
+in code. The service builds the facts from the artefacts of
+record; an unestablishable fact denies. The pack governs actors
+on every tool and the money tool's state and arguments; the
+carrier handlers keep their own state gates as the second line,
+so their named domain refusals (ineligible, fraud-held) survive
+unchanged behind the pack.
+
+The denial shape is AgentCore's, mirrored deliberately: a Policy
+denial is not an HTTP error. The transport succeeds and the
+denial rides back as a JSON-RPC error payload, code -32002,
+naming the denying policy; the invocation stands in the log with
+status `denied` and that policy id, and the handler never ran.
+The harness hermeticity fix belongs to this round too: every
+Postgres harness schema now carries a run-scoped suffix and the
+migration ledger write is conflict-tolerant, because a gate that
+only passes on a fresh cluster is grading the cluster, not the
+code.
+
 ## What is deliberately not here yet
 
-Injection quarantine, the full Gateway + Policy ports (R11),
-model cost ledger, console, access control, reporting, carrier
-exceptions, red team, deploy artefacts. The README's honest status
-is the authoritative per-round account.
+Injection quarantine, model cost ledger, console, access
+control, reporting, carrier exceptions, red team, deploy
+artefacts. The README's honest status is the authoritative
+per-round account.
