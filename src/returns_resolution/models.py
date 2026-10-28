@@ -702,22 +702,29 @@ class CarrierEvent(BaseModel):
 
 
 class ToolCallRecord(BaseModel):
-    """One gateway tool invocation, on the record (R6).
+    """One gateway tool invocation, on the record (R6, extended R11).
 
-    Every call through the ToolGateway — success or refusal — is
-    stored: the tool, the case it acted on, a hash of the exact
-    inputs, the outcome, and what the call produced or why it
-    refused. This is the audit trail Law 6 asks for: carrier and
-    label actions happen only as recorded tool calls.
+    Every call through the gateway — success, refusal or policy
+    denial — is stored: the tool, the case it acted on, the actor
+    who invoked it, a hash of the exact inputs, the outcome, a hash
+    of the result where one was produced, and what the call
+    produced or why it refused. A policy denial records the denying
+    policy's id (`policy_id`) and stands with status "denied": the
+    invocation log is the audit surface for the gateway, permitted
+    and denied calls alike. This is the audit trail Law 6 asks for:
+    tool-shaped actions happen only as recorded tool calls.
     """
 
     call_id: str
     tool: str
     case_id: str
     inputs_hash: str
-    status: str  # ok | error
+    status: str  # ok | error | denied (R11: a gateway policy denial)
     called_on: date
+    actor: str = "staff"  # R11: who invoked (gateway_policy actors)
     result_ref: str | None = None
+    result_hash: str | None = None  # R11: digest of the produced result
+    policy_id: str | None = None  # R11: the denying policy, on a denial
     error: str | None = None
 
 
