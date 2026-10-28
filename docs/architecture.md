@@ -570,8 +570,34 @@ pack also states the runaway guard: a per-case call budget,
 enforced before the profile is reached, refused with the budget
 named, recorded without consuming budget.
 
+## The operations console (R13)
+
+The console is a view over the record, never a second workflow.
+One static HTML file (`console.html`, inline CSS and vanilla
+JavaScript, no build step) is served by the API, and a dedicated
+read model (`console.py`) assembles what it renders from the
+service's artefacts: the board groups cases by the furthest
+recorded lifecycle stage, the detail view walks one case's
+artefact chain in workflow order, the queues are derived from
+stored state (an open review hold, an unsatisfied approval tier,
+an open recovery adjustment), the money view lists the receipt
+and adjustment rows its totals sum, and the gateway view renders
+the invocation log and policy pack.
+
+Two narrowings are deliberate. First, the read model carries an
+assessment's id, total, band and provenance — never its detailed
+payload — so the browser never receives the internal vocabulary
+the messaging disclosure rules protect; a correctness check
+executes the console's own JavaScript against a seeded store and
+proves the money sums and the exact review queue, and scans the
+static file for that vocabulary. Second, the console's only
+mutations are the acts the API already gates — a named fraud
+review and a named refund approval, posted to the existing
+endpoints with the page's stated operator. Identity remains a
+stated actor until R16; the console builds no login.
+
 ## What is deliberately not here yet
 
-Injection quarantine, console, access control, reporting,
+Injection quarantine, access control, reporting,
 carrier exceptions, red team, deploy artefacts. The README's
 honest status is the authoritative per-round account.

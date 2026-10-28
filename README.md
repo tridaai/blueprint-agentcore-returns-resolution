@@ -131,6 +131,15 @@ AWS's own retail demos stop at the shopping cart. Post-purchase — returns, ref
 - **The cost ledger.** Every gateway call — composed, noted, rejected, refused, failed — is a `CostEntry` artefact (migration 0010): profile, model id, purpose, usage (the envelope's metering report for hosted profiles; the gateway's stated estimate, labelled as such, where no envelope exists), the unit prices pinned from a **versioned price pack** (`2026.10.1`), and the cost computed in code from them — never taken from a model's word. Unit prices are sub-cent rate-card data and quantise to the micro-unit; only costs are cents. `verify_cost_ledger` re-performs every entry's arithmetic; a tampered entry is detected. Reads: `GET /model/config`, `GET /model/cost-ledger`, `GET /cases/{id}/cost-ledger`, and the Runtime's `get_model_config` / `get_case_cost_ledger` / `get_cost_ledger` actions.
 - **The runaway guard.** The price pack states a per-case call budget (40 in v1). A drafting call beyond a case's budget is refused with the budget named, and the refusal is recorded as `refused_budget` — refusals don't consume budget, and one case's exhaustion never touches another's. The demo walks the ledger the full case walk accumulates and fires the guard on a two-call budget.
 
+## What R13 adds — the operations console
+
+- **One static file, no build step** — `src/returns_resolution/console.html` is served by the API at `GET /console`: inline CSS and vanilla JavaScript, a light theme, and the Trida footer. It reads a stated operator name and role in the page — the same stated-actor convention the API already uses — and builds no login or identity system (that is R16).
+- **Case board and detail** — cases are grouped by their furthest recorded lifecycle stage (intake, decided, computed, dispositioned, approved, executed, labelled, graded, closed), with counts and artefact figures only. A case detail walks the chain in workflow order: request, order and decision; refund computation lines; disposition chain; approvals, executions and receipts; labels, grading and adjustments; messages with verifier status; memory records; the case cost ledger; and the derived timeline with its named gaps.
+- **Queues an operator can act on** — the review-hold queue carries the review act (named reviewer, coded outcome and reason) through the existing endpoint; the approvals queue shows computed amounts still missing a named approver and records approvals through the existing act; the recovery list shows open `recovery_due` positions. There is no other mutation surface in the console.
+- **Money without new arithmetic** — executed refunds, executed top-ups and outstanding recoveries are sums over the receipt and adjustment artefacts the API returns, each total traceable to the rows listed beneath it. The footer states the rule on the page: the console sums artefact figures; it does not decide a case, price a refund or create a money artefact.
+- **Gateway and policy, visible** — the invocation log (tool, case, actor, outcome, and the denying policy's id on a denial) and the current policy pack are rendered from the gateway reads.
+- **Assessment detail stays out of the browser** — the console's dedicated read model carries an assessment's id, total, band and provenance, never its detailed payload. `make console-check` executes the console's own JavaScript against a seeded store and proves the rendered money totals equal the artefact sums, the review queue is exactly the open holds, and the static file carries none of the banned assessment-internal vocabulary.
+
 ## AgentCore mapping
 
 | AgentCore component | This blueprint | Round |
@@ -143,6 +152,7 @@ AWS's own retail demos stop at the shopping cart. Post-purchase — returns, ref
 | Identity | Customer (3LO) vs staff (2LO) flows separated at the port | R16 |
 | Model gateway | All model-shaped calls behind one gateway port — offline (deterministic), Bedrock-shaped and NIM-shaped profiles, structured outputs only, fail-closed; every call recorded in a cost ledger priced by a versioned pack, with a per-case call budget (hosted profiles stub-tested) | R12 |
 | Evaluations + Observability | Evaluator configs in `infra/`; OTel-shaped spans per case step | R20 |
+| Operations console | One static HTML file over the API: case board + artefact-chain detail, review / approval / recovery queues, money sums over receipts and adjustments, gateway invocation log + policy pack | R13 |
 
 ## Quickstart
 
@@ -151,6 +161,7 @@ make install        # uv sync (or: make install-pip)
 make demo           # eligible + ineligible returns, end to end
 make harness        # the Runtime HTTP contract, exercised locally
 make smoke          # the production smoke: the full lifecycle over HTTP (Postgres when DATABASE_URL is set)
+make console-check  # the R13 console correctness check against a seeded store
 make test           # pytest
 make evals          # the eval gate
 ```
@@ -182,6 +193,7 @@ want an ARM64 image (`docker buildx build --platform linux/arm64`).
 - **Built and gated in R10:** the Postgres production profile — the full suite green on real PostgreSQL via the conftest schema redirect (234 passed, 0 skipped with the test URL set), the eval gate running in-memory + SQLite + Postgres profiles with cross-profile artefact-id parity at zero differences, and the production smoke passing its 21-step HTTP lifecycle ledger on both the Postgres and SQLite profiles. Two dialect defects were found and fixed: SQLite thread-bound connections under threaded API serving, and search_path fall-through masking unmigrated schemas in the harness. Migration ledger 0001–0009 verified on a fresh PG schema; the R7 chain-head resolution and the R9 memory access-log ordering are graded on Postgres explicitly.
 - **Built and gated in R11:** the generalized Gateway port (all tool-shaped operations — carrier tools, refund execution, the grading callback — through the one invocation path, against a local double for AgentCore Gateway), the prepared-execution contract for the money tool, the Policy pack as versioned data evaluated first-match before every invocation with denials recorded by policy id and delivered as HTTP 200 + JSON-RPC −32002 envelopes, and the PG harness hermeticity fix (run-scoped schemas everywhere; conflict-tolerant migration ledger) — graded by forbidden-invocation probes for every policy in the pack, artefact-to-invocation correspondence counters in the eval gate, and double runs of the PG suite and PG eval profiles against one cluster.
 - **Built and gated in R12:** the model gateway (offline / Bedrock-shaped / NIM-shaped profiles behind one port; the offline output byte-identical to the bare model port's, graded) with structured-output validation (invalid hosted responses rejected and recorded, never coerced), fail-closed unreachable profiles (no fallback, graded), the figure verifier still refusing a well-formed hosted response with a wrong figure, and the cost ledger — migration 0010, versioned price pack, per-case call budget with named refusals, re-performable arithmetic with tamper detection — with config and ledger reads on API + Runtime dispatch and the demo's ledger + budget walk.
+- **Built and gated in R13:** the operations console — one static HTML file served at `GET /console`, with board / detail / queues / money / gateway views assembled from artefacts of record by a console-safe read model (`GET /console/data`, `GET /console/cases/{id}`), named approval and review acts only through the existing gated endpoints, and a Node-executed correctness check proving the rendered money sums, the exact review queue, and the absence of banned assessment-internal vocabulary in the static file. Live Bedrock/AgentCore remains stub-tested until an AWS account is wired.
 - **Money still does not really move, parcels neither, and no customer is really written to.** Every execution in this build runs against the payments double, every label against the carrier double, and every message against the messaging double — local stand-ins, labelled on every artefact they produce; production money movement rides the configured AgentCore Payments provider, production labels the retailer's carrier integration behind the Gateway port, and production sending the retailer's messaging provider, none connected here. Memory runs against its local double the same way, and the Gateway and Policy ports are local doubles too: no real AgentCore Gateway or Policy service has been called.
 - **Docker image build was not run** in the build sandbox (no daemon); the Dockerfile and compose file follow the portfolio's verified pattern and are reviewed statically.
 
@@ -211,9 +223,11 @@ src/returns_resolution/
   model_gateway.py the model gateway: profiles, structured outputs, price pack, cost ledger (R12)
   verifier.py      the figure verifier, generalised to the messaging verifier (R8)
   service.py       the one workflow every surface shares
+  console.py       the console-safe read model: board, queues, money, gateway, case detail (R13)
+  console.html     the single-file operations console (R13)
   runtime_app.py   AgentCore Runtime entrypoint (+ contract fallback)
   api.py           FastAPI surface
-scripts/           demo.py, local_harness.py, prod_smoke.py
+scripts/           demo.py, local_harness.py, prod_smoke.py, check_console.py
 evals/             the eval gate
 docs/              architecture.md
 ```

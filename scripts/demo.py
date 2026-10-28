@@ -425,6 +425,36 @@ def main() -> int:
     except _ModelBudgetError as exc:
         print(f"  the runaway guard: a third drafting call for {tcase.case_id} is refused — {exc}")
 
+    print("\n--- operations console (R13; the same record, as an operator view) ---")
+    from collections import Counter
+    from decimal import Decimal as _Decimal
+
+    from returns_resolution.console import build_console_data as _console_data
+
+    console = _console_data(service)
+    stages = Counter(row["stage"] for row in console["cases"])
+    print(
+        "  board: "
+        + ", ".join(f"{stage}={stages[stage]}" for stage in console["stages"] if stages[stage])
+    )
+    print(
+        "  queues: review="
+        f"{[row['case_id'] for row in console['queues']['review']]}, approvals="
+        f"{[row['case_id'] for row in console['queues']['approvals']]}, recovery="
+        f"{[row['case_id'] for row in console['queues']['recovery']]}"
+    )
+    refunds = sum(
+        _Decimal(row["amount"]) for row in console["money"]["receipts"] if row["kind"] == "refund"
+    )
+    top_ups = sum(
+        _Decimal(row["amount"]) for row in console["money"]["receipts"] if row["kind"] == "top_up"
+    )
+    print(
+        f"  money from receipts of record: refunds ${refunds}, top-ups ${top_ups} "
+        "(the console sums artefact figures; it decides nothing)"
+    )
+    print("  served by the API at GET /console, with its data at GET /console/data")
+
     for case_id in ("CASE-2003", "CASE-2004"):
         case = service.get_case(case_id)
         print(f"\n--- {case_id} summary (figure-verified) ---")
