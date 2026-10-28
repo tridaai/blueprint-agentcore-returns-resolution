@@ -139,9 +139,52 @@ windows make unreachable at intake — the matrix is the disposition
 policy of record for an item that arrives anyway, not an intake-only
 table.
 
+## The fraud scoring pack (R4)
+
+`fraud.py` scores cases for fraud. The pack is versioned data with a
+fail-closed loader: parameters for five signals, their tiers and
+caps, the band thresholds (CLEAR < 25 <= MONITOR < 60 <=
+FRAUD_REVIEW) and the review vocabulary (outcome -> coded reasons).
+The engine is a pure function over *facts read from stored
+artefacts* — the customer's stored orders and stored cases — and
+sums Decimal signal contributions:
+
+- velocity: prior cases inside 90 days beyond an allowance of 2,
+  8 points each, capped at 40;
+- serial-returner share: returned/total orders, tiered to 35, and
+  `insufficient_data` below 4 orders — a share over too little
+  history is named, not computed;
+- wardrobing: wear-category (apparel/footwear) cases declared
+  new-with-tags at 21+ days of ownership, 12 each, capped at 36;
+- weight mismatch: the return's scanned weight vs the product
+  master's shipped weight — ratio under 0.50 scores 30 (empty-box
+  band), under 0.80 scores 10; a missing scan or a missing master
+  weight is `not_computable` naming the input;
+- card churn: distinct tender methods across the customer's
+  orders, tiered to 20; no tender breakdown anywhere on record is
+  `insufficient_data` naming `payment_tender_breakdown`.
+
+A score is a content-addressed artefact pinned to the case, the
+pack version and the input artefact ids under a content
+fingerprint; `verify_fraud_score` re-performs it exactly as the
+refund and disposition verifiers re-perform theirs. Re-scoring is
+supersession by link, never an edit. The case carries a derived
+`fraud_state`: a FRAUD_REVIEW band puts the case in `fraud_review`
+— its disposition stands, its refund path is blocked, and
+`assert_refund_path_open` is the guard the R5 money gates call.
+The only act that changes a blocked state is a recorded
+fraud-review decision: named reviewer, outcome and reason from the
+pack vocabulary, pinned to the score it decides on.
+`confirmed_fraud` is sticky (it survives re-scoring);
+`cleared_with_reason` lifts the block for that score only, and the
+score artefact is never modified by the decision — the arithmetic
+and the act stay separate on the record. History is ordered by
+(requested_on, case_id) with a same-day case-id tie-break, so a
+score never depends on the order cases happened to be ingested in.
+
 ## What is deliberately not here yet
 
-Fraud scoring (R4), approval gates and the
+Approval gates and the
 payments port (R5), carrier tools (R6), warehouse grading (R7),
 messaging verifier depth (R8), Memory port (R9), injection quarantine
 (R10), Gateway + Policy ports (R11), model cost ledger (R12), console
