@@ -27,6 +27,7 @@ from .access import (
     SURFACE_MONEY,
     SURFACE_ORDER,
     SURFACE_QUARANTINE,
+    SURFACE_REPORTS,
     AccessDeniedError,
     Principal,
 )
@@ -36,6 +37,7 @@ from .intake import ReferenceFeed
 from .model_gateway import ModelBudgetError, ModelGatewayError
 from .models import ReturnRequest
 from .quarantine import QuarantineError
+from .reporting import ReportError
 from .service import (
     ApprovalError,
     CarrierError,
@@ -195,6 +197,13 @@ class GradingRequest(BaseModel):
         return v.strip()
 
 
+class ReportComputeRequest(BaseModel):
+    kind: str
+    window_start: date | None = None
+    window_end: date | None = None
+    as_of: date
+
+
 def _order_view(order) -> dict:
     view = order.model_dump(mode="json")
     # Totals are computed properties (never stored), so the API adds
@@ -326,6 +335,95 @@ def create_app(service: CaseService) -> FastAPI:
         except AccessDeniedError as exc:
             _guard(exc)
         return [e.model_dump(mode="json") for e in entries]
+
+    @app.get("/reports/pack")
+    def report_pack() -> dict:
+        """The report pack as data (R17): each report's population
+        rule, window rule and measures — the definitions a stored
+        report's figures are versioned by."""
+        return service.get_report_pack().model_dump(mode="json")
+
+    @app.post("/reports/compute", status_code=201)
+    def compute_report(payload: ReportComputeRequest, request: Request) -> dict:
+        """Compute a report from the artefacts of record (R17).
+        With a principal, the caller must hold the pack's
+        compute_report act — supervisor tier; computing is an
+        act, and the auditor's read-only grant does not cover it."""
+        principal = _principal(request, service, surface=SURFACE_REPORTS, target=payload.kind)
+        try:
+            report = (
+                service.compute_report_as(
+                    principal,
+                    payload.kind,
+                    window_start=payload.window_start,
+                    window_end=payload.window_end,
+                    as_of=payload.as_of,
+                )
+                if principal is not None
+                else service.compute_report(
+                    payload.kind,
+                    window_start=payload.window_start,
+                    window_end=payload.window_end,
+                    as_of=payload.as_of,
+                )
+            )
+        except AccessDeniedError as exc:
+            _guard(exc)
+        except ReportError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return report.model_dump(mode="json")
+
+    @app.get("/reports")
+    def reports(request: Request, kind: str | None = None) -> list[dict]:
+        """The stored reports (R17). A customer principal is
+        refused with the hiding shape — reports are not a
+        customer surface at all."""
+        principal = _principal(request, service, surface=SURFACE_REPORTS, target="reports")
+        try:
+            found = (
+                service.list_reports_as(principal, kind=kind)
+                if principal is not None
+                else service.list_reports(kind=kind)
+            )
+        except AccessDeniedError as exc:
+            _guard(exc, not_found="report not found")
+        return [r.model_dump(mode="json") for r in found]
+
+    @app.get("/reports/{report_id}")
+    def report(report_id: str, request: Request) -> dict:
+        """One stored report. A customer probing a report id —
+        real or invented — gets this endpoint's ordinary
+        not-found shape; existence is never confirmed."""
+        principal = _principal(request, service, surface=SURFACE_REPORTS, target=report_id)
+        if principal is None:
+            found = service.get_report(report_id)
+        else:
+            try:
+                found = service.get_report_as(principal, report_id)
+            except AccessDeniedError as exc:
+                _guard(exc, not_found="report not found")
+        if found is None:
+            raise HTTPException(status_code=404, detail="report not found")
+        return found.model_dump(mode="json")
+
+    @app.get("/reports/{report_id}/verify")
+    def verify_report_endpoint(report_id: str, request: Request) -> dict:
+        """Re-perform one report from the stored record (R17):
+        the figures are recomputed independently and compared;
+        `verified` is true only when the re-performance matches
+        exactly."""
+        principal = _principal(request, service, surface=SURFACE_REPORTS, target=report_id)
+        if principal is None:
+            found = service.get_report(report_id)
+        else:
+            try:
+                found = service.get_report_as(principal, report_id)
+            except AccessDeniedError as exc:
+                _guard(exc, not_found="report not found")
+        if found is None:
+            raise HTTPException(status_code=404, detail="report not found")
+        problems = service.verify_management_report(found)
+        return {"report_id": report_id, "verified": not problems, "problems": problems}
 
     @app.get("/orders")
     def orders(request: Request) -> list[dict]:

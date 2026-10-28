@@ -101,6 +101,7 @@ SURFACE_MEMORY = "memory"
 SURFACE_CONSOLE = "console"
 SURFACE_DENIAL_LOG = "denial_log"
 SURFACE_PACKS = "packs"
+SURFACE_REPORTS = "reports"
 SURFACES = [
     SURFACE_CASE,
     SURFACE_ORDER,
@@ -113,6 +114,7 @@ SURFACES = [
     SURFACE_CONSOLE,
     SURFACE_DENIAL_LOG,
     SURFACE_PACKS,
+    SURFACE_REPORTS,
 ]
 
 # Acts — the named operations the pack gates. These are the
@@ -124,6 +126,7 @@ ACT_EXECUTE_REFUND = "execute_refund"
 ACT_APPROVE_REFUND = "approve_refund"
 ACT_CONFIRM_FRAUD_REVIEW = "confirm_fraud_review"
 ACT_RELEASE_QUARANTINE = "release_quarantine"
+ACT_COMPUTE_REPORT = "compute_report"
 ACTS = [
     ACT_INTAKE_RETURN,
     ACT_MANAGE_CASE,
@@ -131,6 +134,7 @@ ACTS = [
     ACT_APPROVE_REFUND,
     ACT_CONFIRM_FRAUD_REVIEW,
     ACT_RELEASE_QUARANTINE,
+    ACT_COMPUTE_REPORT,
 ]
 
 # Denial reasons — the closed vocabulary of the denial log.
@@ -268,7 +272,7 @@ ACCESS_PACK_V1 = AccessPack(
         RoleGrant(
             role=ROLE_STAFF_SUPERVISOR,
             read_surfaces=_STAFF_READS
-            + [SURFACE_FRAUD, SURFACE_COST_LEDGER, SURFACE_DENIAL_LOG],
+            + [SURFACE_FRAUD, SURFACE_COST_LEDGER, SURFACE_DENIAL_LOG, SURFACE_REPORTS],
             acts=list(ACTS),
         ),
         RoleGrant(
@@ -310,6 +314,7 @@ ACCESS_PACK_V1 = AccessPack(
             ROLE_SYSTEM,
         ],
         ACT_RELEASE_QUARANTINE: [ROLE_STAFF_SUPERVISOR, ROLE_SYSTEM],
+        ACT_COMPUTE_REPORT: [ROLE_STAFF_SUPERVISOR, ROLE_SYSTEM],
     },
 )
 

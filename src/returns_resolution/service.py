@@ -16,6 +16,7 @@ from decimal import Decimal
 
 from .access import (
     ACT_APPROVE_REFUND,
+    ACT_COMPUTE_REPORT,
     ACT_CONFIRM_FRAUD_REVIEW,
     ACT_EXECUTE_REFUND,
     ACT_INTAKE_RETURN,
@@ -33,6 +34,7 @@ from .access import (
     SURFACE_MONEY,
     SURFACE_ORDER,
     SURFACE_QUARANTINE,
+    SURFACE_REPORTS,
     AccessControl,
     AccessDeniedError,
     AccessPack,
@@ -178,6 +180,13 @@ from .quarantine import (
     load_screening_pack,
 )
 from .refunds import compute_refund, verify_computation
+from .reporting import (
+    ManagementReport,
+    ReportPack,
+    build_report,
+    load_report_pack,
+    verify_report,
+)
 from .seed import CATALOGUE, HISTORY_CASES, HISTORY_ORDERS, ORDERS, PRODUCT_WEIGHTS_GRAMS
 from .store import Store
 from .timeline import build_timeline
@@ -657,6 +666,135 @@ class CaseService:
             principal, SURFACE_DENIAL_LOG, target="access_denials", on=on
         )
         return self._access.denials()
+
+    # -- management reporting (R17) ----------------------------------
+    # The unguarded methods are the trusted-local face (what the
+    # surfaces gate); the *_as methods are the principal-carrying
+    # face under the access pack's reports surface.
+
+    def get_report_pack(self) -> ReportPack:
+        return load_report_pack()
+
+    def _report_head(
+        self, kind: str, window_start: date | None, window_end: date | None, as_of: date
+    ) -> ManagementReport | None:
+        """The current report for one (kind, window, as-of) key:
+        the stored report no other stored report supersedes."""
+        candidates = [
+            r
+            for r in self.list_reports()
+            if r.kind == kind
+            and r.window_start == window_start
+            and r.window_end == window_end
+            and r.as_of == as_of
+        ]
+        if not candidates:
+            return None
+        superseded = {r.supersedes for r in candidates if r.supersedes}
+        heads = [r for r in candidates if r.report_id not in superseded]
+        return heads[-1] if heads else candidates[-1]
+
+    def compute_report(
+        self,
+        kind: str,
+        *,
+        window_start: date | None = None,
+        window_end: date | None = None,
+        as_of: date,
+    ) -> ManagementReport:
+        """Compute a report from the artefacts of record and store
+        it. Idempotent over unchanged inputs: the recomputation
+        whose fingerprint equals the standing head's returns the
+        standing artefact. Over moved inputs it mints a new
+        artefact linked by `supersedes` — a report is never
+        edited, exactly like every other artefact here."""
+        report = build_report(
+            self, kind, window_start=window_start, window_end=window_end, as_of=as_of
+        )
+        head = self._report_head(kind, report.window_start, report.window_end, as_of)
+        if head is not None and head.report_id == report.report_id:
+            return head
+        if head is not None:
+            report = report.model_copy(update={"supersedes": head.report_id})
+        self._store.put_management_report(report.model_dump(mode="json"))
+        return report
+
+    def get_report(self, report_id: str) -> ManagementReport | None:
+        payload = self._store.get_management_report(report_id)
+        return ManagementReport.model_validate(payload) if payload else None
+
+    def list_reports(self, *, kind: str | None = None) -> list[ManagementReport]:
+        reports = [
+            ManagementReport.model_validate(p)
+            for p in self._store.list_management_reports()
+        ]
+        if kind is not None:
+            reports = [r for r in reports if r.kind == kind]
+        return reports
+
+    def verify_management_report(self, report: ManagementReport) -> list[str]:
+        """Re-perform one report from the stored record; []
+        states the report is exactly reproducible."""
+        return verify_report(self, report)
+
+    def compute_report_as(
+        self,
+        principal: Principal,
+        kind: str,
+        *,
+        window_start: date | None = None,
+        window_end: date | None = None,
+        as_of: date,
+        on: date | None = None,
+    ) -> ManagementReport:
+        """Compute as a principal: the pack's compute_report act —
+        supervisor and system only; the auditor reads reports but
+        computing one is refused read_only_role."""
+        self._access.require_act(principal, ACT_COMPUTE_REPORT, target=kind, on=on)
+        return self.compute_report(
+            kind, window_start=window_start, window_end=window_end, as_of=as_of
+        )
+
+    def get_report_as(
+        self, principal: Principal, report_id: str, *, on: date | None = None
+    ) -> ManagementReport | None:
+        """One report as a principal. Reports are not
+        customer-visible at all: a customer principal is refused
+        with the existence-hiding denial whether or not the id
+        exists — the surfaces render it as the not-found shape,
+        so a probe learns nothing. Other roles route through the
+        pack's reports surface grant."""
+        if principal.role == ROLE_CUSTOMER:
+            self._access.deny(
+                principal_id=principal.id,
+                role=principal.role,
+                surface=SURFACE_REPORTS,
+                target=report_id,
+                reason=REASON_CASE_NOT_VISIBLE,
+                detail="reports are not visible to customer principals",
+                on=on,
+            )
+        self._access.require_read(principal, SURFACE_REPORTS, target=report_id, on=on)
+        return self.get_report(report_id)
+
+    def list_reports_as(
+        self, principal: Principal, *, kind: str | None = None, on: date | None = None
+    ) -> list[ManagementReport]:
+        """The report list as a principal. A customer is refused
+        with the hiding denial — the list's existence is itself
+        staff-side."""
+        if principal.role == ROLE_CUSTOMER:
+            self._access.deny(
+                principal_id=principal.id,
+                role=principal.role,
+                surface=SURFACE_REPORTS,
+                target="reports",
+                reason=REASON_CASE_NOT_VISIBLE,
+                detail="reports are not visible to customer principals",
+                on=on,
+            )
+        self._access.require_read(principal, SURFACE_REPORTS, target="reports", on=on)
+        return self.list_reports(kind=kind)
 
     def _hide_case(self, principal: Principal, case_id: str, *, surface: str, on) -> None:
         """Record a case-visibility denial and raise it. The

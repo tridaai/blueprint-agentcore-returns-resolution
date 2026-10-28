@@ -25,6 +25,7 @@ from .access import (
     SURFACE_GATEWAY,
     SURFACE_MONEY,
     SURFACE_QUARANTINE,
+    SURFACE_REPORTS,
     AccessDeniedError,
 )
 from .config import Config
@@ -35,6 +36,7 @@ from .modelport import OfflineComposer
 from .models import ReturnRequest
 from .gateway import PolicyDeniedError, ToolError
 from .quarantine import QuarantineError
+from .reporting import ReportError
 from .service import (
     ApprovalError,
     CarrierError,
@@ -127,7 +129,11 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
     get_memory_retention {customer_id, as_of?} |
     list_memory_access_log {customer_id?} |
     score_case_from_memory {case_id} |
-    get_access_pack | list_access_denials.
+    get_access_pack | list_access_denials |
+    get_report_pack |
+    compute_report {kind, window_start?, window_end?, as_of} |
+    get_report {report_id} | list_reports {kind?} |
+    verify_report {report_id}.
 
     Any action may carry a principal (R16): payload["principal"]
     = {"id": ..., "role": ...}. A carried principal is
@@ -834,6 +840,71 @@ def handle_payload(service: CaseService, payload: dict[str, Any]) -> dict[str, A
         else:
             entries = service.list_access_denials()
         return {"access_denials": [e.model_dump(mode="json") for e in entries]}
+    if action == "get_report_pack":
+        return {"report_pack": service.get_report_pack().model_dump(mode="json")}
+    if action == "compute_report":
+        window_start = (
+            date.fromisoformat(payload["window_start"]) if payload.get("window_start") else None
+        )
+        window_end = (
+            date.fromisoformat(payload["window_end"]) if payload.get("window_end") else None
+        )
+        as_of = date.fromisoformat(payload["as_of"])
+        try:
+            if principal is not None:
+                report = service.compute_report_as(
+                    principal,
+                    payload["kind"],
+                    window_start=window_start,
+                    window_end=window_end,
+                    as_of=as_of,
+                )
+            else:
+                report = service.compute_report(
+                    payload["kind"],
+                    window_start=window_start,
+                    window_end=window_end,
+                    as_of=as_of,
+                )
+        except AccessDeniedError as exc:
+            return _denied(exc, {"report": None})
+        except ReportError as exc:
+            return {"error": str(exc)}
+        return {"report": report.model_dump(mode="json")}
+    if action == "get_report":
+        if principal is not None:
+            try:
+                found = service.get_report_as(principal, payload["report_id"])
+            except AccessDeniedError as exc:
+                return _denied(exc, {"report": None})
+        else:
+            found = service.get_report(payload["report_id"])
+        return {"report": found.model_dump(mode="json") if found else None}
+    if action == "list_reports":
+        if principal is not None:
+            try:
+                found = service.list_reports_as(principal, kind=payload.get("kind"))
+            except AccessDeniedError as exc:
+                return _denied(exc, {"reports": []})
+        else:
+            found = service.list_reports(kind=payload.get("kind"))
+        return {"reports": [r.model_dump(mode="json") for r in found]}
+    if action == "verify_report":
+        if principal is not None:
+            try:
+                found = service.get_report_as(principal, payload["report_id"])
+            except AccessDeniedError as exc:
+                return _denied(exc, {"report": None})
+        else:
+            found = service.get_report(payload["report_id"])
+        if found is None:
+            return {"report": None}
+        problems = service.verify_management_report(found)
+        return {
+            "report_id": found.report_id,
+            "verified": not problems,
+            "problems": problems,
+        }
     return {"error": f"unknown action: {action}"}
 
 
