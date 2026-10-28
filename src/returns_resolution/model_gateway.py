@@ -77,7 +77,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Callable, Protocol
 
 from pydantic import BaseModel, field_validator
@@ -135,6 +135,17 @@ class ModelProfileUnavailableError(ModelGatewayError):
 # ---------------------------------------------------------------------------
 
 
+PRICE_QUANTUM = Decimal("0.000001")
+
+
+def unit_price(value: Decimal | str | int) -> Decimal:
+    """Quantise a per-1k-token unit price. Unit prices are
+    sub-cent rate-card data (thousandths of a cent and up), so
+    they quantise to the micro-unit — NEVER to cents: the cost
+    they produce is money, the prices themselves are not."""
+    return Decimal(value).quantize(PRICE_QUANTUM, rounding=ROUND_HALF_UP)
+
+
 class ProfilePrice(BaseModel):
     """One profile's rate card: prices per 1,000 tokens, as data.
 
@@ -151,8 +162,8 @@ class ProfilePrice(BaseModel):
 
     @field_validator("input_per_1k", "output_per_1k", mode="before")
     @classmethod
-    def _money(cls, v: object) -> Decimal:
-        return money(Decimal(str(v)))
+    def _price(cls, v: object) -> Decimal:
+        return unit_price(Decimal(str(v)))
 
 
 class PricePack(BaseModel):
@@ -248,7 +259,12 @@ class CostEntry(BaseModel):
     price_pack_version: str
     detail: str = ""
 
-    @field_validator("input_per_1k", "output_per_1k", "cost", mode="before")
+    @field_validator("input_per_1k", "output_per_1k", mode="before")
+    @classmethod
+    def _price(cls, v: object) -> Decimal:
+        return unit_price(Decimal(str(v)))
+
+    @field_validator("cost", mode="before")
     @classmethod
     def _money(cls, v: object) -> Decimal:
         return money(Decimal(str(v)))
