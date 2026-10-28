@@ -50,7 +50,9 @@ planted feed / POST /returns / Runtime invocation
 - **Evaluations**: the local eval gate (`evals/run_evals.py`) is the
   R1 stand-in for AgentCore Evaluations — same discipline (planted
   truth, zero-tolerance counters), run in CI-shaped form locally.
-  Evaluator configs for the live service land with the deploy round.
+  No live evaluator configs are wired in this build — through
+  the R20 freeze, the local gate is the evaluation artefact
+  that ships.
 
 ## Data and stores
 
@@ -948,7 +950,12 @@ carry, each bought by an attack in `docs/red-team.md`:
   compares the bound computation to the case's current
   computation of record, not to the chain's membership.
 
-## What is deliberately not here yet
+## What is deliberately not here
 
-Deploy artefacts. The README's honest status is the
-authoritative per-round account.
+Live provider wiring. The deploy artefacts — the multi-stage
+Dockerfile and the compose stack — have shipped since the R1
+scaffold; what is not here is a connected AWS account and the
+real providers behind the ports (Payments, Gateway, Policy,
+Memory, the carrier and messaging integrations), each
+represented by a labelled local double. The README's honest
+status is the authoritative per-round account.
