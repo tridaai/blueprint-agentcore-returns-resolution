@@ -134,12 +134,47 @@ CREATE TABLE IF NOT EXISTS refund_receipts (
 );
 """
 
+# Migration 0006 — carrier artefacts + tool-call records (R6).
+# Labels are a chain per case (a fresh label supersedes a voided
+# one), so the case key is NOT unique; the carrier reference is.
+# Voids are one per label; pickups and call records are append-only
+# acts.
+_MIGRATION_0006_SQLITE = """
+CREATE TABLE IF NOT EXISTS return_labels (
+    label_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    carrier_ref TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS label_voids (
+    void_id TEXT PRIMARY KEY,
+    label_id TEXT NOT NULL UNIQUE,
+    case_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pickups (
+    pickup_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    label_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tool_calls (
+    call_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("0001", _MIGRATION_0001_SQLITE, _MIGRATION_0001_PG),
     ("0002", _MIGRATION_0002_SQLITE, _MIGRATION_0002_SQLITE),
     ("0003", _MIGRATION_0003_SQLITE, _MIGRATION_0003_SQLITE),
     ("0004", _MIGRATION_0004_SQLITE, _MIGRATION_0004_SQLITE),
     ("0005", _MIGRATION_0005_SQLITE, _MIGRATION_0005_SQLITE),
+    ("0006", _MIGRATION_0006_SQLITE, _MIGRATION_0006_SQLITE),
 ]
 
 
@@ -183,6 +218,18 @@ class Store(Protocol):
     def get_receipt_by_computation(self, computation_id: str) -> dict[str, Any] | None: ...
     def get_receipt_for_case(self, case_id: str) -> dict[str, Any] | None: ...
     def list_receipts(self) -> list[dict[str, Any]]: ...
+    def put_label(self, payload: dict[str, Any]) -> None: ...
+    def get_label(self, label_id: str) -> dict[str, Any] | None: ...
+    def list_labels(self, case_id: str) -> list[dict[str, Any]]: ...
+    def list_all_labels(self) -> list[dict[str, Any]]: ...
+    def put_void(self, payload: dict[str, Any]) -> None: ...
+    def get_void_by_label(self, label_id: str) -> dict[str, Any] | None: ...
+    def list_voids(self, case_id: str) -> list[dict[str, Any]]: ...
+    def put_pickup(self, payload: dict[str, Any]) -> None: ...
+    def list_pickups(self, case_id: str) -> list[dict[str, Any]]: ...
+    def put_tool_call(self, payload: dict[str, Any]) -> None: ...
+    def list_tool_calls(self, case_id: str) -> list[dict[str, Any]]: ...
+    def count_tool_calls(self, case_id: str) -> int: ...
 
 
 class SqlStore:
@@ -593,6 +640,125 @@ class SqlStore:
         rows = self._query("SELECT payload FROM refund_receipts ORDER BY case_id, receipt_id")
         return [json.loads(r["payload"]) for r in rows]
 
+    # -- labels, voids, pickups, tool calls (R6) -------------------------
+    def put_label(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO return_labels (label_id, case_id, carrier_ref, status, payload) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (label_id) DO UPDATE SET "
+            "status = excluded.status, payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO return_labels (label_id, case_id, carrier_ref, status, payload) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (label_id) DO UPDATE SET "
+            "status = EXCLUDED.status, payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["label_id"],
+                payload["case_id"],
+                payload["carrier_ref"],
+                payload["status"],
+                json.dumps(payload),
+            ),
+        )
+
+    def get_label(self, label_id: str) -> dict[str, Any] | None:
+        row = self._query_one("SELECT payload FROM return_labels WHERE label_id = ?", (label_id,))
+        return json.loads(row["payload"]) if row else None
+
+    def list_labels(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM return_labels WHERE case_id = ? ORDER BY label_id", (case_id,)
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
+    def list_all_labels(self) -> list[dict[str, Any]]:
+        rows = self._query("SELECT payload FROM return_labels ORDER BY case_id, label_id")
+        return [json.loads(r["payload"]) for r in rows]
+
+    def put_void(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO label_voids (void_id, label_id, case_id, payload) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (void_id) DO UPDATE SET payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO label_voids (void_id, label_id, case_id, payload) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (void_id) DO UPDATE SET payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["void_id"],
+                payload["label_id"],
+                payload["case_id"],
+                json.dumps(payload),
+            ),
+        )
+
+    def get_void_by_label(self, label_id: str) -> dict[str, Any] | None:
+        row = self._query_one("SELECT payload FROM label_voids WHERE label_id = ?", (label_id,))
+        return json.loads(row["payload"]) if row else None
+
+    def list_voids(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM label_voids WHERE case_id = ? ORDER BY void_id", (case_id,)
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
+    def put_pickup(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO pickups (pickup_id, case_id, label_id, payload) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (pickup_id) DO UPDATE SET payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO pickups (pickup_id, case_id, label_id, payload) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (pickup_id) DO UPDATE SET payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["pickup_id"],
+                payload["case_id"],
+                payload["label_id"],
+                json.dumps(payload),
+            ),
+        )
+
+    def list_pickups(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM pickups WHERE case_id = ? ORDER BY pickup_id", (case_id,)
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
+    def put_tool_call(self, payload: dict[str, Any]) -> None:
+        sql = (
+            "INSERT INTO tool_calls (call_id, case_id, tool, status, payload) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (call_id) DO UPDATE SET "
+            "status = excluded.status, payload = excluded.payload"
+            if self._dialect == "sqlite"
+            else "INSERT INTO tool_calls (call_id, case_id, tool, status, payload) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (call_id) DO UPDATE SET "
+            "status = EXCLUDED.status, payload = EXCLUDED.payload"
+        )
+        self._execute(
+            sql,
+            (
+                payload["call_id"],
+                payload["case_id"],
+                payload["tool"],
+                payload["status"],
+                json.dumps(payload),
+            ),
+        )
+
+    def list_tool_calls(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT payload FROM tool_calls WHERE case_id = ? ORDER BY call_id", (case_id,)
+        )
+        return [json.loads(r["payload"]) for r in rows]
+
+    def count_tool_calls(self, case_id: str) -> int:
+        rows = self._query("SELECT COUNT(*) AS n FROM tool_calls WHERE case_id = ?", (case_id,))
+        return int(rows[0]["n"]) if rows else 0
+
 
 class InMemoryStore:
     """Test double implementing the same port with dicts."""
@@ -610,9 +776,13 @@ class InMemoryStore:
         self._approvals: dict[str, dict] = {}
         self._executions: dict[str, dict] = {}
         self._receipts: dict[str, dict] = {}
+        self._labels: dict[str, dict] = {}
+        self._voids: dict[str, dict] = {}
+        self._pickups: dict[str, dict] = {}
+        self._tool_calls: dict[str, dict] = {}
 
     def migrate(self) -> list[str]:
-        return ["0001", "0002", "0003", "0004", "0005"]
+        return ["0001", "0002", "0003", "0004", "0005", "0006"]
 
     def put_order(self, payload: dict[str, Any]) -> None:
         self._orders[payload["order_id"]] = payload
@@ -761,3 +931,58 @@ class InMemoryStore:
 
     def list_receipts(self) -> list[dict[str, Any]]:
         return [self._receipts[k] for k in sorted(self._receipts)]
+
+    def put_label(self, payload: dict[str, Any]) -> None:
+        self._labels[payload["label_id"]] = payload
+
+    def get_label(self, label_id: str) -> dict[str, Any] | None:
+        return self._labels.get(label_id)
+
+    def list_labels(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._labels[k]
+            for k in sorted(self._labels)
+            if self._labels[k]["case_id"] == case_id
+        ]
+
+    def list_all_labels(self) -> list[dict[str, Any]]:
+        return [self._labels[k] for k in sorted(self._labels)]
+
+    def put_void(self, payload: dict[str, Any]) -> None:
+        self._voids[payload["void_id"]] = payload
+
+    def get_void_by_label(self, label_id: str) -> dict[str, Any] | None:
+        for void in self._voids.values():
+            if void["label_id"] == label_id:
+                return void
+        return None
+
+    def list_voids(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._voids[k]
+            for k in sorted(self._voids)
+            if self._voids[k]["case_id"] == case_id
+        ]
+
+    def put_pickup(self, payload: dict[str, Any]) -> None:
+        self._pickups[payload["pickup_id"]] = payload
+
+    def list_pickups(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._pickups[k]
+            for k in sorted(self._pickups)
+            if self._pickups[k]["case_id"] == case_id
+        ]
+
+    def put_tool_call(self, payload: dict[str, Any]) -> None:
+        self._tool_calls[payload["call_id"]] = payload
+
+    def list_tool_calls(self, case_id: str) -> list[dict[str, Any]]:
+        return [
+            self._tool_calls[k]
+            for k in sorted(self._tool_calls)
+            if self._tool_calls[k]["case_id"] == case_id
+        ]
+
+    def count_tool_calls(self, case_id: str) -> int:
+        return sum(1 for c in self._tool_calls.values() if c["case_id"] == case_id)
