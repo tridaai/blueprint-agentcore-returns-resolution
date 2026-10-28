@@ -248,6 +248,14 @@ ACCESS_PACK_V1 = AccessPack(
                 # and strips every staff-side field before it is
                 # served (the console check probes exactly that).
                 SURFACE_CONSOLE,
+                # The gateway surface is addressable by a customer
+                # principal so an invocation can be judged: the
+                # actor binding makes it speak as "customer", and
+                # the gateway policy pack (R11) denies customer
+                # tool use itself — the access layer decides who
+                # is speaking, the policy pack decides what the
+                # tool may do.
+                SURFACE_GATEWAY,
                 SURFACE_PACKS,
             ],
             acts=[ACT_INTAKE_RETURN],

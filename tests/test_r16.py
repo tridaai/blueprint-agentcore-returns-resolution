@@ -34,7 +34,7 @@ from returns_resolution.access import (
 )
 from returns_resolution.api import create_app
 from returns_resolution.console import build_case_detail, build_console_data
-from returns_resolution.intake import ReferenceFeed
+from returns_resolution.intake import FRAUD_FEED_REQUESTS, ReferenceFeed
 from returns_resolution.modelport import OfflineComposer
 from returns_resolution.runtime_app import handle_payload
 from returns_resolution.service import CaseService
@@ -246,6 +246,8 @@ def test_staff_agent_cannot_approve_supervisor_can():
 
 def test_fraud_review_confirmation_is_reviewer_work():
     service = _service()
+    service.seed_history()
+    service.ingest(FRAUD_FEED_REQUESTS[0])  # CASE-3008 stands in fraud review
     with pytest.raises(AccessDeniedError) as caught:
         service.record_fraud_review_as(
             AGENT, "CASE-3008", outcome="cleared_with_reason",
