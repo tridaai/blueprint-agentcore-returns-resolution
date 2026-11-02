@@ -6,6 +6,11 @@ A post-purchase returns agent for a fictional outdoor retailer, **Cascade Outfit
 
 > **Work in progress** — this blueprint is built and passing its automated test and eval gates, but it has not yet finished hands-on local testing, and its companion blog post is not yet published. Expect changes. This notice comes off when both are done.
 
+<p><a href="https://trida.ai/blog/returns-resolution-agent-blueprint"><img src="https://geeytzpdwvjojoie.public.blob.vercel-storage.com/blog/1793596441777-cover.webp" alt="Returns Resolution Agent Blueprint" width="600"></a></p>
+
+**Deep-dive:** [Returns Resolution Agent Blueprint](https://trida.ai/blog/returns-resolution-agent-blueprint) — how one return is priced as a ledger, read off a disposition matrix, and refunded only through dual approval.
+
+
 ## Why this shape
 
 AWS's own retail demos stop at the shopping cart. Post-purchase — returns, refunds, disposition — is where the money, the fraud and the policy risk actually sit, and it is open ground. This blueprint takes the position a bank-grade blueprint would: **the model talks, the code decides.** Eligibility, windows and exclusions are a policy pack evaluated by a deterministic engine; the model's one job in R1 is drafting the customer summary, and even that draft is verified figure by figure before it is stored.
